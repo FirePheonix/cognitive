@@ -1,9 +1,102 @@
 ---
 title: 2.8 Long-Context Strategies
 lastUpdatedDate: '2026-08-05'
+thumbnail: /ch2-28-long-context-strategies.png
+author: Utkarsh Tyagi
+authorSocials: 'https://x.com/shubhamm069'
 ---
 
 # 2.8 Long-Context Strategies
 
-This section covers the details of 2.8 Long-Context Strategies.
+The arrival of long-context models was supposed to simplify everything. With a model that can handle a million tokens, you could just dump your entire codebase in, all your documentation, the complete conversation history, every relevant document — and let the model figure it out. No more careful retrieval, no more compression, no more agonizing over what to include.
 
+In practice, it doesn't work that way.
+
+Large context windows do open up new categories of application that weren't previously feasible — analyzing entire legal contracts, processing full codebases, reviewing months of conversation history. But they don't eliminate the need for thoughtful context management. They change its character.
+
+Understanding why requires getting specific about how models actually perform over long contexts — and what strategies consistently produce better results.
+
+---
+
+## The Attention Problem at Scale
+
+When a language model processes a long context, every token is theoretically attending to every other token. In practice, attention has a cost that scales with context length, and the model's ability to maintain strong attention across very long inputs isn't uniform.
+
+The "lost in the middle" problem — discussed in the context window management section — becomes more pronounced, not less, as context length grows. Research has shown that models reliably attend to the beginning and end of long contexts but show degraded performance when critical information is placed in the middle. Fill a context with a hundred documents and the model may effectively ignore thirty or forty of them, not because they weren't there, but because they were positioned where attention naturally weakens.
+
+This means that even with a million-token context window, position still matters. The engineering question becomes: how do you structure your long-context inputs to put the most important information where the model will actually use it?
+
+---
+
+## Chunking: The Foundation of Long-Context Processing
+
+When the content that needs to go into the context is longer than what a model can effectively process in one pass — or when you need to make retrieval efficient — **chunking** is the foundational strategy.
+
+Chunking means breaking content into smaller, meaningful pieces that can be individually processed, indexed, and retrieved. The quality of your chunking strategy has a downstream effect on everything: retrieval quality, model comprehension, answer accuracy.
+
+**Fixed-size chunking** is the simplest approach: split every document into equal-sized pieces, say 512 tokens each, with some overlap between adjacent chunks so that sentences don't get cut in half at a boundary. It's easy to implement but semantically crude — it pays no attention to the structure of the content.
+
+**Semantic chunking** breaks content based on meaning rather than token count. Section boundaries, paragraph breaks, logical transitions — these become the natural split points. The result is chunks that contain coherent units of meaning, which tend to be retrieved and understood much more accurately than arbitrarily sliced text.
+
+**Hierarchical chunking** adds another layer: chunks of chunks. A long document might be broken into chapters, each chapter into sections, each section into paragraphs. This hierarchy is indexed and queried at multiple levels, allowing the retrieval system to first find the relevant chapter, then the relevant section, then the specific paragraph. This is especially powerful for structured documents like technical documentation, legal contracts, or research papers.
+
+---
+
+## Contextual Retrieval and the Context Problem
+
+One limitation of standard chunking is that individual chunks often lose context when extracted from their source document. Imagine a chunk that says: "The limitation described above applies only when the temperature parameter exceeds 0.7." Without context, you don't know what limitation is being referred to, or in what circumstances.
+
+**Contextual retrieval** addresses this by enriching each chunk with a brief contextual header — a few sentences that situate the chunk within the broader document — before embedding and indexing it. When the chunk is retrieved later, the model receiving it also gets that context, making the retrieved content significantly more interpretable.
+
+This technique was formalized by Anthropic and shown to substantially improve retrieval accuracy in benchmarks. It adds some upfront processing cost to indexing, but the improvement in downstream answer quality is typically well worth it.
+
+---
+
+## Reranking: Separating Retrieval from Selection
+
+Even the best vector similarity search isn't perfect. It finds content that's semantically similar to the query, which is a good start — but similarity to the query and usefulness for answering the query aren't the same thing. A document might be highly similar to the question without actually containing the answer.
+
+**Reranking** adds a second stage after initial retrieval. A cross-encoder model — which evaluates the full query and each candidate chunk together, rather than comparing embeddings independently — scores candidates by how well they actually answer the question. The top-ranked results are then selected for the final context.
+
+This two-stage approach (recall with vector search, then precision with reranking) consistently outperforms either approach alone. The initial retrieval is optimized for speed and recall; the reranking is optimized for precision. Together, they deliver the most relevant chunks into the model's context, which is where quality ultimately comes from.
+
+---
+
+## Strategic Placement in Long Contexts
+
+When working with genuinely long contexts — documents or histories that fill a substantial portion of the window — how you order and place content significantly affects the model's performance.
+
+Place the most critical information near the **beginning and end** of the context. The model's attention is strongest at these positions. If you're including ten retrieved documents and you know two of them are almost certainly the most relevant, put those two at the start and end of the retrieved section, not in the middle.
+
+Use **clear delimiters and markers** to help the model navigate. "Document 1 of 8:" as a header before each retrieved chunk helps the model understand the structure of what it's reading. "Key constraints:" before a critical section draws attention explicitly. These structural cues don't add many tokens but meaningfully improve comprehension and retrieval.
+
+For very long documents where retrieval is impractical — imagine processing a 300-page contract — consider **map-reduce processing**: break the document into sections, process each section independently to extract relevant information, then combine the extracted information into a final summary or analysis. This is slower than a single-pass approach but produces more reliable results because each section gets the model's full attention.
+
+---
+
+## When to Use Long Context Directly
+
+With all these strategies for managing long content through retrieval and chunking, it's worth asking: when is it actually better to just pass the full content directly?
+
+For tasks that require **holistic understanding** — understanding how different parts of a document relate to each other, tracking threads across an entire codebase, finding contradictions spread across a contract — retrieval-based approaches struggle because the relevant information is distributed and context-dependent. A model processing the full document can see how everything fits together in a way that a model working from retrieved chunks cannot.
+
+For tasks where the **query is hard to specify in advance** — exploratory analysis, general summarization, "what's interesting about this?" style questions — retrieval is at a disadvantage because you don't know what to retrieve. Full-context processing is more natural here.
+
+The practical guidance is: use long-context models when holistic understanding matters and the content isn't too large for effective processing. Use retrieval-based strategies when you need to index large corpora, when the query is specific and answerable from a subset of the content, or when cost and latency require limiting the active context.
+
+---
+
+## The Layered Approach
+
+The most robust production systems don't choose between these strategies — they layer them. A typical production architecture for long-document processing might:
+
+1. Chunk documents semantically on ingestion, enriching each chunk with contextual headers
+2. Embed and index chunks in a vector store
+3. On each request, retrieve candidate chunks using vector similarity
+4. Rerank candidates with a cross-encoder to select the most useful ones
+5. Assemble the final context, placing the highest-confidence chunks at strategic positions
+6. For tasks requiring holistic understanding, use a long-context model for a separate processing path
+
+This layered approach accepts some additional complexity in exchange for consistently higher quality across a wider range of use cases. In production, that tradeoff almost always pays off.
+
+Long-context engineering is ultimately context engineering applied to a harder version of the same problem. The tokens are more numerous, the attention dynamics more challenging, the stakes for getting the structure right higher. But the underlying discipline — deciding what the model needs, in what form, and positioned where it will actually help — remains unchanged.

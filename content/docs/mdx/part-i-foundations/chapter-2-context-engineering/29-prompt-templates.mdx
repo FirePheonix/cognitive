@@ -1,9 +1,135 @@
 ---
 title: 2.9 Prompt Templates
 lastUpdatedDate: '2026-08-05'
+thumbnail: /ch2-29-prompt-templates.png
+author: Utkarsh Tyagi
+authorSocials: 'https://x.com/shubhamm069'
 ---
 
 # 2.9 Prompt Templates
 
-This section covers the details of 2.9 Prompt Templates.
+In the early stages of building with LLMs, most developers write prompts as strings in their code. A prompt might live as a multi-line constant in a Python file, something like:
 
+```python
+SUMMARIZE_PROMPT = """
+You are a helpful assistant. Summarize the following document clearly and concisely.
+
+Document: {document}
+
+Summary:
+"""
+```
+
+This works fine when you have one or two prompts and they rarely change. But as an application grows — more use cases, more user types, more contextual variations — the string-concatenation approach starts to fall apart. Prompts get duplicated across files, inconsistencies emerge, and making a change to the system's behavior requires hunting through multiple places in the code.
+
+Prompt templates are the answer. They bring to prompt construction the same principles that software engineers apply to code: modularity, reusability, separation of concerns, and testability.
+
+---
+
+## What Makes Something a Template
+
+A template is a prompt that contains **placeholders** — variables that get filled in with specific values at runtime. The template defines the structure and the instructions; the calling code provides the data.
+
+In its simplest form, this is just string interpolation. You have a template with `{user_name}` and `{user_question}`, and at runtime you substitute those placeholders with actual values. This is already an improvement over hardcoding, because the structure of the prompt is separated from the data that flows into it.
+
+More powerful templates support **conditional logic** — different content gets included or excluded based on the state of the request:
+
+```
+{% if user_has_history %}
+The user has interacted with this system before. Their last session summary:
+{{ session_summary }}
+{% endif %}
+
+Current question: {{ user_question }}
+```
+
+And more powerful still, templates can support **iteration** — generating repeated blocks of content from a list of items, which is useful for inserting multiple retrieved documents, multiple tool results, or multiple conversation turns.
+
+---
+
+## Template Engines in Practice
+
+Most production AI applications that use templates reach for a proper template engine rather than writing their own. Jinja2 is the most common choice in Python ecosystems because it's expressive, well-tested, and widely understood.
+
+Jinja2 templates look something like this in practice:
+
+```
+You are a support assistant for {{ company_name }}.
+
+{% if user_tier == "enterprise" %}
+This user is on the Enterprise plan and has priority support. Address their issue with full technical detail and offer to schedule a call if needed.
+{% elif user_tier == "pro" %}
+This user is on the Pro plan. Provide thorough technical support.
+{% else %}
+This user is on the Free plan. Provide helpful guidance and point them to documentation where relevant.
+{% endif %}
+
+{% if recent_issues %}
+Context from the user's recent support tickets:
+{% for issue in recent_issues %}
+- {{ issue.date }}: {{ issue.summary }}
+{% endfor %}
+{% endif %}
+
+User's current question: {{ user_question }}
+```
+
+This template does things that simple string interpolation can't: it includes different instruction sets based on user tier, and it conditionally includes recent issue history if it exists. The template defines the complete structure of the prompt; the application just provides the variables.
+
+---
+
+## Separating Templates from Code
+
+One of the most valuable organizational decisions you can make with prompt templates is to store them separately from your application code. Instead of embedding templates in Python constants or JavaScript strings, they live in dedicated files — `.jinja2`, `.txt`, or `.prompt` files — in their own directory.
+
+This separation has several benefits. First, it becomes easy to see all of your prompts in one place, which helps catch inconsistencies. Second, it enables non-engineers to contribute to prompt iteration without needing to understand the surrounding code. A domain expert who understands the business logic can edit a template file much more safely than they can edit a Python function. Third, it makes versioning cleaner — changes to prompts show up as changes to prompt files, which can be reviewed and deployed independently of application logic changes.
+
+```
+prompts/
+├── system/
+│   ├── base.jinja2
+│   ├── support-agent.jinja2
+│   └── coding-assistant.jinja2
+├── tasks/
+│   ├── summarize.jinja2
+│   ├── classify.jinja2
+│   └── generate-code.jinja2
+└── components/
+    ├── user-context.jinja2
+    ├── retrieved-docs.jinja2
+    └── safety-instructions.jinja2
+```
+
+This directory structure treats templates as first-class assets — organized by purpose, named clearly, and easy to navigate.
+
+---
+
+## Template Composition: Building from Parts
+
+One of the more powerful patterns in prompt template design is **composition** — building complex prompts from smaller, reusable components.
+
+Rather than having a monolithic template for every use case, you define a library of smaller template fragments — a component for formatting retrieved documents, a component for user context, a component for output format instructions — and compose them together to build the final prompt for each specific use case.
+
+The analogy to software design is direct: functions are better than repeated code blocks, and composable components are better than monolithic structures. The same principle applies to prompt templates.
+
+This approach also makes A/B testing much more tractable. If you want to test whether a different format for presenting retrieved documents improves answer quality, you change one component and test it across all the prompts that use it — rather than maintaining multiple versions of every prompt.
+
+---
+
+## Common Pitfalls with Templates
+
+**Security and injection.** If any part of the template variables comes from user input, you need to be careful about prompt injection — where a user includes text in their message that manipulates the prompt's instructions. Template engines like Jinja2 have sandboxed modes that limit what variables can do. Be cautious about any template that incorporates raw user input directly into areas that could affect instruction interpretation.
+
+**Template sprawl.** As applications grow, the number of templates tends to grow with them, and without discipline, you end up with hundreds of slightly different templates that are hard to maintain and test. A good template architecture uses composition aggressively to minimize the total number of templates while maximizing reuse.
+
+**Over-parameterization.** Templates should be parameterized at the right level of abstraction. A template with fifty variables becomes its own source of complexity. If you find yourself needing many variables to produce a useful output, that's often a sign the template is trying to do too much.
+
+---
+
+## Templates as the Interface Between Logic and Language
+
+The most useful way to think about prompt templates is as the **interface layer** between your application logic and the language model. Your code knows what data is relevant; the template knows how to present that data to the model effectively. Keeping these concerns separate makes both the logic and the prompts easier to reason about.
+
+When this separation is clean, improving your AI application is much easier. Changes to what data to include are made in the code. Changes to how that data is presented are made in the template. You can evolve both independently, test them separately, and reason about failures more clearly.
+
+Good prompt templates, like good APIs, are clear, consistent, and built to outlast the initial use case they were written for. They're worth investing in early.
