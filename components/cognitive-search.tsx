@@ -2,6 +2,7 @@
 
 import { ChevronRight, Search, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { cn } from '@/lib/cn';
 
 type SearchItem = {
@@ -302,31 +303,34 @@ export function CognitiveSearchTrigger({
           />
         </div>
       ) : null}
-      {open && mode === 'modal' ? (
-        <div className="fixed inset-0 z-[100] flex items-start justify-center bg-black/40 px-4 pt-24 backdrop-blur-sm">
-          <button
-            type="button"
-            aria-label="Close search"
-            className="absolute inset-0 cursor-default"
-            onClick={() => setOpen(false)}
-          />
-          <div className="relative w-full max-w-[640px]">
-            <button
-              type="button"
-              aria-label="Close search"
-              onClick={() => setOpen(false)}
-              className="absolute -right-2 -top-2 z-2 grid size-8 place-items-center rounded-full border bg-fd-popover text-fd-muted-foreground shadow-lg transition-colors hover:text-fd-foreground"
-            >
-              <X className="size-4" />
-            </button>
-            <CognitiveSearchPanel
-              initialSearch=""
-              onClose={() => setOpen(false)}
-              searchItems={searchItems}
-            />
-          </div>
-        </div>
-      ) : null}
+      {open && mode === 'modal'
+        ? createPortal(
+            <div className="fixed inset-0 z-[100] flex items-start justify-center bg-black/40 px-4 pt-24 backdrop-blur-sm">
+              <button
+                type="button"
+                aria-label="Close search"
+                className="absolute inset-0 cursor-default"
+                onClick={() => setOpen(false)}
+              />
+              <div className="relative w-full max-w-[640px]">
+                <button
+                  type="button"
+                  aria-label="Close search"
+                  onClick={() => setOpen(false)}
+                  className="absolute -right-2 -top-2 z-2 grid size-8 place-items-center rounded-full border bg-fd-popover text-fd-muted-foreground shadow-lg transition-colors hover:text-fd-foreground"
+                >
+                  <X className="size-4" />
+                </button>
+                <CognitiveSearchPanel
+                  initialSearch=""
+                  onClose={() => setOpen(false)}
+                  searchItems={searchItems}
+                />
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
     </div>
   );
 }
