@@ -383,6 +383,6 @@ function slugify(value: string) {
     .replace(/\s+/g, '-');
 }
 
-export function generateStaticParams() {
-  return [{ slug: [] }, ...docPages.map((page) => ({ slug: page.slug }))];
-}
+// No generateStaticParams — pages render on demand (SSR) and are cached
+// by Vercel's CDN on first hit. Static export was exhausting build disk space.
+export const dynamicParams = true;

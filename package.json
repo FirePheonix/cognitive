@@ -4,7 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "node scripts/clean-dev-cache.mjs && next dev",
+    "dev": "next dev --turbopack",
+    "dev:clean": "node scripts/clean-dev-cache.mjs && next dev --turbopack",
     "build": "next build",
     "start": "next start",
     "export": "next build",
