@@ -627,6 +627,38 @@ html.dark .md .shiki-wrapper {
     @apply my-8 border-fd-border;
   }
 
+  /* ── Tables ──────────────────────────────────────────────────────────────── */
+  .md table {
+    @apply my-6 w-full text-[0.9rem] border-collapse overflow-hidden rounded-xl border border-fd-border;
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .md thead {
+    @apply bg-fd-secondary;
+  }
+
+  .md th {
+    @apply px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wide text-fd-muted-foreground border-b border-fd-border whitespace-nowrap;
+  }
+
+  .md td {
+    @apply px-4 py-2.5 text-[0.875rem] border-b border-fd-border/50 align-top;
+  }
+
+  .md tr:last-child td {
+    @apply border-b-0;
+  }
+
+  .md tbody tr:nth-child(even) {
+    @apply bg-fd-secondary/30;
+  }
+
+  .md tbody tr:hover {
+    @apply bg-fd-accent/40 transition-colors;
+  }
+
   /* ── KaTeX math rendering ─────────────────────────────────────────────────── */
   .math-display {
     @apply my-6 overflow-x-auto rounded-lg border border-fd-border bg-fd-secondary/30 px-6 py-4 text-center;
