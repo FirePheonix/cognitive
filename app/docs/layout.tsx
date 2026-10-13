@@ -3,6 +3,8 @@ import { DocsSidebar } from '@/components/docs/sidebar';
 import { docNavItems, docGroups, docPages, getSearchItems } from '@/content/docs/docs-server';
 
 export default function DocsLayout({ children }: { children: ReactNode }) {
+  // getSearchItems no longer includes page.body in the searchable index,
+  // keeping the serialized client payload well under Vercel's 20 MB limit.
   const searchItems = getSearchItems(docPages);
 
   return (

@@ -203,8 +203,10 @@ export function getSearchItems(docs: DocPage[]): any[] {
       content: page.title,
       description,
       url,
+      // page.body intentionally excluded — it's too large to serialize into
+      // the client bundle (causes 34MB+ ISR payloads on Vercel)
       searchable: normalizeSearchText(
-        [page.title, description, page.group, page.parentTitle, page.body].join(' '),
+        [page.title, description, page.group, page.parentTitle].join(' '),
       ),
     };
 
@@ -215,7 +217,7 @@ export function getSearchItems(docs: DocPage[]): any[] {
       content: heading.title,
       description,
       url: `${url}#${slugifyHeading(heading.title)}`,
-      searchable: normalizeSearchText([heading.title, page.title, description, page.body].join(' ')),
+      searchable: normalizeSearchText([heading.title, page.title, description].join(' ')),
     }));
 
     return [pageItem, ...headingItems];
