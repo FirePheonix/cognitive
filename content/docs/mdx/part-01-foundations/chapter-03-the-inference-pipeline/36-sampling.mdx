@@ -5,25 +5,178 @@ lastUpdatedDate: '2026-08-05'
 
 # 3.6 Sampling
 
-This section covers the details of 3.6 Sampling.
+At the end of every decode step, the model produces **logits** — one raw score per token in the vocabulary. That's 50,000 to 150,000 numbers representing the model's belief about what token should come next. Sampling is the process of converting those numbers into an actual choice.
 
-## Temperature
+The sampling parameters you pass to the API (`temperature`, `top_p`, `top_k`) directly control this process. Understanding them is essential for getting consistent, reliable model behavior.
 
-Placeholder for Temperature.
+## From Logits to Probabilities
 
-## Top-k
+Raw logits are unconstrained floats. The first step is converting them to a probability distribution using the **softmax** function:
 
-Placeholder for Top-k.
+```
+P(token_i) = exp(logit_i) / Σ exp(logit_j)
+```
 
-## Top-p
+This ensures all probabilities sum to 1 and are non-negative.
 
-Placeholder for Top-p.
+Example output for a partial sentence "The cat sat on the ___":
 
-## Min-p
+```
+Token         Logit    Probability
+"mat"         8.2      45.3%
+"floor"       7.1      15.2%
+"couch"       6.8      11.4%
+"roof"        6.3       7.8%
+"sofa"        6.1       6.7%
+... (50,000 more tokens, mostly near 0)
+```
 
-Placeholder for Min-p.
+## Temperature: Controlling Sharpness
 
-## Beam Search
+Temperature `T` is applied **before** softmax by dividing logits:
 
-Placeholder for Beam Search.
+```
+P(token_i) = exp(logit_i / T) / Σ exp(logit_j / T)
+```
 
+| Temperature | Effect | Use case |
+|---|---|---|
+| 0.0 | Always pick highest-probability token (greedy/deterministic) | Factual Q&A, structured output, code |
+| 0.1–0.3 | Near-deterministic, slight variation | Summarization, data extraction |
+| 0.5–0.7 | Balanced creativity and coherence | General assistant, chat |
+| 0.8–1.2 | More diverse, creative output | Story writing, brainstorming |
+| > 1.5 | Very random, often incoherent | Rarely useful in production |
+
+Visualizing the effect on our cat example:
+
+```
+Temperature = 0.1 (sharp):
+  "mat": 99.9%, everything else: < 0.01%
+
+Temperature = 1.0 (default):
+  "mat": 45%, "floor": 15%, "couch": 11%, ...
+
+Temperature = 2.0 (flat):
+  "mat": 12%, "floor": 11%, "couch": 10%, "the": 9%, "xyz": 1%, ...
+```
+
+**Temperature = 0** is a special case: it's equivalent to `argmax` — always pick the single highest-probability token. This makes generation fully **deterministic** (same prompt → same output, every time). Essential for reproducible tests and structured output parsers.
+
+> Note: Most providers implement temperature=0 as a very small epsilon (~0.00001) rather than true 0, for numerical stability. The behavior is effectively identical.
+
+## Top-p (Nucleus Sampling)
+
+Top-p sampling (`nucleus sampling`) takes a different approach: instead of scaling all probabilities, it **restricts the candidate set** to the smallest group of tokens whose cumulative probability exceeds `p`.
+
+```
+Sort tokens by probability (descending):
+  "mat":   45.3%  → cumulative: 45.3%
+  "floor": 15.2%  → cumulative: 60.5%
+  "couch": 11.4%  → cumulative: 71.9%
+  "roof":   7.8%  → cumulative: 79.7%
+  "sofa":   6.7%  → cumulative: 86.4%
+  "bed":    4.2%  → cumulative: 90.6%  ← top-p=0.9 cutoff here
+  ...
+
+With top-p=0.9: only sample from ["mat", "floor", "couch", "roof", "sofa", "bed"]
+Renormalize probabilities within this set, then sample.
+```
+
+**Why top-p is useful**: it adapts to the model's confidence. When the model is very confident (one token has 95% probability), only 1–2 tokens are in the nucleus. When the model is uncertain (many tokens have similar probabilities), more tokens are included. This provides a natural quality floor.
+
+Common values:
+- `top_p=1.0` — no restriction (use all tokens)
+- `top_p=0.95` — slight quality filter
+- `top_p=0.9` — standard setting, removes the long tail
+- `top_p=0.7` — more focused
+
+## Top-k: Hard Token Limit
+
+Top-k is simpler: only consider the `k` highest-probability tokens, regardless of their actual probabilities.
+
+```
+top_k=5: sample only from {"mat", "floor", "couch", "roof", "sofa"}
+         regardless of how much probability mass they hold
+```
+
+The limitation: top-k=5 behaves very differently depending on whether those 5 tokens hold 60% or 99.9% of probability mass. It's less adaptive than top-p.
+
+Common default: `top_k=50`. Many production systems use top-p instead of (or in addition to) top-k.
+
+## Combining Parameters
+
+Temperature, top-p, and top-k are typically applied in sequence:
+
+```
+1. Divide logits by temperature
+2. Apply softmax to get probabilities
+3. Apply top-k: zero out all but top K tokens
+4. Apply top-p: zero out tokens below cumulative threshold
+5. Renormalize remaining probabilities
+6. Sample from the final distribution
+```
+
+When top-p and top-k are both set, whichever is more restrictive wins.
+
+## Practical Recommendations
+
+```python
+# Factual extraction, structured output, code generation
+response = client.chat.completions.create(
+    model="gpt-4o",
+    temperature=0.0,   # deterministic
+    top_p=1.0,         # no restriction needed at temp=0
+    messages=[...]
+)
+
+# General assistant chat
+response = client.chat.completions.create(
+    model="gpt-4o",
+    temperature=0.7,
+    top_p=0.95,
+    messages=[...]
+)
+
+# Creative writing, story generation
+response = client.chat.completions.create(
+    model="gpt-4o",
+    temperature=1.0,
+    top_p=0.95,
+    messages=[...]
+)
+```
+
+## The "Don't Combine Temperature and Top-p" Debate
+
+You'll see advice online to set either temperature OR top-p, not both. The reality:
+
+- **If you set temperature=0**, top-p doesn't matter (there's one clear winner)
+- **If you set temperature > 0**, top-p provides a useful quality floor by eliminating improbable garbage tokens
+- Most providers recommend leaving top-p at 1.0 if you're tuning temperature, or leaving temperature at 1.0 if you're tuning top-p — to avoid confusing interactions
+
+For most practical purposes, tune temperature and leave top-p at its default (0.95 or 1.0). Only reach for top-p when you have a specific reason.
+
+## Reproducibility and Seeds
+
+Even with temperature=0, some providers may produce slightly different outputs across runs (floating-point non-determinism, different hardware). For true reproducibility:
+
+```python
+# OpenAI supports a seed parameter
+response = client.chat.completions.create(
+    model="gpt-4o",
+    temperature=0,
+    seed=42,   # same seed + same prompt = same output
+    messages=[...]
+)
+```
+
+## Summary
+
+- Logits are raw scores over the entire vocabulary; softmax converts them to probabilities
+- **Temperature**: divides logits before softmax; lower = more peaked/deterministic, higher = flatter/more random
+- **Temperature=0**: greedy decoding — always pick the highest-probability token; fully deterministic
+- **Top-p (nucleus)**: only sample from the smallest token set that accounts for p% of probability mass; adapts to model confidence
+- **Top-k**: only consider the k most probable tokens; simpler but less adaptive than top-p
+- For agents and structured output: `temperature=0`
+- For creative tasks: `temperature=0.7–1.0`, `top_p=0.95`
+- Never use high temperature for structured output parsers — you'll get malformed JSON

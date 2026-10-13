@@ -5,5 +5,129 @@ lastUpdatedDate: '2026-08-05'
 
 # 12.8 Freshness
 
-This section covers the details of 12.8 Freshness.
+A RAG system that retrieves stale documents will produce confident-sounding answers that were true six months ago and are wrong today. Freshness is a retrieval quality dimension, not just an operational concern.
 
+## The Retrieval Drift Problem
+
+Your document corpus changes over time:
+- API documentation gets updated with new versions
+- Best practices change as the ecosystem evolves
+- Product features are added, changed, removed
+- Security advisories supersede earlier guidance
+
+Without freshness handling, a search for "How do I configure authentication?" might return the top-ranked document from 18 months ago — even though the current approach is completely different.
+
+## Freshness Decay Scoring
+
+From `atlas-agents/ch11_memory/online/memory_decay.py:115`:
+
+```python
+# atlas-agents/ch11_memory/online/memory_decay.py:115
+import math
+from datetime import datetime
+
+def freshness_score(
+    semantic_similarity: float,
+    document_date: datetime,
+    half_life_days: float = 30.0,
+) -> float:
+    """
+    Adjust semantic similarity score by document age.
+    A document loses half its effective relevance every `half_life_days` days.
+
+    Formula: salience = similarity × 0.5^(days_old / half_life)
+    """
+    days_old = (datetime.utcnow() - document_date).days
+    decay_factor = 0.5 ** (days_old / half_life_days)
+    return semantic_similarity * decay_factor
+```
+
+What this means in practice:
+
+| Document age | Semantic similarity | Freshness-adjusted score |
+|---|---|---|
+| Today | 0.85 | 0.85 × 1.00 = **0.850** |
+| 30 days | 0.85 | 0.85 × 0.50 = **0.425** |
+| 60 days | 0.85 | 0.85 × 0.25 = **0.213** |
+| 90 days | 0.85 | 0.85 × 0.125 = **0.106** |
+
+A 90-day-old document with strong semantic similarity (0.85) is beaten by a 1-week-old document with moderate similarity (0.50). This is the correct behavior for time-sensitive domains.
+
+## Choosing the Half-Life
+
+The right half-life depends on how fast your domain changes:
+
+| Domain | Recommended half-life |
+|---|---|
+| Security advisories | 7 days |
+| API documentation | 30 days |
+| Product documentation | 60 days |
+| General technical guides | 90 days |
+| Foundational concepts | 365 days |
+
+For domains with versioned content (API v3.2 vs v3.1), use metadata filtering on the version field instead of — or in addition to — decay scoring.
+
+## Recency Filter
+
+For time-sensitive queries, add a hard recency filter before semantic search:
+
+```python
+from datetime import datetime, timedelta
+
+def time_sensitive_search(
+    query: str,
+    max_age_days: int = 90,
+    k: int = 5,
+) -> list[str]:
+    cutoff_date = (datetime.utcnow() - timedelta(days=max_age_days)).strftime("%Y-%m-%d")
+
+    results = qclient.search(
+        collection_name="documents",
+        query_vector=embed(query),
+        query_filter=Filter(
+            must=[
+                FieldCondition(
+                    key="updated_at",
+                    range=Range(gte=cutoff_date),
+                )
+            ]
+        ),
+        limit=k,
+    )
+    return [r.payload["content"] for r in results]
+```
+
+## Monitoring Top Result Dates
+
+Track the dates of your top retrieved results over time. A gradual drift toward older results is a signal that your index needs refreshing:
+
+```python
+def audit_retrieval_freshness(
+    benchmark_queries: list[str],
+    alert_threshold_days: int = 60,
+) -> FreshnessAuditReport:
+    stale_query_count = 0
+    for query in benchmark_queries:
+        results = hybrid_search(query, k=3)
+        top_result_age = get_result_age_days(results[0])
+        if top_result_age > alert_threshold_days:
+            stale_query_count += 1
+            logger.warning(f"Query '{query[:50]}...' returning {top_result_age}-day-old top result")
+
+    stale_rate = stale_query_count / len(benchmark_queries)
+    return FreshnessAuditReport(stale_rate=stale_rate, needs_reindex=stale_rate > 0.20)
+```
+
+If more than 20% of benchmark queries return a top result older than 60 days, schedule an index refresh.
+
+## Index Refresh Strategy
+
+| Document type | Refresh frequency |
+|---|---|
+| Live API docs (auto-generated) | On every doc build |
+| Security bulletins | Daily |
+| Product documentation | Weekly |
+| External reference documents | Monthly |
+| Foundational content | When source changes |
+
+Automate index refresh as part of your documentation pipeline — not as a manual operational task. Freshness should be a system property, not something that requires human attention to maintain.

@@ -5,5 +5,102 @@ lastUpdatedDate: '2026-08-05'
 
 # 16.1 Offline Evaluation
 
-This section covers the details of 16.1 Offline Evaluation.
+Offline evaluation runs your benchmark against a **static, known set of inputs** and reports a score. No real users. No live traffic. Fully reproducible.
 
+It is the simplest form of continuous evaluation and the first line of defense against regressions.
+
+## When to Run Offline Eval
+
+| Trigger | Required? |
+|---|---|
+| Before every deployment | Yes — CI gate |
+| After any prompt change | Yes |
+| After any model update | Yes |
+| After adding or modifying a tool | Yes |
+| On a weekly schedule | Yes — catches silent drift |
+| After a production incident | Yes — add a case, then re-run |
+
+## The Offline Eval Loop
+
+```
+1. Load golden dataset (static — does not change between runs)
+2. For each case: run agent, collect response
+3. Score each response: keyword match + LLM judge + hallucination check
+4. Aggregate: pass_rate, avg_judge_score, hallucination_rate, avg_latency
+5. Compare against baseline
+6. Report: pass / fail + detailed breakdown
+```
+
+```python
+# atlas-agents/ch18_evaluation/online/ci_eval_runner.py
+def run_offline_eval(agent, dataset: list[EvalCase]) -> OfflineEvalReport:
+    results = []
+    for case in dataset:
+        start = time.monotonic()
+        response = agent.run(case.input)
+        latency = time.monotonic() - start
+
+        judge_result = llm_judge(case.input, response, case.expected_keywords)
+        keyword_score = score_keywords(response, case.expected_keywords)
+        tools_ok = validate_tool_usage(response, case.expected_tools, case.forbidden_tools)
+
+        results.append(EvalResult(
+            case=case,
+            agent_answer=response,
+            judge_score=judge_result["score"],
+            hallucinated=judge_result["hallucinated"],
+            keyword_score=keyword_score,
+            latency_seconds=latency,
+            passed=(keyword_score >= 0.8 and not judge_result["hallucinated"] and tools_ok),
+        ))
+
+    return OfflineEvalReport(results=results, timestamp=datetime.utcnow())
+```
+
+## Baseline Comparison
+
+Reference: `atlas-agents/ch18_evaluation/online/ci_eval_runner.py:159` — the `save_baseline()` function stores the previous run's scores for comparison.
+
+```python
+def save_baseline(report: OfflineEvalReport, path: str = "eval_baseline.json"):
+    baseline = {
+        "pass_rate": report.pass_rate,
+        "hallucination_rate": report.hallucination_rate,
+        "avg_judge_score": report.avg_judge_score,
+        "avg_latency": report.avg_latency_seconds,
+        "timestamp": report.timestamp.isoformat(),
+        "git_sha": get_current_sha(),
+    }
+    with open(path, "w") as f:
+        json.dump(baseline, f, indent=2)
+
+def load_baseline(path: str = "eval_baseline.json") -> dict:
+    with open(path) as f:
+        return json.load(f)
+```
+
+If the baseline file doesn't exist (first run), skip the comparison and save the current results as the new baseline.
+
+## Reporting
+
+Don't report only the aggregate pass rate. Report by category:
+
+```
+Offline Eval Report — 2026-08-05T14:32:10Z
+─────────────────────────────────────────────
+Overall:        pass_rate=78.0%  (baseline: 76.0%  Δ+2.0%)
+Hallucinations: 4.0%             (baseline: 6.0%   Δ-2.0%)  ✓
+Judge score:    3.8              (baseline: 3.6    Δ+0.2)   ✓
+
+By Category:
+  code_review:  90%  ✓
+  research:     80%  ✓
+  bug_analysis: 70%  ✓
+  architecture: 75%  ✓
+  safety:       75%  ✓
+
+Status: PASS
+─────────────────────────────────────────────
+```
+
+A report that only shows "78% pass rate" hides the fact that safety dropped from 90% to 75%. Break it down.

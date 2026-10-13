@@ -5,5 +5,140 @@ lastUpdatedDate: '2026-08-05'
 
 # 9.5 Idempotency
 
-This section covers the details of 9.5 Idempotency.
+Agents retry. Networks fail. The same tool call will be made twice. If your tools aren't idempotent — safe to call multiple times with the same arguments — you'll end up with duplicate emails sent, duplicate records created, or duplicate payments processed.
 
+> **Idempotency**: calling a function multiple times with the same arguments produces the same result as calling it once.
+
+## Read vs. Write Operations
+
+Read operations are naturally idempotent. `read_file("report.txt")` called twice returns the same content both times (assuming the file hasn't changed) and has no side effects.
+
+Write operations are not naturally idempotent. You must make them so explicitly.
+
+## The Idempotency Pattern
+
+For any operation that creates or modifies a resource: check first, create only if it doesn't exist.
+
+```python
+def idempotent_create_pr(repo: str, branch: str, title: str) -> dict:
+    """Create a PR, or return the existing one if it already exists."""
+    # Check if a PR already exists for this branch
+    existing = github.get_pull_requests(repo, head=branch, state="open")
+
+    if existing:
+        return existing[0]  # Already exists — return it without creating another
+
+    return github.create_pull_request(repo, branch, title)
+```
+
+The same pattern applies to any resource creation:
+
+```python
+def idempotent_create_record(table: str, unique_key: str, data: dict) -> dict:
+    existing = db.find_one(table, {unique_key: data[unique_key]})
+    if existing:
+        return existing
+    return db.insert(table, data)
+
+
+def idempotent_send_notification(user_id: str, event_id: str, message: str) -> str:
+    # Use a composite key: user + event
+    if notification_log.exists(user_id=user_id, event_id=event_id):
+        return f"Notification already sent for event {event_id}"
+    notification_service.send(user_id, message)
+    notification_log.record(user_id=user_id, event_id=event_id)
+    return "Notification sent"
+```
+
+## Idempotency Keys
+
+For operations where check-then-create isn't sufficient (e.g., payment APIs), use idempotency keys:
+
+```python
+import hashlib
+import json
+
+def compute_idempotency_key(tool_name: str, args: dict) -> str:
+    """Deterministic key from tool name + args."""
+    payload = json.dumps({"tool": tool_name, "args": args}, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+
+def idempotent_charge(amount: int, currency: str, customer_id: str) -> dict:
+    key = compute_idempotency_key("charge", {
+        "amount": amount,
+        "currency": currency,
+        "customer_id": customer_id,
+    })
+
+    return stripe.charges.create(
+        amount=amount,
+        currency=currency,
+        customer=customer_id,
+        idempotency_key=key,  # Stripe deduplicates on this key
+    )
+```
+
+Many payment and messaging APIs support idempotency keys natively. Always use them.
+
+## File Operations
+
+```python
+def idempotent_write_file(path: str, content: str) -> str:
+    """Write file only if content has changed."""
+    from pathlib import Path
+
+    file = Path(path)
+
+    if file.exists():
+        existing_content = file.read_text(encoding="utf-8")
+        if existing_content == content:
+            return f"File already up to date: {path}"  # No-op
+
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_text(content, encoding="utf-8")
+    return f"File written: {path}"
+```
+
+## State-Dependent Idempotency
+
+Sometimes idempotency depends on current state:
+
+```python
+def idempotent_deploy(service: str, version: str, environment: str) -> str:
+    current = deployment_registry.get_current_version(service, environment)
+
+    if current == version:
+        return f"Service {service} is already at version {version} in {environment}"
+
+    deployment_registry.deploy(service, version, environment)
+    return f"Deployed {service} {version} to {environment}"
+```
+
+## When Idempotency Is Critical
+
+| Operation | Risk if non-idempotent | Required pattern |
+|---|---|---|
+| Send email | Duplicate emails | Idempotency key + log |
+| Charge payment | Double charges | Provider idempotency key |
+| Create database record | Duplicate records | Check-then-insert |
+| Create GitHub PR | Duplicate PRs | Check-then-create |
+| Send webhook | Duplicate events | Event ID dedup |
+| Write file | Overwrite with identical content (benign) | Content hash check |
+| Read file | Nothing | Naturally idempotent |
+| HTTP GET | Nothing | Naturally idempotent |
+
+## Testing Idempotency
+
+Write a test that calls every write tool twice and verifies the side effect happened exactly once:
+
+```python
+def test_idempotent_create_pr():
+    pr1 = idempotent_create_pr("owner/repo", "feature-branch", "My Feature")
+    pr2 = idempotent_create_pr("owner/repo", "feature-branch", "My Feature")
+
+    assert pr1["id"] == pr2["id"]  # Same PR returned both times
+    assert github.count_prs("owner/repo", head="feature-branch") == 1  # Only one exists
+```
+
+If this test fails, the function is not idempotent and will cause bugs in production agents.

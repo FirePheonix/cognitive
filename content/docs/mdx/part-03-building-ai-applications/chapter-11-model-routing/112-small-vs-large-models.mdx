@@ -5,5 +5,159 @@ lastUpdatedDate: '2026-08-05'
 
 # 11.2 Small vs Large Models
 
-This section covers the details of 11.2 Small vs Large Models.
+The most common cost mistake in AI engineering is using a large model for work a small model handles just as well. The capability gap between tiers has narrowed significantly since 2024 — Haiku today outperforms GPT-4 from 2023 on most standard benchmarks. Use the cheapest model that gets the job done reliably.
 
+## The Model Tier Strategy
+
+From Book Chapter 7, the four-tier model:
+
+| Tier | Models | Approx cost | Best for |
+|---|---|---|---|
+| **Nano** (free) | Llama 3.2 (local), Gemma 3 (local) | $0/call | Development, high-volume classification, offline use |
+| **Micro** (~$0.001/call) | Claude Haiku 4.5, Gemini Flash 2.0 | ~$0.001 | Guardrails, routing, simple extraction, memory summarization |
+| **Standard** (~$0.003/call) | GPT-4o, Claude Sonnet 4.6 | ~$0.003 | Most production tasks, code generation, complex QA |
+| **Frontier** (~$0.015/call) | Claude Opus 4.5, o1 | ~$0.015 | Complex reasoning, architecture decisions, novel problems |
+
+These prices are approximate and will shift. Build your routing logic on *capability measurements* from your benchmarks, not on assumed price-performance curves.
+
+## Task Routing by Model Tier
+
+### Nano Tier: Free Local Models
+
+```python
+# Via Ollama
+import ollama
+
+def classify_intent_local(text: str) -> str:
+    response = ollama.chat(
+        model="llama3.2:3b",
+        messages=[{"role": "user", "content": f"Classify intent in one word: {text}"}]
+    )
+    return response["message"]["content"].strip()
+```
+
+Use for: high-volume preprocessing, development testing, offline scenarios, cases where occasional errors are acceptable and easily retried.
+
+### Micro Tier: Guardrails and Routing
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic()
+
+def run_guardrail_check(content: str) -> dict:
+    """Fast safety check — runs before the main agent."""
+    response = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=50,
+        messages=[{
+            "role": "user",
+            "content": f"""Does this content contain harmful requests?
+Reply with JSON: {{"safe": true/false, "reason": "..."}}
+
+Content: {content}"""
+        }]
+    )
+    import json
+    return json.loads(response.content[0].text)
+```
+
+At ~$0.001 per call, you can run this check on every request. If it costs $0.003 to handle a request with the standard tier model, a $0.001 guardrail adds 33% to cost but protects every request.
+
+### Standard Tier: Main Production Work
+
+```python
+from openai import OpenAI
+
+client = OpenAI()
+
+def generate_response(messages: list) -> str:
+    """Main agent response — standard tier."""
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+    )
+    return response.choices[0].message.content
+```
+
+GPT-4o and Claude Sonnet handle ~90% of production tasks correctly. Reserve the frontier tier for the remaining 10%.
+
+### Frontier Tier: Complex Reasoning
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic()
+
+def architecture_review(codebase_summary: str, requirements: str) -> str:
+    """Architecture decision — frontier tier."""
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=4096,
+        messages=[{
+            "role": "user",
+            "content": f"Review this architecture and suggest improvements:\n\n{codebase_summary}\n\nRequirements: {requirements}"
+        }]
+    )
+    return response.content[0].text
+```
+
+## Benchmark Before You Route
+
+The tier table above is a starting point. Your actual routing thresholds should come from benchmarking on your specific tasks. Reference: `atlas-agents/ch14_guardrails/online/guardrail_benchmark.py:264` — benchmarks three pipeline configurations showing cost vs accuracy tradeoffs.
+
+```python
+# Simplified benchmark structure
+TASK_BENCHMARK = {
+    "intent_classification": {
+        "haiku": {"accuracy": 0.94, "cost_per_call": 0.0008},
+        "sonnet": {"accuracy": 0.97, "cost_per_call": 0.003},
+        "gpt4o": {"accuracy": 0.96, "cost_per_call": 0.003},
+    },
+    "code_generation": {
+        "haiku": {"accuracy": 0.71, "cost_per_call": 0.0008},
+        "sonnet": {"accuracy": 0.89, "cost_per_call": 0.003},
+        "gpt4o": {"accuracy": 0.91, "cost_per_call": 0.003},
+    },
+    "structured_json_output": {
+        "haiku": {"accuracy": 0.82, "cost_per_call": 0.0008},
+        "sonnet": {"accuracy": 0.96, "cost_per_call": 0.003},
+        "gpt4o": {"accuracy": 0.97, "cost_per_call": 0.003},
+    }
+}
+```
+
+For intent classification, Haiku at 94% accuracy is usually good enough — the 3% gap over Sonnet costs 3.75× more. For code generation, the quality gap is large enough to justify Sonnet.
+
+## What Breaks with Smaller Models
+
+Not all capabilities degrade uniformly as you go down tiers:
+
+1. **Structured JSON output** degrades first — smaller models struggle to maintain schema compliance across complex nested structures. Haiku needs simpler schemas.
+
+2. **Multi-step reasoning** compounds errors — each step has higher error probability, and errors in step 1 propagate to step 2. Use standard tier or above for chain-of-thought tasks.
+
+3. **Tool calling support** varies by training — some smaller models weren't heavily trained on tool-use patterns. Test your specific tools against each model.
+
+4. **Long-context faithfulness** — smaller models lose track of details in long contexts faster than large models.
+
+## The Routing Rule
+
+```python
+def select_model(task_type: str, quality_floor: float = 0.90) -> str:
+    """Select the cheapest model that exceeds quality_floor for task_type."""
+    candidates = sorted(
+        TASK_BENCHMARK.get(task_type, {}).items(),
+        key=lambda x: x[1]["cost_per_call"]
+    )
+    for model, metrics in candidates:
+        if metrics["accuracy"] >= quality_floor:
+            return model
+    # Nothing meets the floor — use the best available
+    return candidates[-1][0]
+```
+
+For intent classification with a 90% quality floor: Haiku qualifies at $0.0008/call.
+For code generation with a 90% quality floor: Haiku at 71% doesn't qualify; Sonnet at 89% is close but may not; GPT-4o at 91% qualifies.
+
+Fill in real numbers from your benchmarks.

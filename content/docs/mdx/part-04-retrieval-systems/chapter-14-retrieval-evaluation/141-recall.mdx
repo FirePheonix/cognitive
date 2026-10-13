@@ -5,5 +5,140 @@ lastUpdatedDate: '2026-08-05'
 
 # 14.1 Recall
 
-This section covers the details of 14.1 Recall.
+Recall measures whether your retrieval system finds all the relevant documents — not just some of them. A high-recall retriever leaves nothing important on the floor.
 
+## Definition: Recall@K
+
+**Recall@K** = (number of relevant documents in top-K results) / (total number of relevant documents)
+
+If there are 5 documents relevant to a query and your retriever returns 3 of them in its top-5 results:
+
+```
+Recall@5 = 3 / 5 = 0.60 (60%)
+```
+
+The denominator is the total count of all relevant documents in the corpus, not just the ones you retrieved. Recall is asking: **of everything that matters, how much did you find?**
+
+## Why Recall Is the Primary RAG Metric
+
+In a RAG system, recall directly determines the upper bound on answer quality. If the relevant document isn't retrieved, the LLM cannot use it — and will either hallucinate an answer or say it doesn't know.
+
+**Low recall = incomplete information = incomplete or wrong answers.**
+
+Most production RAG systems prioritize Recall@5 or Recall@10 as the headline metric. Precision matters too (see 14.2), but a system with perfect precision and 30% recall is fundamentally broken.
+
+## Measuring Recall: The Golden Dataset
+
+Measuring recall requires a **golden dataset**: a curated set of (query, relevant_document_ids) pairs where you know ground truth. This is the hardest part.
+
+```python
+# Golden dataset format
+golden_dataset = [
+    {
+        "query": "What is the company's vacation policy?",
+        "relevant_doc_ids": ["hr_handbook_section_4", "vacation_policy_2024"]
+    },
+    {
+        "query": "How do I submit a bug report?",
+        "relevant_doc_ids": ["eng_process_doc", "jira_guide"]
+    },
+    # ...
+]
+```
+
+### Creating the Golden Dataset
+
+Options, ranked by quality:
+
+1. **Human annotation** — domain experts label which documents answer each query. Most accurate, most expensive.
+2. **LLM-assisted annotation** — use an LLM to identify relevant documents from the corpus for a set of queries, then have humans verify. Faster.
+3. **Synthetic QA generation** — have an LLM read each document and generate plausible queries that it answers. Scales well, but requires quality filtering.
+
+```python
+def generate_synthetic_golden_dataset(documents: list[dict], llm) -> list[dict]:
+    dataset = []
+    for doc in documents:
+        prompt = f"""
+        Read this document and generate 3 realistic questions that this document answers.
+        Return JSON: {{"questions": ["q1", "q2", "q3"]}}
+        
+        Document ID: {doc['id']}
+        Content: {doc['content'][:2000]}
+        """
+        result = json.loads(llm.invoke(prompt).content)
+        
+        for question in result["questions"]:
+            dataset.append({
+                "query": question,
+                "relevant_doc_ids": [doc["id"]]
+            })
+
+    return dataset
+```
+
+## Computing Recall@K
+
+```python
+def recall_at_k(
+    retriever,
+    golden_dataset: list[dict],
+    k: int
+) -> float:
+    recall_scores = []
+
+    for item in golden_dataset:
+        query = item["query"]
+        relevant_ids = set(item["relevant_doc_ids"])
+
+        # Retrieve top-K documents
+        retrieved_docs = retriever.retrieve(query, k=k)
+        retrieved_ids = {doc.metadata["id"] for doc in retrieved_docs}
+
+        # How many relevant docs appear in the top-K?
+        found = len(relevant_ids & retrieved_ids)
+        recall = found / len(relevant_ids)
+        recall_scores.append(recall)
+
+    return sum(recall_scores) / len(recall_scores)
+
+# Evaluate across different K values
+for k in [1, 3, 5, 10, 20]:
+    score = recall_at_k(retriever, golden_dataset, k=k)
+    print(f"Recall@{k}: {score:.3f}")
+
+# Recall@1:  0.412
+# Recall@3:  0.658
+# Recall@5:  0.743
+# Recall@10: 0.861
+# Recall@20: 0.923
+```
+
+## Interpreting Recall Numbers
+
+| Recall@5 | Assessment |
+|---|---|
+| > 0.85 | Excellent — most relevant docs are being found |
+| 0.70–0.85 | Good — acceptable for many applications |
+| 0.50–0.70 | Marginal — users will notice gaps in answers |
+| < 0.50 | Poor — retrieval is fundamentally broken |
+
+These thresholds depend on your domain. For medical or legal applications, you may need Recall@5 > 0.95 before deploying.
+
+## Improving Recall
+
+When recall is low, the most effective interventions:
+
+| Fix | Typical recall improvement |
+|---|---|
+| Better chunking (smaller chunks, more overlap) | +5–15% |
+| Switch from cosine to hybrid (vector + BM25) | +10–20% |
+| Better embedding model | +5–15% |
+| Increase K (retrieve more candidates) | +5–20% |
+| Query expansion / synonyms | +3–10% |
+| Add metadata filters selectively | Varies |
+
+## The Recall-Cost Tradeoff
+
+Increasing K improves recall at the cost of more tokens in context (higher cost, lower precision). The practical ceiling: if you need Recall@5 > 0.85 but your current system achieves 0.85 at K=20, that's a signal to improve your retrieval quality rather than just increasing K.
+
+Track recall as a continuous metric in production. A drop in recall without a system change often indicates corpus drift — new documents that are being added but not retrieved, or embedding distribution shift.

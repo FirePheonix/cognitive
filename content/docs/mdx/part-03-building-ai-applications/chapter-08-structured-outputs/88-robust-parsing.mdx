@@ -5,5 +5,198 @@ lastUpdatedDate: '2026-08-05'
 
 # 8.8 Robust Parsing
 
-This section covers the details of 8.8 Robust Parsing.
+Putting everything together: the production parsing pattern. Three layers of defense, applied in sequence. The principle is simple — **never trust raw LLM output**.
 
+## The Three Layers
+
+```
+Layer 1: Generation-time constraints    → prevent bad output before it happens
+Layer 2: Schema validation              → catch structural problems
+Layer 3: Semantic validation            → catch logically wrong output
+```
+
+Each layer catches what the previous layer misses.
+
+## Layer 1: Generation-Time Constraints
+
+Apply at the API call level. Use whatever the provider supports:
+
+```python
+# OpenAI — native structured output (strongest)
+response = client.beta.chat.completions.parse(
+    model="gpt-4o",
+    messages=messages,
+    response_format=ResearchReport,  # Schema enforced server-side
+)
+
+# Gemini — schema-constrained JSON
+config = types.GenerateContentConfig(
+    response_mime_type="application/json",
+    response_schema=ResearchReport,
+)
+
+# Anthropic — JSON mode + tool calling
+# (Use a tool schema as output schema — see Chapter 9)
+
+# Self-hosted — grammar-constrained decoding
+generator = outlines.generate.json(model, ResearchReport)
+```
+
+Generation-time constraints reduce validation failures to near zero for structured fields. They don't help with semantic problems (a URL field that contains a non-URL string passes JSON schema but is still wrong).
+
+## Layer 2: Schema Validation
+
+Always validate, even when using structured output APIs. The provider can fail or change behavior:
+
+```python
+from pydantic import ValidationError
+
+def parse_response(raw: str | None, model: type[BaseModel]) -> BaseModel:
+    if raw is None:
+        raise ValueError("Model returned no content")
+
+    try:
+        return model.model_validate_json(raw)
+    except (ValidationError, json.JSONDecodeError) as e:
+        # Try repair before giving up
+        repaired = attempt_repair(raw, model)
+        if repaired:
+            return repaired
+        raise
+```
+
+## Layer 3: Semantic Validation
+
+Schema validation tells you the field has a value. Semantic validation tells you the value makes sense:
+
+```python
+import re
+from urllib.parse import urlparse
+
+class SemanticValidator:
+    """Validates field values beyond type correctness."""
+
+    @staticmethod
+    def is_valid_url(value: str) -> bool:
+        try:
+            result = urlparse(value)
+            return all([result.scheme in ("http", "https"), result.netloc])
+        except Exception:
+            return False
+
+    @staticmethod
+    def is_reasonable_summary(value: str) -> bool:
+        words = value.split()
+        return 10 <= len(words) <= 200  # Not too short, not too long
+
+    @staticmethod
+    def has_no_hallucination_markers(value: str) -> bool:
+        bad_patterns = [
+            r"as an ai",
+            r"i cannot",
+            r"i don't have access",
+            r"\[insert\]",
+            r"\[placeholder\]",
+        ]
+        lower = value.lower()
+        return not any(re.search(p, lower) for p in bad_patterns)
+
+
+def semantic_validate(report: ResearchReport) -> list[str]:
+    """Returns list of semantic validation warnings (not errors)."""
+    issues = []
+    validator = SemanticValidator()
+
+    for url in report.sources:
+        if not validator.is_valid_url(url):
+            issues.append(f"Source '{url}' does not look like a valid URL")
+
+    if not validator.is_reasonable_summary(report.summary):
+        issues.append(f"Summary length ({len(report.summary.split())} words) seems unusual")
+
+    if not validator.has_no_hallucination_markers(report.title):
+        issues.append("Title contains hallucination markers")
+
+    return issues
+```
+
+Semantic validation issues are usually warnings, not hard failures. Log them, flag for review, but don't crash.
+
+## The Confidence Field Trick
+
+Always include a `confidence` field in your output schema. Low-confidence outputs get flagged for human review rather than being surfaced directly to users:
+
+```python
+from typing import Literal
+
+class ResearchReport(BaseModel):
+    title: str
+    summary: str
+    findings: list[str]
+    sources: list[str]
+    confidence: Literal["high", "medium", "low"]  # Always include this
+```
+
+Then in your routing logic:
+
+```python
+report = parse_response(raw, ResearchReport)
+semantic_issues = semantic_validate(report)
+
+if report.confidence == "low" or semantic_issues:
+    # Route to human review queue instead of user-facing surface
+    enqueue_for_review(report, issues=semantic_issues)
+else:
+    return report
+```
+
+The model is reasonably good at self-assessing confidence when asked explicitly. A `confidence: "low"` output from the model usually does contain lower-quality information. Use it as a cheap first filter.
+
+## The Complete Pipeline
+
+```python
+def get_research_report(query: str) -> ResearchReport | None:
+    messages = build_messages(query)
+
+    # Layer 1: Generation-time constraints
+    try:
+        response = client.beta.chat.completions.parse(
+            model="gpt-4o",
+            messages=messages,
+            response_format=ResearchReport,
+        )
+        report = response.choices[0].message.parsed
+        if report is None:
+            raise ValueError(f"Model refusal: {response.choices[0].message.refusal}")
+    except Exception as e:
+        # Layer 1 failed — fall through to raw + repair
+        raw = call_fallback(messages)
+        report = parse_with_repair(raw, ResearchReport)
+
+    if report is None:
+        return None  # All repair failed
+
+    # Layer 2: Schema already enforced by Pydantic above
+
+    # Layer 3: Semantic validation
+    issues = semantic_validate(report)
+    if issues:
+        logger.warning("Semantic validation issues", extra={"issues": issues, "report_title": report.title})
+
+    if report.confidence == "low":
+        enqueue_for_review(report)
+        return None  # Don't surface to user yet
+
+    return report
+```
+
+## Summary
+
+| Layer | What it catches | Cost |
+|---|---|---|
+| Generation constraints | Syntax errors, schema violations | ~0ms overhead |
+| Schema validation (Pydantic) | Missing fields, wrong types | ~1ms |
+| Semantic validation | Logically wrong values | ~1ms |
+| Confidence field | Low-quality outputs | Built into generation |
+
+Apply all three layers. The overhead is microseconds. The protection is real.

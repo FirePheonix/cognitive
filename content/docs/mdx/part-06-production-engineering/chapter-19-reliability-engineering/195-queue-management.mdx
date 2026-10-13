@@ -5,5 +5,168 @@ lastUpdatedDate: '2026-08-05'
 
 # 19.5 Queue Management
 
-This section covers the details of 19.5 Queue Management.
+Agent tasks can take seconds to minutes to complete. Synchronous HTTP requests with that latency don't scale — clients time out, workers block, and a slow task degrades all concurrent users. The solution: async task queues.
 
+## The Async Architecture
+
+```
+Client                  FastAPI                Celery Worker           Redis
+  │                       │                         │                    │
+  │─── POST /agent/async ─►│                         │                    │
+  │                       │─── enqueue task ────────────────────────────►│
+  │◄── {task_id: "abc"} ──│                         │                    │
+  │                       │                         │◄─── dequeue ───────│
+  │                       │                         │                    │
+  │                       │                   [agent runs...]            │
+  │                       │                         │                    │
+  │─── GET /status/abc ──►│                         │                    │
+  │◄── {status: "pending"}│                         │                    │
+  │                       │                         │                    │
+  │                       │                   [task complete]            │
+  │─── GET /status/abc ──►│                         │                    │
+  │◄── {status: "success",│                         │                    │
+  │    result: "..."}     │                         │                    │
+```
+
+## FastAPI + Celery + Redis
+
+From `atlas-agents/ch19_deployment`:
+
+```python
+from fastapi import FastAPI
+from celery import Celery
+from pydantic import BaseModel
+
+app = FastAPI()
+celery = Celery("atlas", broker="redis://localhost:6379/0", backend="redis://localhost:6379/1")
+
+class AgentRequest(BaseModel):
+    message: str
+    user_id: str
+
+class AgentResponse(BaseModel):
+    task_id: str
+    status: str
+
+# Async task submission
+@app.post("/agent/async", response_model=AgentResponse)
+async def submit_agent_task(request: AgentRequest):
+    task = process_agent_task.delay({
+        "message": request.message,
+        "user_id": request.user_id,
+    })
+    return AgentResponse(task_id=task.id, status="processing")
+
+# Status polling
+@app.get("/agent/status/{task_id}")
+async def get_task_status(task_id: str):
+    task = process_agent_task.AsyncResult(task_id)
+
+    if task.state == "PENDING":
+        return {"status": "pending", "result": None}
+    elif task.state == "SUCCESS":
+        return {"status": "success", "result": task.result}
+    elif task.state == "FAILURE":
+        return {"status": "failed", "error": str(task.result)}
+    else:
+        return {"status": task.state.lower(), "result": None}
+
+# The Celery task
+@celery.task(bind=True, max_retries=3)
+def process_agent_task(self, task_data: dict) -> dict:
+    try:
+        agent = build_agent(task_data["user_id"])
+        result = agent.run(task_data["message"])
+        return {"output": result, "user_id": task_data["user_id"]}
+    except Exception as e:
+        raise self.retry(exc=e, countdown=2 ** self.request.retries)
+```
+
+## Webhook Support
+
+Instead of requiring clients to poll, call them back when the task is done:
+
+```python
+class AgentRequestWithWebhook(BaseModel):
+    message: str
+    user_id: str
+    webhook_url: str | None = None  # Optional callback URL
+
+@celery.task(bind=True, max_retries=3)
+def process_agent_task_with_webhook(self, task_data: dict) -> dict:
+    result = atlas_agent.run(task_data["message"])
+
+    # Call webhook if provided
+    if task_data.get("webhook_url"):
+        try:
+            import httpx
+            httpx.post(
+                task_data["webhook_url"],
+                json={
+                    "task_id": self.request.id,
+                    "status": "success",
+                    "result": result,
+                },
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning(f"Webhook delivery failed: {e}")
+            # Don't fail the task because the webhook failed
+
+    return {"output": result}
+```
+
+## Queue Configuration
+
+```python
+# Priority queues — route different task types to different workers
+celery.conf.task_routes = {
+    "process_quick_task":    {"queue": "quick"},     # Short tasks: < 10s
+    "process_research_task": {"queue": "research"},   # Long tasks: < 5min
+    "process_code_task":     {"queue": "code"},       # Code execution: < 2min
+}
+
+# Worker specialization
+# celery worker -Q quick -c 20        # 20 concurrent workers for quick tasks
+# celery worker -Q research -c 5      # 5 workers for long research tasks
+# celery worker -Q code -c 3          # 3 workers for code execution
+```
+
+## Task State Storage
+
+Store intermediate state in Redis for long-running tasks that want to report progress:
+
+```python
+@celery.task(bind=True)
+def long_research_task(self, query: str) -> dict:
+    steps = ["search", "analyze", "synthesize", "format"]
+
+    for i, step in enumerate(steps):
+        # Update progress visible to status endpoint
+        self.update_state(
+            state="PROGRESS",
+            meta={"current_step": step, "progress": (i + 1) / len(steps)},
+        )
+        execute_step(step, query)
+
+    return {"output": final_result}
+```
+
+```python
+# Status endpoint shows progress
+@app.get("/agent/status/{task_id}")
+async def get_status(task_id: str):
+    task = long_research_task.AsyncResult(task_id)
+    if task.state == "PROGRESS":
+        return {
+            "status": "running",
+            "current_step": task.info.get("current_step"),
+            "progress": task.info.get("progress"),
+        }
+```
+
+## Related Sections
+
+- [19.7 Load Shedding](./197-load-shedding) — rejecting tasks when the queue is too deep
+- [19.8 Disaster Recovery](./198-disaster-recovery) — recovering in-flight tasks after worker crashes
+- [19.1 Retries](./191-retries) — retry logic within Celery tasks

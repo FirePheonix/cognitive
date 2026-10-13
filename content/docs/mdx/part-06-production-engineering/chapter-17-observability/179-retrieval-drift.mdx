@@ -5,5 +5,160 @@ lastUpdatedDate: '2026-08-05'
 
 # 17.9 Retrieval Drift
 
-This section covers the details of 17.9 Retrieval Drift.
+Your vector store's content gets stale. Documents that accurately described your product six months ago may now be outdated — a pricing change, a feature removal, a policy update. The RAG pipeline will happily retrieve these stale documents and the agent will confidently give wrong answers.
 
+Retrieval drift is subtle: the system works, the retrieval succeeds, the agent answers confidently — but the answer is based on outdated information.
+
+## The Freshness Metadata Pattern
+
+Every document stored in the vector store should carry freshness metadata:
+
+```python
+@dataclass
+class Document:
+    content: str
+    embedding: list[float]
+    metadata: DocumentMetadata
+
+@dataclass
+class DocumentMetadata:
+    source: str                    # URL, file path, system name
+    timestamp: datetime            # When was this document created/updated?
+    expiry: datetime | None        # When should this document be considered stale?
+    version: str | None            # Version identifier if applicable
+    content_hash: str              # Detect when source content changes
+```
+
+At index time:
+
+```python
+def index_document(content: str, source: str, ttl_days: int = 30) -> None:
+    embedding = embed(content)
+    doc = Document(
+        content=content,
+        embedding=embedding,
+        metadata=DocumentMetadata(
+            source=source,
+            timestamp=datetime.utcnow(),
+            expiry=datetime.utcnow() + timedelta(days=ttl_days),
+            content_hash=hashlib.sha256(content.encode()).hexdigest(),
+        ),
+    )
+    vector_store.upsert(doc)
+```
+
+## Freshness-Aware Retrieval
+
+When retrieving, check staleness before including a document:
+
+```python
+def retrieve_fresh(query: str, max_age_days: int = 30) -> list[Document]:
+    """
+    Retrieve documents, filtering out those older than max_age_days.
+    """
+    candidates = vector_store.similarity_search(query, k=20)
+
+    fresh_docs = []
+    stale_count = 0
+
+    for doc in candidates:
+        age = (datetime.utcnow() - doc.metadata.timestamp).days
+        if age > max_age_days:
+            stale_count += 1
+            continue
+        fresh_docs.append(doc)
+
+    if stale_count > 0:
+        logger.warning(f"Filtered {stale_count} stale documents from retrieval results")
+
+    return fresh_docs[:5]  # Top-k after freshness filter
+```
+
+## Time-Weighted Scoring
+
+An alternative to hard cutoffs: reduce the relevance score of older documents. From `atlas-agents/ch11_memory/online/memory_decay.py:115`:
+
+```python
+import math
+
+def time_weighted_score(
+    semantic_score: float,
+    document_age_days: int,
+    decay_factor: float = 0.01,
+) -> float:
+    """
+    Blend semantic similarity with recency.
+    decay_factor controls how fast old documents lose relevance:
+    - 0.01: gentle decay (~50% weight at 70 days old)
+    - 0.05: fast decay (~50% weight at 14 days old)
+    """
+    recency_weight = math.exp(-decay_factor * document_age_days)
+    return semantic_score * recency_weight
+
+# Apply to all retrieved documents
+def rank_with_freshness(results: list[tuple[Document, float]]) -> list[Document]:
+    age_scored = [
+        (
+            doc,
+            time_weighted_score(
+                semantic_score=score,
+                document_age_days=(datetime.utcnow() - doc.metadata.timestamp).days,
+            ),
+        )
+        for doc, score in results
+    ]
+    age_scored.sort(key=lambda x: x[1], reverse=True)
+    return [doc for doc, _ in age_scored]
+```
+
+## Detecting When Documents Go Stale
+
+Proactively re-fetch sources and detect content changes:
+
+```python
+async def check_document_freshness(doc: Document) -> FreshnessCheck:
+    """
+    Re-fetch the source and check if content has changed.
+    Run this on a schedule for high-value documents.
+    """
+    try:
+        current_content = await fetch_url(doc.metadata.source)
+        current_hash = hashlib.sha256(current_content.encode()).hexdigest()
+
+        if current_hash != doc.metadata.content_hash:
+            return FreshnessCheck(
+                is_stale=True,
+                reason="Content changed at source",
+                new_content=current_content,
+            )
+
+        # Check expiry
+        if doc.metadata.expiry and datetime.utcnow() > doc.metadata.expiry:
+            return FreshnessCheck(is_stale=True, reason="TTL expired")
+
+        return FreshnessCheck(is_stale=False)
+
+    except Exception as e:
+        return FreshnessCheck(is_stale=True, reason=f"Could not verify: {e}")
+```
+
+## Scheduled Re-Indexing
+
+For critical knowledge bases, re-index on a schedule:
+
+```python
+# Daily re-indexing of high-value documents
+@scheduled_task(cron="0 2 * * *")
+async def refresh_knowledge_base():
+    stale_docs = vector_store.find_stale(older_than_days=7)
+    for doc in stale_docs:
+        check = await check_document_freshness(doc)
+        if check.is_stale and check.new_content:
+            await index_document(check.new_content, doc.metadata.source)
+            logger.info(f"Re-indexed: {doc.metadata.source}")
+```
+
+## Related Sections
+
+- [17.7 Model Drift](./177-model-drift) — drift from model changes vs. data changes
+- [17.8 Prompt Drift](./178-prompt-drift) — drift from prompt changes

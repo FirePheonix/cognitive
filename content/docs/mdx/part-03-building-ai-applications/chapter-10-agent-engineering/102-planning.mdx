@@ -5,5 +5,115 @@ lastUpdatedDate: '2026-08-05'
 
 # 10.2 Planning
 
-This section covers the details of 10.2 Planning.
+Planning answers a simple question: *before the agent acts, how much thinking should it do?*
 
+The spectrum runs from "decide one step at a time" to "generate a complete plan, then execute it mechanically." Both approaches are used in production. Choosing between them is a design decision, not a technical one.
+
+## Two Planning Styles
+
+### Reactive Planning (ReAct)
+
+Decide the next step **after each observation**. The agent never knows more than one move ahead.
+
+```
+Question
+  → Think: "What do I need to do first?"
+  → Act: call a tool
+  → Observe: read the result
+  → Think: "What do I need to do now?"
+  → Act: call another tool
+  → ...until done
+```
+
+**Strengths:** Flexible. Handles surprises well. If a tool fails or returns unexpected data, the agent can adapt on the fly.
+
+**Weaknesses:** Can meander. Without a plan, the agent may take inefficient routes to the answer.
+
+**Best for:** Open-ended research, debugging, tasks where the full scope isn't clear at the start.
+
+### Proactive Planning (Plan-and-Execute)
+
+Generate a full plan upfront, then execute each step without reconsidering the plan.
+
+```
+Question
+  → Plan: ["Step 1: ...", "Step 2: ...", "Step 3: ..."]
+  → Execute Step 1
+  → Execute Step 2
+  → Execute Step 3
+  → Synthesize results
+  → Done
+```
+
+From the book:
+
+> *"Plan-and-Execute works best when the scope is clear upfront and the plan rarely needs mid-course corrections."*
+
+**Strengths:** Predictable. Easier to audit. Steps can often run in parallel. Progress is visible.
+
+**Weaknesses:** Brittle. If Step 2 fails in a way that invalidates the plan, a pure Plan-and-Execute agent keeps executing the now-invalid remaining steps.
+
+**Best for:** Structured workflows, batch processing, tasks with a clear and stable scope.
+
+## Side-by-Side Comparison
+
+| Dimension | Reactive (ReAct) | Proactive (Plan-and-Execute) |
+|---|---|---|
+| When is the plan made? | One step at a time | All upfront |
+| Handles surprises? | Yes | Poorly |
+| Auditable? | Hard to predict | Easy to inspect |
+| Parallel execution? | Difficult | Natural |
+| Good default? | Yes | When scope is known |
+
+## State-Based Planning with LangGraph
+
+![The stateful agent graph](/part-03/chapter-10/stateful-graph.jpeg)
+*Fig: The stateful agent graph: planning, execution, review, and automated recovery or human intervention as explicit graph nodes.*
+
+For structured planning, state graphs give you an explicit representation of where the agent is in its plan. Here's the state definition from `atlas-agents/ch05_state_graphs/code_review_agent.py:182`:
+
+```python
+# From atlas-agents/ch05_state_graphs/code_review_agent.py
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+    plan: list[str]          # The upfront plan — list of step descriptions
+    current_step: int        # Which step we're executing now
+    retry_count: int         # How many times we've retried the current step
+    needs_approval: bool     # Whether to pause and ask a human
+```
+
+Every field serves a purpose:
+
+- `plan` is generated once by a `plan_node` at the start and never changes (unless the agent explicitly replans)
+- `current_step` advances as steps complete — if the agent crashes and restarts, it can resume from here
+- `retry_count` prevents infinite retries on a broken step
+- `needs_approval` is a human-in-the-loop gate — certain risky actions pause execution and wait
+
+The `plan_node` itself does one thing: given the user's goal, ask the LLM to produce an ordered list of steps. Then a separate `execute_node` takes `plan[current_step]` and runs it. The planning and execution concerns are cleanly separated.
+
+## Replanning
+
+Neither pure approach handles all situations. A hybrid — Plan-and-Execute with a replan trigger — is common in production:
+
+```python
+def should_replan(state: AgentState) -> bool:
+    # If the last step failed AND it was a critical dependency, replan
+    last_result = state["messages"][-1].content
+    if "FAILED" in last_result and state["current_step"] < len(state["plan"]) // 2:
+        return True  # Failed early in the plan — results may be invalid
+    return False
+```
+
+The rule of thumb: **replan when an early failure invalidates later steps**. Don't replan on every small obstacle — that turns Plan-and-Execute back into ReAct with extra overhead.
+
+## Which Should You Use?
+
+```
+Is the full scope of the task knowable upfront?
+  ├─ No  → Use ReAct
+  └─ Yes → Does the plan need to adapt based on intermediate results?
+              ├─ Yes → Use ReAct (or hybrid)
+              └─ No  → Use Plan-and-Execute
+```
+
+When in doubt, start with ReAct. It's simpler to implement and debug. Move to Plan-and-Execute when you need predictability or parallel execution.

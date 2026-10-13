@@ -5,5 +5,170 @@ lastUpdatedDate: '2026-08-05'
 
 # 8.4 Schema Validation
 
-This section covers the details of 8.4 Schema Validation.
+Pydantic is the production standard for schema validation in Python. Define your schema once as a class — it handles validation, type coercion, error messages, JSON serialization, and documentation. OpenAI's SDK integrates with it directly.
 
+## Defining Your Schema
+
+```python
+from pydantic import BaseModel, Field, field_validator
+from typing import Literal
+
+class ResearchReport(BaseModel):
+    title: str
+    summary: str = Field(description="2-3 sentence summary of the findings")
+    findings: list[str] = Field(min_length=1, description="Key findings, one per item")
+    sources: list[str] = Field(description="URLs or citation strings")
+    confidence: Literal["high", "medium", "low"]
+
+    @field_validator("sources")
+    @classmethod
+    def sources_not_empty(cls, v):
+        if not v:
+            raise ValueError("At least one source is required")
+        return v
+```
+
+The `Field(description=...)` annotations do double duty: they enforce validation constraints *and* they appear in the JSON schema sent to the model, giving it explicit guidance on what each field should contain.
+
+## OpenAI Structured Outputs
+
+OpenAI's `beta.chat.completions.parse()` endpoint accepts a Pydantic model as `response_format`. It validates the output automatically and returns a Python object — not a string:
+
+```python
+from openai import OpenAI
+from pydantic import BaseModel, Field
+from typing import Literal
+
+client = OpenAI()
+
+class ResearchReport(BaseModel):
+    title: str
+    summary: str = Field(description="2-3 sentence summary")
+    findings: list[str]
+    sources: list[str]
+    confidence: Literal["high", "medium", "low"]
+
+response = client.beta.chat.completions.parse(
+    model="gpt-4o",
+    messages=[
+        {"role": "system", "content": "You are a research assistant."},
+        {"role": "user", "content": "Summarize recent findings on transformer attention mechanisms."}
+    ],
+    response_format=ResearchReport,
+)
+
+# Already a ResearchReport object — no json.loads(), no manual validation
+report = response.choices[0].message.parsed
+print(report.title)       # str
+print(report.confidence)  # "high" | "medium" | "low"
+print(report.findings)    # list[str]
+```
+
+If the model produces output that doesn't match the schema, `response.choices[0].message.parsed` will be `None` and `response.choices[0].message.refusal` will contain the reason. Check for this:
+
+```python
+msg = response.choices[0].message
+if msg.parsed is None:
+    print(f"Model refused or failed to produce valid output: {msg.refusal}")
+else:
+    report = msg.parsed
+```
+
+## Gemini Structured Outputs
+
+```python
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, Field
+from typing import Literal
+
+client = genai.Client()
+
+class ResearchReport(BaseModel):
+    title: str
+    summary: str = Field(description="2-3 sentence summary")
+    findings: list[str]
+    sources: list[str]
+    confidence: Literal["high", "medium", "low"]
+
+response = client.models.generate_content(
+    model="gemini-2.0-flash",
+    contents="Summarize recent findings on transformer attention mechanisms.",
+    config=types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=ResearchReport,  # Pydantic model passed directly
+    ),
+)
+
+import json
+data = json.loads(response.text)
+report = ResearchReport.model_validate(data)
+```
+
+## Manual Validation (Anthropic / Any Provider)
+
+When the provider doesn't integrate with Pydantic directly, validate manually:
+
+```python
+from pydantic import ValidationError
+import json
+
+raw_output = call_anthropic(messages)  # Returns a string
+
+try:
+    data = json.loads(raw_output)
+    report = ResearchReport.model_validate(data)
+    return report
+except json.JSONDecodeError as e:
+    raise ValueError(f"Model output is not valid JSON: {e}")
+except ValidationError as e:
+    raise ValueError(f"Model output does not match schema: {e}")
+```
+
+`ValidationError` gives you precise, human-readable error messages:
+
+```
+1 validation error for ResearchReport
+confidence
+  Input should be 'high', 'medium' or 'low' [type=literal_error, input_value='very high', input_url=...]
+```
+
+This error message can be fed back to the model in a retry — see [Retry Loops](./86-retry-loops).
+
+## Schema in the Prompt
+
+Always include the schema in your system prompt, even when using structured output APIs. The model should see what you expect before it generates:
+
+```python
+import json
+
+schema_str = json.dumps(ResearchReport.model_json_schema(), indent=2)
+
+system_prompt = f"""You are a research assistant.
+Always respond with JSON matching this schema exactly:
+
+{schema_str}"""
+```
+
+## Nested Schemas
+
+Pydantic handles nested objects cleanly:
+
+```python
+class Finding(BaseModel):
+    claim: str
+    evidence: str
+    strength: Literal["strong", "moderate", "weak"]
+
+class ResearchReport(BaseModel):
+    title: str
+    summary: str
+    findings: list[Finding]   # Nested validation
+    confidence: Literal["high", "medium", "low"]
+```
+
+The full schema (including nested types) is serialized and sent to the model. More structure = more for the model to follow correctly, but also more precise validation on the return.
+
+## The Validation Contract
+
+Schema validation gives you a typed Python object from an LLM call. Once you have a `ResearchReport`, the rest of your code can treat it like any other typed object — IDE autocomplete, type checking, no defensive `dict.get()` calls. This is the point.

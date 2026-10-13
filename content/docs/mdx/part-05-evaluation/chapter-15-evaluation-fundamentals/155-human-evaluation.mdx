@@ -5,5 +5,81 @@ lastUpdatedDate: '2026-08-05'
 
 # 15.5 Human Evaluation
 
-This section covers the details of 15.5 Human Evaluation.
+LLM judges are fast and cheap. Human evaluators are slow and expensive. Neither alone is sufficient.
 
+## Where Each Excels
+
+| Dimension | LLM Judge | Human Evaluator |
+|---|---|---|
+| Speed | Milliseconds | Minutes to hours |
+| Cost | Fractions of a cent | $10–$50 per hour |
+| Scale | Unlimited | Constrained |
+| Consistency | High (same prompt = same score) | Variable (fatigue, mood) |
+| Nuance | Misses cultural context, humor, tone | Catches everything |
+| Novel failures | Misses failure modes it wasn't trained to catch | Catches unexpected problems |
+| Ambiguous cases | Scores confidently (sometimes wrongly) | Flags uncertainty |
+
+## The Hybrid Approach
+
+Use LLM-as-judge for **large-scale continuous evaluation** — every production call, every PR, every nightly run. Use human evaluation for:
+
+1. **Borderline cases** — where judge scores are disputed or near threshold
+2. **New capability launches** — before shipping, have humans validate a sample
+3. **Incident investigation** — when something goes wrong, humans review the failure
+4. **Judge calibration** — periodically compare judge scores to human scores to catch judge drift
+
+## Multi-Judge Consensus and Human Escalation
+
+From `atlas-agents/ch18_evaluation/online/multi_judge_consensus.py:221`:
+
+When multiple LLM judges evaluate the same response and **disagree by 2 or more points**, the case is automatically flagged as "disputed" and routed to human review.
+
+```
+Judge A scores: 4
+Judge B scores: 2
+Difference: 2 ← triggers human review
+
+Judge A scores: 4
+Judge B scores: 3
+Difference: 1 ← resolved by majority vote, no human needed
+```
+
+This escalation logic means humans focus on exactly the cases where automated evaluation is least reliable — not on the 90% of cases where judges agree.
+
+## Human Evaluation Protocol
+
+When sending cases to human reviewers:
+
+```
+Reviewer instructions:
+1. Read the question carefully
+2. Read the agent's full response
+3. Evaluate on these dimensions (1–5 each):
+   - Factual accuracy
+   - Completeness (did it answer the full question?)
+   - Clarity (is it easy to understand?)
+   - Appropriateness (tone, safety, format)
+4. Flag if the response contains potential misinformation
+5. Do NOT look at the LLM judge's score before scoring
+
+Time budget: 3–5 minutes per case
+```
+
+Blind review (not seeing the judge's score first) is essential. Anchoring to the judge's score defeats the purpose of human validation.
+
+## Calibration: Are Your Judges Aligned?
+
+Periodically run the same 50 cases through both the LLM judge and human reviewers. Compute the correlation:
+
+```python
+from scipy.stats import pearsonr
+
+judge_scores = [result.judge_score for result in sample]
+human_scores = [result.human_score for result in sample]
+
+correlation, p_value = pearsonr(judge_scores, human_scores)
+print(f"Judge-human correlation: {correlation:.3f} (p={p_value:.4f})")
+# Target: correlation > 0.7
+```
+
+If correlation drops below 0.7, your judge prompt needs revision. The judge may have drifted from what humans consider "good."

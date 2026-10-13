@@ -5,5 +5,116 @@ lastUpdatedDate: '2026-08-05'
 
 # 18.4 Per-Tenant Cost
 
-This section covers the details of 18.4 Per-Tenant Cost.
+In a multi-tenant system, each customer's usage is an operational cost that you bear — until you charge for it or limit it.
 
+Per-tenant cost tracking is how you know when a tenant is unprofitable, when you need to enforce limits, and which tenants need custom pricing.
+
+## The Core Pattern
+
+Tag every LLM call with `tenant_id`. Aggregate in Redis. Check against limit before processing:
+
+```python
+class TenantAwareAgent:
+    def __init__(self, tenant_id: str):
+        self.tenant_id = tenant_id
+
+    def run(self, user_input: str) -> str:
+        # Check budget BEFORE running — not after
+        self._check_budget()
+
+        response = litellm.completion(
+            model="anthropic/claude-haiku-4-5",
+            messages=self.build_messages(user_input),
+        )
+
+        cost = litellm.completion_cost(completion_response=response)
+        self._record_cost(cost)
+
+        return response.choices[0].message.content
+
+    def _check_budget(self):
+        current = self.get_current_spend()
+        limit = self.get_budget_limit()
+        if current >= limit:
+            raise TenantBudgetExceededError(
+                tenant_id=self.tenant_id,
+                current_spend=current,
+                limit=limit,
+            )
+        if current >= limit * 0.8:
+            self._send_budget_alert(current, limit)  # 80% warning
+
+    def _record_cost(self, cost: float):
+        key = f"costs:tenant:{self.tenant_id}:{datetime.utcnow().strftime('%Y-%m')}"
+        redis_client.incrbyfloat(key, cost)
+        redis_client.expire(key, 90 * 24 * 3600)  # Keep 90 days
+```
+
+## Tenant Budget Tiers
+
+```python
+TENANT_BUDGET_TIERS = {
+    "free":       5.00,    # $5/month
+    "starter":   50.00,    # $50/month
+    "pro":      500.00,    # $500/month
+    "enterprise": None,    # Negotiated — no hard limit, but alert at $5,000
+}
+
+def get_tenant_budget(tenant_id: str) -> float | None:
+    tenant = db.get_tenant(tenant_id)
+    return TENANT_BUDGET_TIERS.get(tenant.plan)
+```
+
+## Rate Limiting vs. Budget Limiting
+
+Two different controls — both necessary:
+
+| Control | What it limits | Why |
+|---|---|---|
+| **Rate limit** | Requests per minute/hour | Prevents bursts, protects infrastructure |
+| **Budget limit** | Total spend per month | Prevents runaway costs, enables billing |
+
+```python
+from slowapi import Limiter
+
+# Rate limit: 100 requests per hour per tenant
+limiter = Limiter(key_func=get_tenant_id)
+
+@app.post("/api/agent")
+@limiter.limit("100/hour")
+async def agent_endpoint(request: Request):
+    tenant_id = get_tenant_id(request)
+    agent = TenantAwareAgent(tenant_id=tenant_id)
+    return agent.run(request.json()["input"])
+```
+
+## Monitoring Tenant Cost Distribution
+
+```python
+def tenant_cost_report(month: str = None) -> dict:
+    month = month or datetime.utcnow().strftime('%Y-%m')
+    pattern = f"costs:tenant:*:{month}"
+    keys = redis_client.keys(pattern)
+
+    costs = {}
+    for key in keys:
+        tenant_id = key.split(":")[2]
+        costs[tenant_id] = float(redis_client.get(key) or 0)
+
+    total = sum(costs.values())
+    sorted_tenants = sorted(costs.items(), key=lambda x: x[1], reverse=True)
+
+    return {
+        "total": total,
+        "top_10": sorted_tenants[:10],
+        "tenants_over_budget": [
+            t for t, c in costs.items()
+            if c >= get_tenant_budget(t) * 0.9
+        ],
+    }
+```
+
+High-usage tenants fall into three categories:
+1. **Power users** — valuable customers, may need a higher plan
+2. **Inefficient integrations** — large context, no caching, many retries — help them optimize
+3. **Abusive patterns** — unusually high volume, possible scraping — rate limit or investigate

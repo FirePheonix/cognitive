@@ -5,7 +5,8 @@ import { usePathname } from 'next/navigation';
 import {
   BookOpen,
   Book,
-  ClipboardList,
+  FlaskConical,
+  Cpu,
   Check,
   ChevronRight,
   ChevronsUpDown,
@@ -25,22 +26,33 @@ const sections = [
     href: '/docs',
     color: 'var(--brand)',
     icon: BookOpen,
+    filter: 'handbook',
   },
   {
-    title: 'Chapters',
-    description: 'Long-form tutorials',
+    title: 'Long Form',
+    description: 'Deep-dive chapters',
     href: '/docs/part-01-foundations/chapter-01-from-prompt-to-production',
     color: 'var(--accent)',
     icon: Book,
+    filter: 'long-form',
   },
   {
-    title: 'Appendices',
-    description: 'References and checklists',
-    href: '/docs/appendix-a-foundations-of-language-representation',
-    color: 'var(--fd-primary)',
-    icon: ClipboardList,
+    title: 'ML Fundamentals',
+    description: 'Classical ML from scratch',
+    href: '/docs/ml-fundamentals',
+    color: 'oklch(0.7 0.15 140)',
+    icon: FlaskConical,
+    filter: 'ml-fundamentals',
   },
-];
+  {
+    title: 'LLM Fundamentals',
+    description: 'How language models work',
+    href: '/docs/llm-fundamentals',
+    color: 'var(--fd-primary)',
+    icon: Cpu,
+    filter: 'llm-fundamentals',
+  },
+] as const;
 
 export function DocsSidebar({
   docs,
@@ -56,12 +68,46 @@ export function DocsSidebar({
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
   const [openChapters, setOpenChapters] = useState<Record<string, boolean>>({});
   const selected = useMemo(
-    () =>
-      sections.find((section) => pathname === section.href || pathname.startsWith(section.href)) ??
-      sections[0],
+    () => {
+      if (pathname.startsWith('/docs/ml-fundamentals')) {
+        return sections.find((s) => s.filter === 'ml-fundamentals')!;
+      }
+      if (pathname.startsWith('/docs/llm-fundamentals') || pathname.match(/^\/docs\/appendix-[a-z]-/)) {
+        return sections.find((s) => s.filter === 'llm-fundamentals')!;
+      }
+      if (pathname.match(/^\/docs\/part-\d+-/) || pathname.startsWith('/docs/long-form')) {
+        return sections.find((s) => s.filter === 'long-form')!;
+      }
+      return sections[0];
+    },
     [pathname],
   );
-  const sidebarTree = useMemo(() => buildSidebarTree(docs), [docs]);
+  const fullSidebarTree = useMemo(() => buildSidebarTree(docs), [docs]);
+  
+  // Filter sidebar tree based on selected section
+  const sidebarTree = useMemo(() => {
+    switch (selected.filter) {
+      case 'ml-fundamentals':
+        return fullSidebarTree.filter((s) => s.page.slug[0] === 'ml-fundamentals');
+      case 'llm-fundamentals':
+        return fullSidebarTree.filter((s) =>
+          s.page.slug[0] === 'llm-fundamentals' || s.page.slug[0]?.startsWith('appendix-')
+        );
+      case 'long-form':
+        return fullSidebarTree.filter((s) =>
+          s.page.slug[0]?.startsWith('part-') || s.page.slug[0] === 'long-form'
+        );
+      default:
+        // Handbook: everything except the dedicated sections
+        return fullSidebarTree.filter((s) =>
+          !s.page.slug[0]?.startsWith('part-') &&
+          !s.page.slug[0]?.startsWith('appendix-') &&
+          s.page.slug[0] !== 'ml-fundamentals' &&
+          s.page.slug[0] !== 'llm-fundamentals' &&
+          s.page.slug[0] !== 'long-form'
+        );
+    }
+  }, [fullSidebarTree, selected.filter]);
 
   useEffect(() => {
     // Find active section
@@ -412,6 +458,16 @@ function navLinkClass(active: boolean, child = false) {
 }
 
 function formatGroupTitle(group: string) {
+  // Handle appendix titles: "Appendix A — Foundations..." -> "A. Foundations..."
+  const appendixMatch = group.match(/^Appendix\s+([A-Z])\s*[—–-]\s*(.+)$/i);
+  if (appendixMatch) {
+    return `${appendixMatch[1]}. ${appendixMatch[2]}`;
+  }
+  // Handle part titles: "Part I — Foundations" -> "I. Foundations"
+  const partMatch = group.match(/^Part\s+([IVX]+)\s*[—–-]\s*(.+)$/i);
+  if (partMatch) {
+    return `${partMatch[1]}. ${partMatch[2]}`;
+  }
   return group.replace(':', ' - ');
 }
 

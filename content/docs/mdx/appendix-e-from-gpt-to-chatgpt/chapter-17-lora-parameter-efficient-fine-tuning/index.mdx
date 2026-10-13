@@ -268,3 +268,73 @@ In practice: LoRA is the default for almost everyone.
 - Typical rank `r=16` on LLaMA-7B reduces trainable parameters from 7B to ~131M — about 53× reduction.
 - After training, `W_merged = W + (α/r)·AB` can be computed once for zero-overhead inference.
 - **QLoRA** adds 4-bit quantization of the base model, bringing 7B fine-tuning within reach of consumer GPUs (~5GB).
+
+---
+
+## Deep Dive: The Complete LoRA Math
+
+**The core equation:**
+Given frozen pretrained weights $W_0 \in \mathbb{R}^{d \times k}$, LoRA adds a trainable low-rank update:
+
+$$W = W_0 + \Delta W = W_0 + \frac{\alpha}{r} BA$$
+
+Where $B \in \mathbb{R}^{d \times r}$, $A \in \mathbb{R}^{r \times k}$, and $r \ll \min(d, k)$.
+
+**Why this saves memory — the full accounting:**
+Full fine-tuning with Adam requires storing per-parameter:
+- Weights: 2 bytes (fp16)
+- Gradients: 2 bytes
+- Adam first moment: 4 bytes (fp32)
+- Adam second moment: 4 bytes (fp32)
+
+Total: 12 bytes per parameter.
+
+LoRA only trains $B$ and $A$. Original weights are frozen (no gradients needed for them). The parameter reduction:
+
+$$\frac{\text{LoRA params}}{\text{Full params}} = \frac{r(d+k)}{dk}$$
+
+For $d = k = 4096$, $r = 8$: ratio $= \frac{8 \times 8192}{4096^2} \approx \frac{1}{256}$. A 256× reduction in trainable parameters, with a proportional reduction in gradient and optimizer state memory.
+
+**Initialization — why start with $B = 0$:**
+Standard initialization:
+
+$$A \sim \mathcal{N}(0, \sigma^2), \quad B = 0$$
+
+At initialization: $\Delta W = BA = 0$. The model starts with exactly the same behavior as the pretrained model. This means training starts from a meaningful baseline — the first gradient update is a small perturbation around known-good behavior, not a random jump.
+
+**The $\alpha/r$ scaling:**
+The $\alpha/r$ scaling factor controls the effective magnitude of the update:
+
+$$\Delta W = \frac{\alpha}{r} BA$$
+
+If you double $r$, the individual $BA$ product effectively doubles in magnitude (because $B$ and $A$ are now larger matrices). Dividing by $r$ keeps the update magnitude roughly constant regardless of rank choice. Common practice: set $\alpha = 2r$ (making the ratio 2) or $\alpha = r$ (making the ratio 1).
+
+**What "rank" really means:**
+LoRA assumes the optimal task adaptation lies in a low-dimensional subspace:
+
+$$\text{rank}(\Delta W) \le r$$
+
+This is not "the original weights $W_0$ are low rank." It's claiming "the change needed to adapt this model to your task is low rank." Empirically, this holds for most fine-tuning scenarios — the task update is a directional push in parameter space, not a random full-rank perturbation.
+
+**PEFT method comparison:**
+
+| Method | Where it modifies | Inference overhead | Merge possible |
+|---|---|---|---|
+| Prompt Tuning | Input embeddings | Uses context tokens | No |
+| Prefix Tuning | Every layer's K/V | Extra compute per layer | No |
+| Adapter | Bottleneck module in each block | Extra sequential compute | No |
+| LoRA | Weight update (all linear layers) | None after merging | Yes |
+
+**Merge — deploying LoRA with zero overhead:**
+After training, you can fold LoRA back into the base weights:
+
+$$W_{\text{merged}} = W_0 + \frac{\alpha}{r} BA$$
+
+The result is a standard model with no extra layers or computation. The adaptation is baked in. Alternatively, keep $W_0$ separate and switch adapters dynamically — one base model, many specialized personalities, no memory overhead per adapter.
+
+**QLoRA — fitting fine-tuning on a single GPU:**
+Quantize the frozen base model to 4-bit:
+
+$$h = Q(W_0)x + \frac{\alpha}{r} BAx$$
+
+The quantized base model uses 4× less GPU memory. The LoRA adapters $A$ and $B$ are kept in full precision (bfloat16) — they're tiny, so the overhead is minimal. This made fine-tuning a 70B model possible on a single consumer GPU (with ~24GB VRAM), which was previously impossible.

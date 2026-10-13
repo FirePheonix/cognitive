@@ -5,5 +5,181 @@ lastUpdatedDate: '2026-08-05'
 
 # 9.6 Retry Safety
 
-This section covers the details of 9.6 Retry Safety.
+Not every tool failure is permanent. Network blips, rate limits, and temporary resource unavailability are all transient — retrying works. But retrying at the wrong time, with the wrong delay, or without distinguishing transient from permanent errors makes things worse.
 
+## The Core Pattern
+
+From `atlas-agents/ch03_tools_and_skills`:
+
+```python
+import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+def execute_with_retry(
+    registry,
+    tool_name: str,
+    args: dict,
+    max_retries: int = 2,
+) -> str:
+    """
+    Execute a tool with exponential backoff on transient failures.
+    Returns the result string (which may be an "Error: ..." string).
+    """
+    last_result = None
+
+    for attempt in range(max_retries + 1):
+        result = registry.execute_tool(tool_name, args)
+        last_result = result
+
+        if not result.startswith("Error:"):
+            return result  # Success
+
+        # Determine if this error is retryable
+        if is_permanent_error(result):
+            logger.warning(f"Permanent error on {tool_name}: {result}")
+            return result  # Don't retry permanent failures
+
+        if attempt < max_retries:
+            wait_time = 2 ** attempt  # 1s, 2s, 4s, ...
+            logger.info(f"Transient error on {tool_name} (attempt {attempt + 1}), retrying in {wait_time}s")
+            time.sleep(wait_time)
+
+    return last_result  # Return last result even if still an error
+
+
+def is_permanent_error(error_str: str) -> bool:
+    """
+    Distinguish errors that retrying won't fix from transient failures.
+    """
+    permanent_patterns = [
+        "not found",
+        "permission denied",
+        "invalid argument",
+        "not allowed",
+        "does not exist",
+        "authentication failed",
+        "forbidden",
+    ]
+    lower = error_str.lower()
+    return any(p in lower for p in permanent_patterns)
+```
+
+## Transient vs. Permanent Errors
+
+| Error | Type | Action |
+|---|---|---|
+| HTTP 429 (Rate Limited) | Transient | Retry with backoff |
+| HTTP 503 (Service Unavailable) | Transient | Retry with backoff |
+| Network timeout | Transient | Retry |
+| HTTP 404 (Not Found) | Permanent | Fail fast |
+| HTTP 403 (Forbidden) | Permanent | Fail fast |
+| HTTP 400 (Bad Request) | Permanent | Fail fast (bad args) |
+| File not found | Permanent | Fail fast |
+| Permission denied | Permanent | Fail fast |
+| Database constraint violation | Permanent | Fail fast |
+
+Retrying a 404 is wasteful. Retrying a 429 is necessary. The distinction matters at scale.
+
+## Rate Limit Detection
+
+```python
+import re
+
+def is_rate_limited(error_str: str) -> bool:
+    return any(indicator in error_str.lower() for indicator in [
+        "rate limit",
+        "429",
+        "too many requests",
+        "quota exceeded",
+        "throttled",
+    ])
+
+
+def execute_with_rate_limit_aware_retry(
+    registry,
+    tool_name: str,
+    args: dict,
+    max_retries: int = 3,
+) -> str:
+    for attempt in range(max_retries + 1):
+        result = registry.execute_tool(tool_name, args)
+
+        if not result.startswith("Error:"):
+            return result
+
+        if is_rate_limited(result):
+            # Rate limits need longer backoff
+            wait_time = 5 * (2 ** attempt)  # 5s, 10s, 20s, 40s
+            logger.info(f"Rate limited on {tool_name}, waiting {wait_time}s")
+            time.sleep(wait_time)
+        elif is_permanent_error(result):
+            return result
+        else:
+            # Generic transient error
+            wait_time = 2 ** attempt
+            time.sleep(wait_time)
+
+    return result
+```
+
+## HTTP Retry with `tenacity`
+
+For HTTP-based tools, `tenacity` provides a clean decorator-based retry:
+
+```python
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+)
+import requests
+import logging
+
+logger = logging.getLogger(__name__)
+
+@retry(
+    retry=retry_if_exception_type((requests.Timeout, requests.ConnectionError)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+)
+def fetch_url(url: str) -> str:
+    response = requests.get(url, timeout=5)
+    response.raise_for_status()
+    return response.text
+```
+
+`tenacity` handles the backoff math and logging. Use it for external HTTP calls. Use manual retry logic for tool results that return error strings (no exceptions to catch).
+
+## The Retry Budget Per Agent Turn
+
+Set a global budget, not just per-tool:
+
+```python
+class BudgetedRegistry:
+    def __init__(self, registry, max_total_retries: int = 5):
+        self.registry = registry
+        self.max_total_retries = max_total_retries
+        self.total_retries_used = 0
+
+    def execute_with_retry(self, tool_name: str, args: dict) -> str:
+        for attempt in range(3):  # Max 3 attempts per tool
+            if self.total_retries_used >= self.max_total_retries:
+                return "Error: Retry budget exhausted for this agent turn."
+
+            result = self.registry.execute_tool(tool_name, args)
+
+            if not result.startswith("Error:") or is_permanent_error(result):
+                return result
+
+            self.total_retries_used += 1
+            time.sleep(2 ** attempt)
+
+        return result
+```
+
+Without a global budget, a single flaky tool can consume all retries while other tools wait. The agent turn should have a wall-clock time budget (see [Tool Timeouts](./98-tool-timeouts)) and a retry count budget.

@@ -5,5 +5,196 @@ lastUpdatedDate: '2026-08-05'
 
 # 7.5 AWQ
 
-This section covers the details of 7.5 AWQ.
+AWQ (Activation-aware Weight Quantization) is a 4-bit post-training quantization method that typically outperforms GPTQ. The key insight: not all weights are equally important. Protecting a small fraction of salient weights during quantization preserves far more model quality than treating all weights uniformly.
 
+## The Observation: Salient Channels
+
+When researchers analyzed which weights cause the most quantization damage, they found a consistent pattern:
+
+**Activation magnitudes are not uniform**. Some input channels (dimensions) have consistently high activation values across many inputs. The weights connected to these "salient" channels are disproportionately important for the model's output.
+
+```
+Example: a weight matrix row with input dimension magnitudes:
+  dim 0:  activation magnitude ~0.1  (low importance)
+  dim 1:  activation magnitude ~0.2  (low importance)
+  ...
+  dim 47: activation magnitude ~8.5  (HIGH IMPORTANCE ← salient channel)
+  ...
+  dim 256: activation magnitude ~0.3 (low importance)
+```
+
+If you quantize the weight at dim 47 with a coarse 4-bit grid, you introduce significant absolute error on a dimension that strongly affects the output. Quantizing the weight at dim 0 with the same coarseness causes much less damage.
+
+## AWQ's Approach: Per-Channel Scaling
+
+AWQ's insight: before quantizing, **scale the salient channels to reduce their quantization error**, and compensate by inversely scaling the corresponding weights.
+
+For each weight column `i`:
+
+```
+Original operation:
+  output += activation[i] × weight[i]  (float computation)
+
+AWQ scaled operation:
+  output += (activation[i] × s[i]) × (weight[i] / s[i])
+
+If s[i] > 1 for salient channels:
+  activation[i] × s[i]: larger — but still in fp16 (no loss)
+  weight[i] / s[i]:     smaller — better quantization granularity for int4!
+```
+
+The mathematical output is identical. But `weight[i] / s[i]` has a smaller range → when quantized to int4, the scale is smaller → less quantization error.
+
+For non-salient channels, `s[i] = 1` (no change).
+
+## How AWQ Finds Salient Channels
+
+AWQ identifies salient channels by running a small calibration set through the model and measuring per-channel activation magnitudes:
+
+```python
+def find_salient_channels(model, calibration_data, n_top_percent=1.0):
+    activation_magnitudes = {}
+    
+    def hook_fn(module, input, output, layer_name):
+        x = input[0]
+        magnitude = x.abs().mean(dim=0)  # average magnitude per channel
+        activation_magnitudes[layer_name] = magnitude.cpu()
+    
+    # Register hooks on all linear layers
+    hooks = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            hooks.append(module.register_forward_hook(
+                lambda m, i, o, n=name: hook_fn(m, i, o, n)
+            ))
+    
+    # Run calibration data
+    with torch.no_grad():
+        for batch in calibration_data:
+            model(batch)
+    
+    # Remove hooks
+    for h in hooks:
+        h.remove()
+    
+    return activation_magnitudes
+```
+
+Channels in the top 1% of activation magnitude are considered salient. These receive a larger scale factor `s[i]` during quantization.
+
+## Installation and Usage
+
+```bash
+pip install autoawq
+```
+
+### Quantizing a Model
+
+```python
+from awq import AutoAWQForCausalLM
+from transformers import AutoTokenizer
+
+model_path = "meta-llama/Meta-Llama-3-8B-Instruct"
+quant_path = "llama-3-8b-awq"
+
+# Load model
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+model = AutoAWQForCausalLM.from_pretrained(
+    model_path,
+    device_map="auto",
+    safetensors=True,
+)
+
+# Quantization config
+quant_config = {
+    "zero_point": True,   # asymmetric quantization
+    "q_group_size": 128,  # per-group scale
+    "w_bit": 4,           # int4
+    "version": "GEMM",    # inference kernel (GEMM for batch, GEMV for single-token)
+}
+
+# Quantize (uses calibration data from "pileval" dataset by default)
+model.quantize(tokenizer, quant_config=quant_config)
+
+# Save
+model.save_quantized(quant_path)
+tokenizer.save_pretrained(quant_path)
+print(f"Model saved to {quant_path}")
+```
+
+### Loading and Using a Quantized Model
+
+```python
+from awq import AutoAWQForCausalLM
+from transformers import AutoTokenizer
+
+model = AutoAWQForCausalLM.from_quantized(
+    "TheBloke/Llama-2-7B-AWQ",
+    fuse_layers=True,    # fuse attention layers for faster inference
+    device_map="auto",
+)
+tokenizer = AutoTokenizer.from_pretrained("TheBloke/Llama-2-7B-AWQ")
+
+inputs = tokenizer("Explain quantum computing:", return_tensors="pt").to("cuda")
+output = model.generate(**inputs, max_new_tokens=200, temperature=0.7)
+print(tokenizer.decode(output[0], skip_special_tokens=True))
+```
+
+### Using with vLLM
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model TheBloke/Llama-2-7B-AWQ \
+    --quantization awq \
+    --dtype float16 \
+    --max-model-len 4096
+```
+
+## AWQ vs GPTQ Benchmark Comparison
+
+On the same models and hardware, AWQ generally outperforms GPTQ:
+
+| Model | Metric | fp16 | GPTQ int4 | AWQ int4 | AWQ advantage |
+|---|---|---|---|---|---|
+| Llama-2-7B | MMLU | 45.3% | 43.1% | 44.2% | +1.1% |
+| Llama-2-13B | MMLU | 54.8% | 52.4% | 53.7% | +1.3% |
+| Llama-2-7B | GSM8K | 14.3% | 11.8% | 13.1% | +1.3% |
+| Mistral-7B | MMLU | 63.7% | 60.5% | 62.1% | +1.6% |
+
+AWQ also tends to be faster in inference (better kernel implementations) and requires less time to quantize than GPTQ (no sequential column processing).
+
+## Quantization Time
+
+AWQ is significantly faster to quantize than GPTQ:
+
+| Model | AWQ time | GPTQ time |
+|---|---|---|
+| 7B | ~5–10 minutes | ~30 minutes |
+| 13B | ~15–20 minutes | ~1 hour |
+| 70B | ~1–2 hours | ~8 hours |
+
+The speedup comes from AWQ's simpler per-channel scaling approach vs GPTQ's sequential Hessian-based column optimization.
+
+## When to Choose AWQ vs GPTQ
+
+| Consideration | AWQ | GPTQ |
+|---|---|---|
+| Quality | Slightly better | Good |
+| Quantization speed | Faster | Slower |
+| Inference speed | Slightly faster (better kernels) | Good |
+| Hardware support | A100/H100/RTX | Broader |
+| Pre-quantized models | Many available | More available |
+| Active development | Yes | Mature/stable |
+
+**Default recommendation**: AWQ for new deployments. It's faster to quantize, slightly better quality, and has good tooling. Use GPTQ if you need a pre-quantized model that only exists in GPTQ format, or if you're on older hardware with better GPTQ kernel support.
+
+## Summary
+
+- AWQ identifies "salient" channels via activation magnitude analysis on a small calibration set
+- Salient channels (top 1% by activation magnitude) receive per-channel scaling that reduces their quantization error
+- The scaling is mathematically transparent — output is identical before/after the scale transformation
+- AWQ outperforms GPTQ by ~1–2% on most benchmarks
+- AWQ is 5–10× faster to quantize than GPTQ
+- Available via `autoawq` library and `--quantization awq` in vLLM
+- Pre-quantized AWQ models available on HuggingFace
+- Default choice for new int4 quantization deployments

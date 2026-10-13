@@ -5,5 +5,193 @@ lastUpdatedDate: '2026-08-05'
 
 # 11.6 Graceful Degradation
 
-This section covers the details of 11.6 Graceful Degradation.
+When your primary model is down, your application should degrade — not fail. Users should get a slightly worse response (slower, simpler, less capable) rather than an error page. The goal: maintain availability at the cost of quality when necessary.
 
+> "A 7B local model that returns a useful 80% answer is infinitely better than no response."
+
+## The Provider Fallback Chain
+
+Never build an application with a single model provider. Always have a fallback chain:
+
+```
+GPT-4o → Claude Sonnet → Gemini Flash → local Llama (never zero availability)
+```
+
+The chain ensures you always have *something* to fall back to, with local models as the final backstop that requires no external connectivity.
+
+## The Circuit-Breaker Pattern
+
+From `atlas-agents/ch07_model_portability/online/model_router.py`:
+
+```python
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+
+@dataclass
+class CircuitBreaker:
+    cooldown_seconds: int = 120
+    failure_threshold: int = 3
+    _failures: int = 0
+    _last_failure: datetime | None = None
+
+    def is_open(self) -> bool:
+        """Open circuit = provider is on cooldown, skip it."""
+        if self._failures < self.failure_threshold:
+            return False
+        if self._last_failure is None:
+            return False
+        elapsed = datetime.now() - self._last_failure
+        return elapsed < timedelta(seconds=self.cooldown_seconds)
+
+    def record_failure(self):
+        self._failures += 1
+        self._last_failure = datetime.now()
+
+    def record_success(self):
+        self._failures = 0
+        self._last_failure = None
+
+    def time_until_reset(self) -> float:
+        """Seconds until cooldown expires. 0 if not in cooldown."""
+        if not self.is_open():
+            return 0.0
+        elapsed = (datetime.now() - self._last_failure).total_seconds()
+        return max(0.0, self.cooldown_seconds - elapsed)
+
+
+class GracefulRouter:
+    """Routes to the best available provider, skipping those on cooldown."""
+
+    def __init__(self, priority_order: list[str]):
+        self.priority_order = priority_order
+        self.breakers = {p: CircuitBreaker() for p in priority_order}
+
+    def complete(self, messages: list, **kwargs) -> tuple[str, str]:
+        """
+        Returns (response_text, model_used).
+        Tries providers in priority order, skipping those on cooldown.
+        """
+        for provider in self.priority_order:
+            if self.breakers[provider].is_open():
+                continue
+
+            try:
+                response = call_provider(provider, messages, **kwargs)
+                self.breakers[provider].record_success()
+                return response, provider
+
+            except Exception as e:
+                self.breakers[provider].record_failure()
+                continue  # Try next provider
+
+        raise RuntimeError("All providers are unavailable.")
+
+    def health_report(self) -> dict:
+        return {
+            provider: {
+                "available": not breaker.is_open(),
+                "failures": breaker._failures,
+                "cooldown_remaining_s": breaker.time_until_reset(),
+            }
+            for provider, breaker in self.breakers.items()
+        }
+```
+
+## Configuring the Fallback Chain
+
+```python
+# Priority order: best model first, local fallback last
+router = GracefulRouter(priority_order=[
+    "gpt-4o",               # Primary: best quality
+    "claude-sonnet-4-6",    # Fallback 1: comparable quality
+    "gemini/gemini-2.0-flash",  # Fallback 2: faster, slightly lower quality
+    "ollama/llama3:8b",     # Fallback 3: local, free, works offline
+])
+```
+
+## Signaling Degradation to Users
+
+When serving from a fallback, tell users (or logging systems) which tier they're on:
+
+```python
+response, model_used = router.complete(messages)
+
+# Attach degradation metadata
+is_degraded = model_used != "gpt-4o"  # Not the primary model
+quality_tier = get_model_tier(model_used)
+
+if is_degraded:
+    # Don't necessarily tell the user — but log it and maybe add a note
+    log_degraded_response(model_used, quality_tier)
+
+    if quality_tier == "local":
+        # Local model may be significantly weaker — surface this
+        response += "\n\n*Note: Responses may be less detailed than usual due to service degradation.*"
+```
+
+## Automatic Recovery
+
+The circuit breaker resets automatically after the cooldown. But you can also probe for recovery proactively:
+
+```python
+import threading
+import time
+
+class SelfHealingRouter(GracefulRouter):
+    def __init__(self, priority_order: list[str]):
+        super().__init__(priority_order)
+        self._start_recovery_probe()
+
+    def _start_recovery_probe(self):
+        """Background thread probes degraded providers every 60s."""
+        def probe():
+            while True:
+                time.sleep(60)
+                for provider, breaker in self.breakers.items():
+                    if breaker.is_open():
+                        try:
+                            # Lightweight probe call
+                            call_provider(provider, [{"role": "user", "content": "ping"}], max_tokens=1)
+                            breaker.record_success()  # Provider is back
+                        except Exception:
+                            pass  # Still down
+
+        thread = threading.Thread(target=probe, daemon=True)
+        thread.start()
+```
+
+## Graceful Degradation Beyond Model Selection
+
+Model fallback is one dimension. The full graceful degradation strategy:
+
+| Level | What fails | Fallback |
+|---|---|---|
+| 1 | Primary model API | Secondary model |
+| 2 | All cloud models | Local model |
+| 3 | All generation fails | Cached response (last good response) |
+| 4 | No useful response available | Safe error message with retry guidance |
+
+```python
+def ultra_resilient_complete(messages: list, cache: dict) -> str:
+    # Level 1 & 2: Try models in fallback chain
+    try:
+        response, model = router.complete(messages)
+        cache_key = compute_cache_key(messages)
+        cache[cache_key] = response  # Update cache on success
+        return response
+    except RuntimeError:
+        pass  # All models down
+
+    # Level 3: Return cached response if available
+    cache_key = compute_cache_key(messages)
+    if cache_key in cache:
+        return cache[cache_key] + "\n\n*(Note: This response is from cache due to service unavailability.)*"
+
+    # Level 4: Safe error message
+    return (
+        "I'm temporarily unable to process your request due to service issues. "
+        "Please try again in a few minutes."
+    )
+```
+
+Never let an uncaught exception propagate from your model routing layer to the user.

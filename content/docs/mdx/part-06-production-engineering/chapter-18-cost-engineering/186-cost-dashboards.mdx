@@ -5,5 +5,108 @@ lastUpdatedDate: '2026-08-05'
 
 # 18.6 Cost Dashboards
 
-This section covers the details of 18.6 Cost Dashboards.
+Real-time cost visibility is a production requirement, not a nice-to-have. If you find out about a cost spike from your billing statement, you found out too late.
 
+## What to Track
+
+### Daily Cost by Model
+
+```
+Daily LLM Spend — Last 7 Days
+───────────────────────────────────────────────
+Date         claude-sonnet  claude-haiku  gpt-4o   Total
+───────────────────────────────────────────────
+2026-07-30   $12.40         $2.10        $0.80    $15.30
+2026-07-31   $11.80         $2.30        $0.90    $15.00
+2026-08-01   $13.10         $2.20        $0.70    $16.00
+2026-08-02   $45.20  ⚠️     $8.90  ⚠️   $0.80    $54.90  ← spike
+2026-08-03   $14.20         $2.40        $0.90    $17.50
+2026-08-04   $12.90         $2.10        $0.70    $15.70
+2026-08-05   $13.50         $2.30        $0.80    $16.60
+```
+
+### Cost Per Feature (Weekly)
+
+```
+Feature Cost Breakdown — Week of 2026-07-28
+──────────────────────────────────────────────
+Feature           Calls    Total Cost   Avg/Call
+──────────────────────────────────────────────
+code_review       2,340    $93.60       $0.040
+research_agent      890    $178.00      $0.200
+summarization     5,100    $15.30       $0.003
+newsletter_crew      45    $6.03        $0.134
+guardrails        8,440    $8.44        $0.001
+──────────────────────────────────────────────
+Total            16,815   $301.37
+```
+
+## Alert Thresholds
+
+```python
+COST_ALERTS = {
+    # Spike detection
+    "daily_spend_multiplier": 2.0,      # Alert if today > 2× yesterday
+    "hourly_spend_max": 5.00,           # Alert if any hour exceeds $5
+
+    # Budget alerts
+    "monthly_budget_warning": 0.80,     # Alert at 80% of monthly budget
+    "monthly_budget_hard": 0.95,        # Alert at 95% — escalate
+
+    # Feature anomalies
+    "feature_cost_multiplier": 3.0,     # Alert if feature cost > 3× rolling average
+}
+
+def check_cost_alerts(daily_costs: dict):
+    today = daily_costs["today"]
+    yesterday = daily_costs["yesterday"]
+
+    if yesterday > 0 and today / yesterday > COST_ALERTS["daily_spend_multiplier"]:
+        send_alert(
+            level="warning",
+            message=f"Daily spend spike: ${today:.2f} today vs ${yesterday:.2f} yesterday",
+        )
+```
+
+## LangSmith for Traced Agents
+
+LangSmith provides per-run cost tracking for any agent that uses LangChain. Costs appear in the trace UI automatically:
+
+```python
+from langchain_anthropic import ChatAnthropic
+from langchain_core.callbacks import LangChainTracer
+
+# Costs are tracked automatically per trace
+llm = ChatAnthropic(
+    model="claude-sonnet-4-6",
+    callbacks=[LangChainTracer(project_name="production-agent")],
+)
+```
+
+Navigate to LangSmith → your project → click any trace → see token counts and cost in the sidebar.
+
+## Grafana / DataDog Integration
+
+For full control, pipe LiteLLM cost data to your observability stack:
+
+```python
+# Send cost metrics to StatsD (Grafana / DataDog compatible)
+import statsd
+
+statsd_client = statsd.StatsClient("localhost", 8125, prefix="llm")
+
+def track_with_statsd(response, feature: str, tenant_id: str):
+    cost = litellm.completion_cost(completion_response=response)
+    tokens = response.usage.total_tokens
+
+    # These become Grafana time-series graphs
+    statsd_client.gauge(f"cost.feature.{feature}", cost)
+    statsd_client.gauge(f"tokens.tenant.{tenant_id}", tokens)
+    statsd_client.incr(f"calls.feature.{feature}")
+```
+
+Grafana dashboard panels to build:
+- **Time series**: daily spend by model (line chart)
+- **Bar chart**: cost by feature (weekly aggregation)
+- **Gauge**: current month spend vs. budget
+- **Alert rule**: trigger PagerDuty if hourly spend exceeds $5

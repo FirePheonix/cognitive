@@ -5,5 +5,180 @@ lastUpdatedDate: '2026-08-05'
 
 # 4.4 Cache Reuse
 
-This section covers the details of 4.4 Cache Reuse.
+If two requests share the same prefix — even partially — there's no reason to recompute the KV cache for that prefix. Computing it once and reusing it is one of the highest-leverage optimizations in production inference systems.
 
+## Prefix Sharing: The Core Idea
+
+When multiple requests have identical leading content, the KV vectors for that prefix are identical. Share them:
+
+```
+Request 1:
+  System: "You are a helpful coding assistant. [2000 tokens of context]"
+  User:   "How do I sort a list in Python?"
+
+Request 2:
+  System: "You are a helpful coding assistant. [2000 tokens of context]"
+  User:   "What is a list comprehension?"
+
+The system prompt (2000 tokens) is identical.
+→ Compute KV cache once, share across both requests.
+```
+
+Without caching: 2 × 2000 tokens of prefill.  
+With prefix sharing: 1 × 2000 tokens of prefill + 2 tiny incremental prefills.
+
+At scale — thousands of requests per hour with the same system prompt — this translates to massive compute and cost savings.
+
+## Anthropic's Prompt Caching
+
+Anthropic exposes prefix caching directly through the API. Mark content with `cache_control` to tell the provider where to cache:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+# Mark the system prompt as cacheable
+response = client.messages.create(
+    model="claude-opus-4-5",
+    max_tokens=1024,
+    system=[
+        {
+            "type": "text",
+            "text": (
+                "You are an expert software architect with 20 years of experience. "
+                "You specialize in distributed systems, cloud architecture, and "
+                "performance engineering. When answering questions, you provide "
+                "concrete examples, consider trade-offs carefully, and reference "
+                "real-world systems where relevant.\n\n"
+                # ... continue for 1000+ tokens
+            ),
+            "cache_control": {"type": "ephemeral"},
+        }
+    ],
+    messages=[{"role": "user", "content": "How should I design a rate limiter?"}]
+)
+
+print(response.usage)
+# cache_creation_input_tokens: 1200  (first request — paid to create)
+# cache_read_input_tokens: 0
+# input_tokens: 12                   (just the user message)
+```
+
+On subsequent requests with the same system prompt:
+
+```python
+response2 = client.messages.create(
+    model="claude-opus-4-5",
+    max_tokens=1024,
+    system=[
+        {
+            "type": "text", 
+            "text": "... same system prompt ...",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ],
+    messages=[{"role": "user", "content": "What is consistent hashing?"}]
+)
+
+print(response2.usage)
+# cache_creation_input_tokens: 0
+# cache_read_input_tokens: 1200   ← cache hit!
+# input_tokens: 8
+```
+
+### Anthropic Cache Economics
+
+| Token type | Claude Opus price | Notes |
+|---|---|---|
+| Regular input | $15 / MTok | Full prefill cost |
+| Cache write | $18.75 / MTok | 25% premium to write cache |
+| Cache read | $1.50 / MTok | 90% discount vs regular |
+| Output | $75 / MTok | Unaffected |
+
+The math: write once, read many times. After just 2 cache hits, you're saving money. After 10 hits, you've saved ~85% of that system prompt's cost.
+
+### Minimum Length Requirements
+
+Anthropic requires at least **1,024 tokens** in a cacheable block. There's no benefit in caching a 50-token system prompt — the overhead isn't worth it.
+
+OpenAI implements automatic prefix caching for prompts ≥1,024 tokens (no explicit marking needed as of late 2024).
+
+## Structuring Prompts to Maximize Cache Hits
+
+The cacheable prefix must be **identical byte-for-byte** to the previous request. Any change — even whitespace — busts the cache.
+
+**Design principle: stable content first, dynamic content last.**
+
+```python
+# ✓ Optimal structure for caching
+messages = [
+    {
+        "role": "system",
+        "content": STABLE_SYSTEM_PROMPT,   # 2000 tokens, never changes
+        "cache_control": {"type": "ephemeral"},
+    },
+    *FEW_SHOT_EXAMPLES,                    # 1000 tokens, same every request
+    {
+        "role": "user", 
+        "content": user_query,             # varies per request
+    }
+]
+
+# ✗ Kills cache hits
+messages = [
+    {
+        "role": "system",
+        "content": f"User ID: {user_id}\nTimestamp: {timestamp}\n" + SYSTEM_PROMPT,
+        # ^ Different every request → cache never hits
+    }
+]
+```
+
+Move any request-specific data (user IDs, timestamps, session context) to the end of the prompt or into the user turn. Keep the system prompt clean and stable.
+
+## Multi-Turn Conversation Caching
+
+Multi-turn conversations benefit from caching automatically — each new turn extends the cached prefix rather than recomputing it:
+
+```
+Turn 1:  System (2000 tokens) + User1 (20 tokens)
+         → Pay full prefill for 2020 tokens
+         → Cache created for entire 2020-token prefix
+
+Turn 2:  System (2000 tokens) + User1 + Assistant1 + User2 (50 tokens)
+         → Cache hit on first 2020 tokens
+         → Pay only for the 50 new tokens (+ cache write for new prefix)
+
+Turn 3:  ... + 80 more tokens
+         → Cache hit on first 2070 tokens
+         → Pay only for 80 new tokens
+```
+
+Without caching, turn 10 of a conversation might cost 10× turn 1. With caching, each turn costs roughly the same (just the new tokens).
+
+## Server-Side vs Application-Level Caching
+
+**Server-side prefix caching** (Anthropic, OpenAI, vLLM):
+- Handled transparently by the inference server
+- No client code changes needed
+- Cache stored in GPU memory
+- Limited by GPU memory and cache lifetime
+
+**Application-level caching** (roll your own):
+- Store the raw text of the response in Redis/Memcached
+- Return cached text without hitting the LLM at all
+- Only works for exact prompt matches
+- Unlimited duration, but misses any semantic similarity
+
+Both are complementary. Use application-level caching for truly identical requests (e.g., same FAQ question), and provider-side prefix caching for shared system prompts.
+
+## Summary
+
+- Prefix sharing: if two requests share the same leading tokens, compute KV cache once and reuse
+- Anthropic's prompt caching: mark content with `cache_control`, save 90% on cache hits
+- Minimum 1,024 tokens required for caching to be worthwhile
+- Cache hits require **byte-identical** prefixes — dynamic content busts the cache
+- Structure prompts: stable (system prompt, examples) → dynamic (user input)
+- Multi-turn conversations benefit automatically — each turn extends rather than replaces the cache
+- Application-level caching (exact match) complements provider-side prefix caching

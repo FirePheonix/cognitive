@@ -5,5 +5,107 @@ lastUpdatedDate: '2026-08-05'
 
 # 16.3 Shadow Deployments
 
-This section covers the details of 16.3 Shadow Deployments.
+A shadow deployment runs a new agent version **in parallel with the production version** — it receives and processes all real traffic, but its responses are discarded. Users see only the production response.
 
+This is the safest way to test a new version at full production scale before any user is affected.
+
+## The Shadow Architecture
+
+```
+User Request
+     │
+     ▼
+  Router
+  ┌──────┬──────────────────────────────┐
+  │      │                              │
+  ▼      ▼                              │
+Current  Shadow                         │
+Version  Version                        │
+  │      │                              │
+  │      ├─► Response discarded         │
+  │      └─► Logged for comparison ─────┘
+  │
+  ▼
+User Response (always from Current)
+```
+
+```python
+async def shadow_router(user_input: str, session_id: str):
+    # Always run current version — this is what the user receives
+    current_response = await current_agent.run(user_input)
+
+    # Fire-and-forget shadow run — user doesn't wait for this
+    asyncio.create_task(
+        run_shadow(user_input, session_id, current_response)
+    )
+
+    return current_response
+
+
+async def run_shadow(user_input: str, session_id: str, current_response: str):
+    try:
+        shadow_response = await shadow_agent.run(user_input)
+        await log_shadow_comparison(
+            session_id=session_id,
+            input=anonymize(user_input),
+            current=current_response,
+            shadow=shadow_response,
+            timestamp=datetime.utcnow(),
+        )
+    except Exception as e:
+        # Shadow failures are silent — never affect production
+        logger.warning(f"Shadow run failed for session {session_id}: {e}")
+```
+
+## What Shadow Deployments Reveal
+
+| Issue | Detectable in Shadow? |
+|---|---|
+| New failure modes on real user inputs | Yes |
+| Latency regression | Yes |
+| Cost increase (token count) | Yes |
+| Behavior differences on edge cases | Yes |
+| Safety regressions | Yes |
+| User satisfaction impact | No (shadow responses not shown) |
+
+Shadow deployments are especially valuable for catching **edge cases that your golden dataset doesn't cover** — the long tail of real user inputs.
+
+## Evaluating Shadow vs. Current
+
+After collecting shadow comparisons, run a pairwise evaluation (see [15.7 Pairwise Evaluation](/docs/part-05-evaluation/chapter-15-evaluation-fundamentals/157-pairwise-evaluation)):
+
+```python
+def analyze_shadow_results(comparisons: list[ShadowComparison]) -> ShadowAnalysis:
+    pairwise_results = []
+    for comp in comparisons:
+        result = pairwise_consensus(
+            question=comp.input,
+            answer_a=comp.current,
+            answer_b=comp.shadow,
+        )
+        pairwise_results.append(result)
+
+    shadow_wins = sum(1 for r in pairwise_results if r.winner == "B")
+    current_wins = sum(1 for r in pairwise_results if r.winner == "A")
+    ties = sum(1 for r in pairwise_results if r.winner in ("tie", "ambiguous"))
+    total = len(pairwise_results)
+
+    return ShadowAnalysis(
+        shadow_win_rate=shadow_wins / total,
+        current_win_rate=current_wins / total,
+        tie_rate=ties / total,
+        recommendation="promote" if shadow_wins / total > 0.55 else "hold",
+    )
+```
+
+## Promotion Decision
+
+Only promote the shadow agent to production if:
+
+1. Shadow win rate ≥ 55% (meaningfully better, not just noise)
+2. Shadow hallucination rate ≤ production hallucination rate
+3. Shadow latency p99 ≤ production latency p99 × 1.10 (within 10%)
+4. Shadow cost per call ≤ production cost × 1.20 (cost regression acceptable only with quality gain)
+5. No new failure categories surfaced in shadow logs
+
+A shadow deployment that reveals new failures has done its job — don't promote, fix the failures first.

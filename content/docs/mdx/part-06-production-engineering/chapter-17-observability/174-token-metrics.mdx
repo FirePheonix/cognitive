@@ -5,5 +5,141 @@ lastUpdatedDate: '2026-08-05'
 
 # 17.4 Token Metrics
 
-This section covers the details of 17.4 Token Metrics.
+Token usage is the primary cost driver for LLM-powered applications. Without token tracking, you're operating blind — unable to optimize costs, detect abuse, allocate budgets, or understand which features are expensive.
 
+## Input vs Output Tokens
+
+| Token Type | Typical Price | Notes |
+|------------|--------------|-------|
+| **Input tokens** | Lower | Everything in the context window: system prompt, history, tool results |
+| **Output tokens** | Higher (2-3×) | What the model generates |
+
+The implication: long system prompts are expensive, but a verbose model is more expensive. Agents with many tool result injections accumulate significant input token costs.
+
+## The Cost Formula
+
+```python
+def calculate_cost(
+    input_tokens: int,
+    output_tokens: int,
+    model: str,
+) -> float:
+    # Prices per million tokens (as of 2026 — verify current pricing)
+    PRICES = {
+        "claude-opus-4-5": {
+            "input":  15.00 / 1_000_000,
+            "output": 75.00 / 1_000_000,
+        },
+        "claude-haiku-4-5-20251001": {
+            "input":  0.80 / 1_000_000,
+            "output": 4.00 / 1_000_000,
+        },
+        "gpt-4o": {
+            "input":  2.50 / 1_000_000,
+            "output": 10.00 / 1_000_000,
+        },
+    }
+
+    prices = PRICES.get(model, PRICES["claude-opus-4-5"])
+    return (input_tokens * prices["input"]) + (output_tokens * prices["output"])
+```
+
+LiteLLM's `completion_cost()` handles this automatically across all providers and stays current with pricing changes:
+
+```python
+from litellm import completion_cost
+
+# After any LiteLLM completion call
+cost = completion_cost(completion_response=response)
+```
+
+## Tracking Per Model, Feature, User
+
+Track token usage at multiple granularities:
+
+```python
+@dataclass
+class TokenUsageRecord:
+    timestamp: datetime
+    model: str
+    feature: str      # "code_review", "research", "summarization"
+    user_id: str
+    session_id: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+
+def record_token_usage(span: LLMSpan, feature: str, user_id: str) -> None:
+    record = TokenUsageRecord(
+        timestamp=span.start_time,
+        model=span.model,
+        feature=feature,
+        user_id=user_id,
+        session_id=span.trace_id,
+        input_tokens=span.input_tokens,
+        output_tokens=span.output_tokens,
+        cost_usd=calculate_cost(span.input_tokens, span.output_tokens, span.model),
+    )
+    # Real-time: Redis for current totals
+    redis.incrbyfloat(f"cost:user:{user_id}:today", record.cost_usd)
+    redis.incrbyfloat(f"cost:feature:{feature}:today", record.cost_usd)
+
+    # Historical: Postgres for analysis
+    db.insert("token_usage", record)
+```
+
+## Redis for Real-Time Tracking
+
+```python
+# Increment on every LLM call — O(1) per call
+def track_usage_realtime(user_id: str, tokens: int, cost: float) -> None:
+    pipe = redis.pipeline()
+    pipe.incr(f"tokens:user:{user_id}:minute")
+    pipe.expire(f"tokens:user:{user_id}:minute", 60)
+    pipe.incrbyfloat(f"cost:user:{user_id}:day", cost)
+    pipe.expire(f"cost:user:{user_id}:day", 86400)
+    pipe.execute()
+
+# Check before allowing a request
+def check_user_budget(user_id: str, daily_limit_usd: float) -> bool:
+    current_spend = float(redis.get(f"cost:user:{user_id}:day") or 0)
+    return current_spend < daily_limit_usd
+```
+
+## Token Cost by Component
+
+Understanding where tokens come from helps with optimization:
+
+```
+Typical agent request token breakdown:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+System prompt           │███░░░░░░░│  800 tokens
+Conversation history    │█░░░░░░░░░│  300 tokens
+Tool definitions        │████░░░░░░│ 1,200 tokens
+Tool results (fetched)  │██████████│ 3,500 tokens  ← often the biggest
+User message            │░░░░░░░░░░│  150 tokens
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Total input             5,950 tokens
+Model output              800 tokens
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Tool results dominate because agents inject the full text of fetched content. Truncating or summarizing tool results before injection can significantly reduce costs.
+
+## Dashboards and Alerts
+
+Key metrics to surface:
+
+| Metric | Alert Threshold |
+|--------|----------------|
+| Cost per request | >2× historical average |
+| Daily user cost | >$X (configurable per plan) |
+| Total daily cost | >Y% of budget |
+| Input/output ratio | Abnormally high output suggests verbose model behavior |
+| Cost per feature | Track which features are cost centers |
+
+## Related Sections
+
+- [17.5 Latency Analysis](./175-latency-analysis) — latency and token tracking share the same span data
+- [19.4 Rate Limiting](../chapter-19-reliability-engineering/194-rate-limiting) — token-per-minute rate limiting builds on this tracking
+- [17.3 Spans](./173-spans) — token data lives in LLM spans

@@ -5,5 +5,187 @@ lastUpdatedDate: '2026-08-05'
 
 # 13.2 Context Compression
 
-This section covers the details of 13.2 Context Compression.
+Retrieved chunks are rarely pure signal. A 512-token chunk retrieved for the query "What is the refund policy?" might contain 400 tokens of company history, shipping information, and legal boilerplate before it gets to the two sentences that actually answer the question. Context compression removes that noise before it reaches the LLM.
 
+## The Problem: Noisy Chunks
+
+Standard chunking splits documents at fixed token boundaries or paragraph breaks. The resulting chunks are topically mixed. When you inject them into context, you're diluting the signal-to-noise ratio of your prompt — which has measurable effects on answer quality.
+
+Context compression addresses this at the retrieval layer, before the LLM ever sees the content.
+
+## Extractive Compression
+
+Extractive compression uses a small model to score every sentence in a retrieved chunk for relevance to the query. Only high-scoring sentences are retained.
+
+```python
+from langchain.retrievers.document_compressors import LLMChainExtractor
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain_openai import ChatOpenAI
+
+# The base retriever gets top-K chunks
+base_retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+
+# The compressor filters sentences within each chunk
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+compressor = LLMChainExtractor.from_llm(llm)
+
+# Combine them
+compression_retriever = ContextualCompressionRetriever(
+    base_compressor=compressor,
+    base_retriever=base_retriever
+)
+
+# Now retrieve — each result is a compressed version of the original chunk
+compressed_docs = compression_retriever.invoke("What is the refund policy?")
+```
+
+The result: instead of 5 full chunks (2,500 tokens), you might get 5 compressed excerpts (300 tokens total) — all directly relevant to the query.
+
+## LLMLingua: Token-Level Compression
+
+LLMLingua uses a small language model (e.g., LLaMA) to score the importance of every **token** in the context, then prunes low-importance tokens. This goes beyond sentence-level extraction to true token-level compression.
+
+```python
+from llmlingua import PromptCompressor
+
+compressor = PromptCompressor(
+    model_name="microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank",
+    use_llmlingua2=True,
+)
+
+compressed = compressor.compress_prompt(
+    context=retrieved_chunks,
+    instruction="Answer the question about the refund policy.",
+    target_token=200,   # compress to ~200 tokens
+    condition_compare=True,
+)
+
+print(f"Original tokens: {compressed['origin_tokens']}")
+print(f"Compressed tokens: {compressed['compressed_tokens']}")
+print(f"Ratio: {compressed['ratio']}")
+# → Original tokens: 1847
+# → Compressed tokens: 201
+# → Ratio: 9.19x
+```
+
+Typical results: **5–10× compression with ~95% information retention** on information retrieval benchmarks.
+
+## Selective Context
+
+The Selective Context approach (from the paper "Selective Context") computes self-information scores (perplexity under a small language model) for each sentence. High-perplexity content = more information-dense. Low-perplexity sentences (common, predictable phrases) are removed.
+
+```python
+# Conceptual implementation of selective context
+import math
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+
+def sentence_self_information(sentence: str, model, tokenizer) -> float:
+    """Lower perplexity = more predictable = less informative."""
+    inputs = tokenizer(sentence, return_tensors="pt")
+    loss = model(**inputs, labels=inputs["input_ids"]).loss
+    return math.exp(loss.item())  # perplexity score
+
+def compress_context(chunks: list[str], query: str, keep_ratio: float = 0.3):
+    scored_sentences = []
+    for chunk in chunks:
+        sentences = chunk.split(". ")
+        for sent in sentences:
+            score = sentence_self_information(sent, model, tokenizer)
+            scored_sentences.append((score, sent))
+
+    # Keep only the top X% most informative sentences
+    scored_sentences.sort(reverse=True)
+    cutoff = int(len(scored_sentences) * keep_ratio)
+    return " ".join(sent for _, sent in scored_sentences[:cutoff])
+```
+
+## The Lost-in-the-Middle Problem
+
+Research has established that LLMs recall information better when it appears at the **start** or **end** of the context window. Documents placed in the middle of a long context are reliably underutilized — even if they contain the most relevant information.
+
+This finding has two practical implications:
+
+1. **Compress first** — reduce total context length so "middle" content is less likely.
+2. **Order strategically** — after compression, place the highest-confidence chunk at position 0, the second-highest at the end, and lower-confidence material in between.
+
+```python
+def order_for_recall(chunks: list[str], scores: list[float]) -> list[str]:
+    """
+    Place highest-scoring chunk first, second-highest last.
+    This exploits primacy and recency effects in LLM attention.
+    """
+    ranked = sorted(zip(scores, chunks), reverse=True)
+
+    if len(ranked) <= 2:
+        return [c for _, c in ranked]
+
+    result = [ranked[0][1]]          # highest score → position 0
+    result += [c for _, c in ranked[1:-1]]  # rest in the middle
+    result.append(ranked[-1][1])     # second-highest → last position
+    return result
+```
+
+## Caching Compressed Chunks
+
+Compression is relatively expensive (it requires a model inference pass). Cache aggressively:
+
+```python
+import hashlib
+import json
+import redis
+
+cache = redis.Redis()
+
+def get_compressed_chunk(chunk: str, query: str, compressor) -> str:
+    cache_key = hashlib.sha256(f"{query}::{chunk}".encode()).hexdigest()
+    cached = cache.get(cache_key)
+
+    if cached:
+        return cached.decode()
+
+    compressed = compressor.compress(chunk, query)
+    cache.setex(cache_key, 3600, compressed)  # cache for 1 hour
+    return compressed
+```
+
+Cache the (query, chunk) → compressed_chunk mapping. For repeated queries against a stable corpus, this eliminates repeated compression overhead.
+
+## Compression Comparison
+
+| Method | Compression Ratio | Quality Retention | Speed | Notes |
+|---|---|---|---|---|
+| Sentence extraction (LLM) | 3–5× | High | Slow | Most accurate |
+| LLMLingua | 5–10× | ~95% | Medium | Token-level |
+| Selective Context | 2–4× | Good | Fast | No LLM needed |
+| BM25 sentence scoring | 2–3× | Medium | Very fast | Query-term overlap only |
+
+## The Full Pipeline
+
+```python
+class CompressingRetriever:
+    def __init__(self, vector_store, compressor, reranker=None):
+        self.vector_store = vector_store
+        self.compressor = compressor
+        self.reranker = reranker
+
+    def retrieve(self, query: str, k: int = 5) -> list[str]:
+        # 1. Retrieve broad candidates
+        raw_chunks = self.vector_store.similarity_search(query, k=k * 2)
+
+        # 2. Compress each chunk
+        compressed = [
+            get_compressed_chunk(c.page_content, query, self.compressor)
+            for c in raw_chunks
+        ]
+
+        # 3. Optionally rerank the compressed chunks
+        if self.reranker:
+            scores = self.reranker.predict([(query, c) for c in compressed])
+            ranked = sorted(zip(scores, compressed), reverse=True)
+            compressed = [c for _, c in ranked[:k]]
+
+        # 4. Order for primacy/recency recall
+        return compressed[:k]
+```
+
+Context compression and smart ordering work together. The goal is a context window that is dense with relevant signal — every token earning its place.

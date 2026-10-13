@@ -5,5 +5,101 @@ lastUpdatedDate: '2026-08-05'
 
 # 18.1 Token Accounting
 
-This section covers the details of 18.1 Token Accounting.
+Tokens are the unit of LLM cost. Every dollar you spend on LLM APIs is ultimately a function of token count — input tokens + output tokens × price per token.
 
+Understanding token accounting is understanding your cost structure.
+
+## What Drives Your Token Count
+
+```
+Every LLM call includes:
+┌─────────────────────────────────────────────┐
+│  System prompt          (counted every call) │
+│  Conversation history   (grows each turn)    │
+│  Tool schemas           (included every req) │
+│  Retrieved documents    (can be enormous)    │
+│  User message                                │
+├─────────────────────────────────────────────┤
+│  Response (output tokens)                   │
+└─────────────────────────────────────────────┘
+```
+
+| Component | Tokens (typical) | Notes |
+|---|---|---|
+| System prompt | 200–2,000 | Fixed per call — optimize this first |
+| Tool schemas | 100–500 per tool | Each tool definition adds overhead |
+| Conversation history | 0–50,000+ | Grows unbounded without pruning |
+| Retrieved documents | 500–10,000 | Biggest variable cost in RAG systems |
+| User message | 10–500 | Usually small |
+| Agent response | 100–2,000 | Output is 2–5× pricier per token |
+
+## The Hidden Multipliers
+
+### Agentic loops multiply every call
+
+A 6-iteration agent loop costs 6× more than a single call. This seems obvious, but developers routinely miss it when estimating costs:
+
+```
+Single call:       1,000 input + 500 output = $0.002
+Agent (6 loops):   6,000 input + 3,000 output = $0.012
+
+Multiply by 10,000 daily users:
+Single call:    $20/day
+Agent (6 loops): $120/day
+```
+
+### Tool calls are actually two calls
+
+Each tool call costs tokens in both directions:
+
+```
+Agent decides to call search_web:
+  → Agent output includes tool_call JSON     (+200 tokens output)
+  → Tool result added to conversation        (+500 tokens input next turn)
+
+Total: 700 extra tokens per tool call
+A 3-tool-call agent adds ~2,100 tokens to the conversation.
+```
+
+## Tracking Cost with LiteLLM
+
+LiteLLM's `completion_cost()` tracks cost automatically across providers — no manual price table maintenance:
+
+```python
+import litellm
+
+response = litellm.completion(
+    model="anthropic/claude-sonnet-4-6",
+    messages=messages,
+)
+
+cost = litellm.completion_cost(completion_response=response)
+print(f"This call cost: ${cost:.6f}")
+
+# Full token breakdown
+usage = response.usage
+print(f"Input tokens:  {usage.prompt_tokens}")
+print(f"Output tokens: {usage.completion_tokens}")
+print(f"Total tokens:  {usage.total_tokens}")
+```
+
+## Token Budgets
+
+Set explicit token budgets per agent and per feature:
+
+```python
+TOKEN_BUDGETS = {
+    "simple_qa": 2_000,          # No tools, single turn
+    "code_review": 8_000,        # 1–2 tool calls, medium context
+    "research_agent": 20_000,    # Multiple tools, large retrieved context
+    "newsletter_crew": 50_000,   # Multi-agent pipeline
+}
+
+def check_token_budget(agent_type: str, current_tokens: int) -> bool:
+    budget = TOKEN_BUDGETS.get(agent_type, 10_000)
+    if current_tokens > budget * 0.9:
+        logger.warning(f"{agent_type} approaching token budget: {current_tokens}/{budget}")
+    return current_tokens <= budget
+```
+
+If an agent regularly exceeds its budget, that's a signal to optimize — not to raise the budget.

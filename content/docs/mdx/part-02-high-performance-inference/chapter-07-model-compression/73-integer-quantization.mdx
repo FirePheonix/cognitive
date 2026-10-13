@@ -5,13 +5,194 @@ lastUpdatedDate: '2026-08-05'
 
 # 7.3 Integer Quantization
 
-This section covers the details of 7.3 Integer Quantization.
+Integer quantization is the foundational technique behind int8 and int4 model compression. Before understanding GPTQ, AWQ, or SmoothQuant, you need to understand what quantization actually does to a weight: how a float gets mapped to an integer, and how to get a float back.
 
-## INT8
+## The Basic Quantization Operation
 
-Placeholder for INT8.
+Quantization maps a continuous range of floating-point values to a discrete set of integers. The process:
 
-## INT4
+**1. Find the range**:
+```python
+weight_min = tensor.min()
+weight_max = tensor.max()
+```
 
-Placeholder for INT4.
+**2. Compute the scale factor**:
+```python
+# For int8 (256 levels: -128 to 127)
+n_bits = 8
+n_levels = 2 ** n_bits  # 256
+scale = (weight_max - weight_min) / (n_levels - 1)
+```
 
+**3. Compute zero point** (for asymmetric quantization):
+```python
+zero_point = round(-weight_min / scale)
+zero_point = max(0, min(n_levels - 1, zero_point))
+```
+
+**4. Quantize**:
+```python
+quantized = round(tensor / scale) + zero_point
+quantized = clamp(quantized, 0, n_levels - 1)
+```
+
+**5. Dequantize** (at inference time):
+```python
+dequantized = (quantized - zero_point) * scale
+```
+
+The dequantized value approximately equals the original, with rounding error bounded by ±scale/2.
+
+## Symmetric vs Asymmetric Quantization
+
+**Symmetric**: zero maps to zero. Scale is the same for positive and negative values:
+
+```python
+scale = max(abs(weight_min), abs(weight_max)) / 127
+quantized = round(tensor / scale)  # range: [-127, 127]
+dequantized = quantized * scale
+```
+
+Simpler, but wastes range if weights are asymmetrically distributed (e.g., all positive).
+
+**Asymmetric**: uses both scale and zero_point to cover the exact [min, max] range:
+
+```python
+scale = (weight_max - weight_min) / 255
+zero_point = round(-weight_min / scale)
+quantized = round(tensor / scale) + zero_point  # range: [0, 255]
+dequantized = (quantized - zero_point) * scale
+```
+
+More expressive, slightly more complex. Preferred for int8 weight quantization.
+
+## Quantization Granularity
+
+The granularity at which you compute scale and zero_point matters significantly:
+
+**Per-tensor (lowest granularity)**:
+```
+One scale for the entire weight matrix
+Simple, but high quantization error for outliers
+```
+
+**Per-row / per-column**:
+```
+One scale per row (or column) of the weight matrix
+Better handles weight distributions that vary across the matrix
+```
+
+**Per-group (standard for int4)**:
+```
+Group size = 128: compute scale for every 128 consecutive weights
+Very fine-grained: each group has its own optimal scale
+Significant quality improvement over per-tensor
+```
+
+```python
+# Per-group quantization (group_size=128)
+weight = ...  # shape: [out_features, in_features]
+group_size = 128
+
+# Reshape to expose groups
+weight_grouped = weight.reshape(-1, group_size)  # [n_groups, group_size]
+
+# Scale per group
+scales = weight_grouped.abs().max(dim=1).values / 7  # int4 range [-8, 7]
+quantized = (weight_grouped / scales.unsqueeze(1)).round().clamp(-8, 7).to(torch.int8)
+
+# Dequantize
+dequantized = (quantized * scales.unsqueeze(1)).reshape_as(weight)
+```
+
+Per-group quantization is why int4 models are viable at all — without per-group scales, int4 quality would be unacceptably poor for most tasks.
+
+## Quantization Error
+
+Quantization error comes from rounding. The maximum error is bounded by half the step size:
+
+```
+Max quantization error ≤ scale / 2
+
+For int8:
+  scale = (max - min) / 255
+  If the weight range is [-1, 1]: scale = 2/255 ≈ 0.0078
+  Max error: ~0.004
+
+For int4:
+  scale = (max - min) / 15
+  If the weight range is [-1, 1]: scale = 2/15 ≈ 0.133
+  Max error: ~0.067
+```
+
+Int4 has 17× more quantization error than int8 for the same weight range. This is why int4 needs per-group quantization — smaller groups have smaller ranges, which reduces scale, which reduces error.
+
+## Outlier Problem
+
+Many weight matrices contain a small number of very large values (outliers):
+
+```
+Example weight matrix values:
+  [-0.12, 0.34, -0.08, 0.21, ..., 85.3, ..., -0.15, 0.09]
+                                   ↑ outlier
+
+Without special handling:
+  scale = (85.3 - (-0.12)) / 255 = 0.334
+  Quantizing -0.12: round(-0.12/0.334) = round(-0.36) = 0 → dequant: 0.0 (error: 0.12)
+  Most weights: ~0.334 resolution — terrible for small weights!
+
+The outlier ruins quantization for all other weights.
+```
+
+Solutions:
+- **Clipping**: set a tighter range, clipping the outlier
+- **Per-group quantization**: the outlier affects only its own group
+- **SmoothQuant**: migrate outliers from activations to weights (Chapter 7.6)
+- **AWQ**: identify and protect high-importance channels (Chapter 7.5)
+
+## Post-Training Quantization (PTQ)
+
+PTQ quantizes an already-trained model without any gradient updates:
+
+```python
+from transformers import AutoModelForCausalLM
+from bitsandbytes import quantize
+
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+
+# Simple int8 PTQ via bitsandbytes
+model_int8 = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Meta-Llama-3-8B-Instruct",
+    load_in_8bit=True,  # bitsandbytes int8 PTQ
+)
+```
+
+PTQ is fast (minutes on CPU/GPU), requires no training data, and typically yields:
+- int8: within 1–2% of fp16 quality on most benchmarks
+- int4 (naive per-tensor): 5–15% quality degradation
+- int4 (GPTQ/AWQ per-group): 2–5% degradation
+
+## Quality Impact by Task
+
+Quantization affects different tasks differently:
+
+| Task | int8 quality (vs fp16) | int4 quality (vs fp16) |
+|---|---|---|
+| General knowledge (MMLU) | ~99% | ~94–97% |
+| Code generation (HumanEval) | ~99% | ~92–96% |
+| Mathematical reasoning | ~98% | ~88–94% |
+| Long-form generation | ~99% | ~95–98% |
+| Complex reasoning (GSM8K) | ~97% | ~85–93% |
+
+Math and complex reasoning are most sensitive to quantization. Code generation is moderately sensitive. General conversation is least sensitive.
+
+## Summary
+
+- Quantization maps floats to integers via a scale (and zero_point for asymmetric)
+- The scale determines quantization resolution — smaller scale = finer granularity = less error
+- Granularity options: per-tensor (coarse), per-row, per-group (fine — standard for int4)
+- Per-group quantization with group_size=128 makes int4 viable for most tasks
+- Outliers in weight matrices expand the scale and degrade quantization quality for all other weights
+- PTQ: quantize after training, no compute needed, within 1–2% for int8, 2–5% for int4 (with GPTQ/AWQ)
+- Math and reasoning are most sensitive to quantization; general conversation is most resilient

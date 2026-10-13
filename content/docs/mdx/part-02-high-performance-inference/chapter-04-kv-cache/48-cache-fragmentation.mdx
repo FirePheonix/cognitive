@@ -5,5 +5,183 @@ lastUpdatedDate: '2026-08-05'
 
 # 4.8 Cache Fragmentation
 
-This section covers the details of 4.8 Cache Fragmentation.
+GPU memory fragmentation is a silent killer of inference throughput. A system can appear to have enough memory while simultaneously being unable to serve large requests — because the available memory is scattered in disconnected chunks. Understanding fragmentation, and how PagedAttention eliminates it, is key to understanding why vLLM was such a step change in inference serving.
 
+## What Is Memory Fragmentation?
+
+Fragmentation occurs when free memory exists, but it's not in contiguous chunks large enough to satisfy an allocation request.
+
+```
+Traditional KV cache allocation (contiguous required):
+
+GPU Memory (10 blocks shown):
+┌──────────┬──────────┬──────────┬──────────┬──────────┐
+│  Req A   │  Req A   │  FREE    │  Req B   │  FREE    │
+│ (full)   │ (full)   │          │ (partial)│          │
+└──────────┴──────────┴──────────┴──────────┴──────────┘
+     0          1          2          3          4
+
+Free blocks: 2 and 4 = 2 blocks free
+
+New request C needs 2 contiguous blocks:
+  Block 2 + Block 4? Non-contiguous → CANNOT ALLOCATE
+  Result: Request C is rejected despite having enough total free memory
+```
+
+This is exactly what happens with traditional LLM serving systems. Each request gets a pre-allocated contiguous chunk of KV cache. When requests complete at different times, free memory becomes scattered.
+
+## Quantifying the Waste
+
+In a production serving scenario without PagedAttention:
+
+```
+Scenario:
+  Max context length per request: 2048 tokens
+  KV cache per 2048 tokens: 256 MB
+  Available KV cache memory: 5 GB → capacity for 19 sequences
+
+Reality:
+  Average actual usage: 200 tokens per sequence
+  Actual KV data per sequence: 200/2048 × 256 MB = 25 MB
+  Useful data in 5 GB: 19 × 25 MB = 475 MB
+  Wasted (internal fragmentation): 4.525 GB = 90.5% waste
+```
+
+You're paying for 19 sequences' worth of GPU memory but only using 9.5% of it for actual KV data.
+
+## External Fragmentation
+
+Beyond internal fragmentation (waste within an allocated block), there's external fragmentation (the gaps between freed blocks):
+
+```
+After mixed-length requests complete and new ones arrive:
+
+Time 0 (fresh start):
+[A: 256MB][B: 256MB][C: 256MB][D: 256MB][E: 256MB][FREE: 3.75GB]
+
+Time 1 (B and D complete, E expands):
+[A: 256MB][FREE 256MB][C: 256MB][FREE 256MB][E: 512MB][FREE: 3.5GB]
+
+New request F needs 512MB contiguous:
+  Largest contiguous free block: 3.5 GB → OK
+New request G needs 512MB contiguous:
+  Next largest: 3.0 GB → OK
+...
+
+Time 2 (heavy usage, several completions):
+[FREE 256MB][X: 512MB][FREE 128MB][Y: 768MB][FREE 256MB][Z: 384MB][FREE 128MB][...]
+
+New large request needs 512MB contiguous:
+  No single free block is 512MB → REJECTED despite 768MB total free
+```
+
+This external fragmentation compounds over time, making long-running serving processes increasingly inefficient.
+
+## PagedAttention: The Solution
+
+PagedAttention's key insight: **KV cache accesses don't need to be contiguous in physical memory** — as long as the attention kernel knows where each block is.
+
+Each sequence's KV cache is divided into fixed-size pages (blocks), typically 16 tokens each. A **block table** maps logical page indices to physical GPU memory addresses:
+
+```python
+# Conceptual block table structure
+class BlockTable:
+    def __init__(self):
+        self.logical_to_physical = {}   # {logical_block_id: physical_block_id}
+    
+    def get_physical_block(self, logical_id):
+        return self.logical_to_physical[logical_id]
+    
+    def allocate_new_block(self):
+        # Find any free physical block — anywhere in GPU memory
+        physical_id = self.free_block_pool.pop()
+        logical_id = len(self.logical_to_physical)
+        self.logical_to_physical[logical_id] = physical_id
+        return logical_id
+```
+
+The modified attention kernel looks up each token's physical location via the block table:
+
+```
+Sequence A block table:
+  Logical block 0 → Physical block 7
+  Logical block 1 → Physical block 2
+  Logical block 2 → Physical block 15
+
+Physical GPU memory layout:
+[BLOCK 0: Req B][BLOCK 1: Req C][BLOCK 2: Req A][...][BLOCK 7: Req A][...]
+
+Attention for Req A reads: Block 7, then Block 2, then Block 15
+Non-contiguous in memory — but logically contiguous via block table lookup
+```
+
+## Fragmentation Comparison
+
+| Aspect | Contiguous allocation | PagedAttention |
+|---|---|---|
+| Internal fragmentation | Up to 90%+ | ~12.5% (half a block on average) |
+| External fragmentation | Grows over time | None (blocks are reused freely) |
+| Max sequences per GPU | Limited by worst-case contiguous need | Limited only by total block count |
+| vLLM reported waste | — | <4% |
+
+The <4% waste figure comes from the PagedAttention paper. It accounts for:
+- Half a block wasted per sequence on average (the last block is partially filled)
+- Metadata overhead for the block table
+- Alignment padding
+
+## Block Size Selection
+
+Choosing the right block size involves a tradeoff:
+
+| Block size | Pros | Cons |
+|---|---|---|
+| 4 tokens | Very low waste per sequence | High metadata overhead |
+| 16 tokens | Good balance (vLLM default) | — |
+| 32 tokens | Lower metadata overhead | More waste on short sequences |
+| 64 tokens | Best for long sequences | High waste on short ones |
+
+vLLM uses 16 tokens per block as the default, which minimizes average waste across typical workloads.
+
+## Prefix Sharing Via Shared Blocks
+
+PagedAttention enables another capability: **physical block sharing between requests**. If two sequences share the same prefix, they can literally share the same physical KV blocks:
+
+```
+Request 1 and Request 2 both start with:
+  "You are a helpful assistant. [2000 tokens of examples]"
+
+Logical blocks 0–124 (the shared prefix):
+  → both point to the SAME physical blocks
+  → physical memory used: 1× (not 2×)
+
+Copy-on-write: when either sequence starts diverging (generating different tokens),
+  the shared block is copied to a new physical block for that sequence only.
+```
+
+This is how vLLM implements efficient prefix caching — without duplicating KV data for identical prefixes.
+
+## Monitoring Fragmentation
+
+In a vLLM deployment:
+
+```bash
+# Check block utilization
+curl http://localhost:8000/metrics | grep cache
+
+# Key metrics:
+# vllm:gpu_cache_usage_perc       — fraction of blocks in use
+# vllm:num_blocks_total           — total physical blocks available
+# vllm:num_blocks_used            — blocks currently allocated
+```
+
+If `gpu_cache_usage_perc` is consistently above 95% but throughput is lower than expected, fragmentation may not be the issue (PagedAttention handles it) — but eviction might be. Look at `num_preemptions`.
+
+## Summary
+
+- Memory fragmentation wastes GPU KV cache capacity when requests complete at different times
+- Contiguous KV cache allocation creates up to 90%+ waste in typical workloads
+- PagedAttention divides KV cache into 16-token blocks; sequences reference blocks via a lookup table
+- Physical blocks can be non-contiguous — fragmentation is eliminated
+- vLLM reports <4% waste with PagedAttention vs 50–90% with contiguous allocation
+- Block sharing enables copy-on-write prefix sharing between requests
+- Default block size (16 tokens) balances metadata overhead against per-sequence waste

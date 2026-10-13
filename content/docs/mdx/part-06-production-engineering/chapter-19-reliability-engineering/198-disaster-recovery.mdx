@@ -5,5 +5,162 @@ lastUpdatedDate: '2026-08-05'
 
 # 19.8 Disaster Recovery
 
-This section covers the details of 19.8 Disaster Recovery.
+Agent workers crash. Servers restart. Deployments interrupt in-flight tasks. Without checkpointing, a task that fails 90% of the way through restarts from the beginning — wasting time, tokens, and potentially producing duplicate side effects.
 
+## The Checkpoint Pattern
+
+Save progress after each significant step. If the worker crashes, resume from the last checkpoint rather than from the start.
+
+From `atlas-agents/ch19_deployment`:
+
+```python
+import json
+import redis
+
+r = redis.Redis()
+
+def checkpoint_step(task_id: str, step: int, state: dict) -> None:
+    """
+    Persist current state to Redis after completing a step.
+    Checkpoints are stored with a TTL — they expire after the task should be done.
+    """
+    pipe = r.pipeline()
+    pipe.set(f"agent:{task_id}:step",  step,              ex=86400)  # 24h TTL
+    pipe.set(f"agent:{task_id}:state", json.dumps(state), ex=86400)
+    pipe.execute()
+
+def resume_from_checkpoint(task_id: str) -> tuple[int, dict]:
+    """
+    Load the last checkpoint. Returns (step=0, state={}) if no checkpoint exists.
+    """
+    step_raw  = r.get(f"agent:{task_id}:step")
+    state_raw = r.get(f"agent:{task_id}:state")
+
+    step  = int(step_raw)  if step_raw  else 0
+    state = json.loads(state_raw) if state_raw else {}
+
+    return step, state
+
+def clear_checkpoint(task_id: str) -> None:
+    """Delete checkpoint data after successful task completion."""
+    r.delete(f"agent:{task_id}:step", f"agent:{task_id}:state")
+```
+
+## Using Checkpoints in a Multi-Step Agent
+
+```python
+@celery.task(bind=True)
+def long_research_task(self, task_id: str, query: str) -> dict:
+    # Resume from last checkpoint (or start fresh)
+    start_step, state = resume_from_checkpoint(task_id)
+
+    steps = [
+        ("search",    lambda s: search_web(query)),
+        ("filter",    lambda s: filter_results(s["search_results"])),
+        ("analyze",   lambda s: analyze_results(s["filtered_results"])),
+        ("synthesize",lambda s: synthesize_findings(s["analysis"])),
+        ("format",    lambda s: format_output(s["synthesis"])),
+    ]
+
+    for i, (step_name, step_fn) in enumerate(steps):
+        if i < start_step:
+            continue  # Already completed — skip
+
+        logger.info(f"Executing step {i}: {step_name}")
+        try:
+            result = step_fn(state)
+            state[f"{step_name}_result"] = result
+
+            # Checkpoint after each successful step
+            checkpoint_step(task_id, i + 1, state)
+
+        except Exception as e:
+            logger.error(f"Step {step_name} failed: {e}")
+            raise self.retry(exc=e, countdown=2 ** self.request.retries)
+
+    clear_checkpoint(task_id)
+    return {"output": state["format_result"]}
+```
+
+## LangGraph's Built-In Persistence
+
+If you use LangGraph, checkpointing is automatic — you just provide a checkpointer:
+
+```python
+from langgraph.graph import StateGraph
+from langgraph.checkpoint.sqlite import SqliteSaver      # Local development
+from langgraph.checkpoint.postgres import PostgresSaver   # Production
+
+# Development: SQLite checkpointer
+with SqliteSaver.from_conn_string("checkpoints.db") as checkpointer:
+    graph = StateGraph(AgentState)
+    # ... define graph ...
+    agent = graph.compile(checkpointer=checkpointer)
+
+    # Every node execution is automatically checkpointed
+    # Pass thread_id to resume a specific session
+    config = {"configurable": {"thread_id": "task-123"}}
+    result = agent.invoke({"query": "..."}, config=config)
+
+# Production: Postgres checkpointer
+async with PostgresSaver.from_conn_string(DATABASE_URL) as checkpointer:
+    agent = graph.compile(checkpointer=checkpointer)
+```
+
+To resume a crashed LangGraph run, invoke with the same `thread_id`:
+
+```python
+# This picks up from where the last run left off
+result = agent.invoke(
+    None,   # Input is None — resume from checkpoint
+    config={"configurable": {"thread_id": "task-123"}},
+)
+```
+
+## Idempotency
+
+Checkpointing only helps if steps are **idempotent** — running a step twice produces the same result as running it once:
+
+```python
+# Non-idempotent: calling twice sends two emails
+def notify_user(user_id: str, message: str) -> None:
+    send_email(user_id, message)
+
+# Idempotent: calling twice sends one email (deduplication key)
+def notify_user_idempotent(task_id: str, user_id: str, message: str) -> None:
+    if not redis.setnx(f"notified:{task_id}:{user_id}", "1"):
+        return  # Already sent
+    redis.expire(f"notified:{task_id}:{user_id}", 86400)
+    send_email(user_id, message)
+```
+
+For LLM calls, idempotency means caching: same inputs → return cached output rather than calling the API again.
+
+## Recovery Testing
+
+Test your disaster recovery path regularly:
+
+```python
+@pytest.mark.integration
+def test_task_resumes_after_crash():
+    task_id = "test-crash-recovery-001"
+
+    # Manually set a checkpoint as if a crash happened at step 2
+    checkpoint_step(task_id, step=2, state={
+        "search_result": "cached search results",
+        "filter_result": "filtered results",
+    })
+
+    # Run the task — it should skip steps 0 and 1
+    result = long_research_task(task_id, "test query")
+
+    assert result["output"] is not None
+    # Verify steps 0 and 1 were not re-executed
+    # (check mock call counts, side effect logs, etc.)
+```
+
+## Related Sections
+
+- [19.5 Queue Management](./195-queue-management) — the Celery task infrastructure that disaster recovery applies to
+- [19.1 Retries](./191-retries) — retries are the first line of recovery before checkpointing kicks in
+- [17.2 Traces](../chapter-17-observability/172-traces) — traces show exactly what happened before a crash

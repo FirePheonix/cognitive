@@ -5,5 +5,124 @@ lastUpdatedDate: '2026-08-05'
 
 # 16.4 A/B Testing
 
-This section covers the details of 16.4 A/B Testing.
+A/B testing splits real traffic between two agent versions and measures the **actual impact on users**. Unlike shadow deployments (where shadow responses are discarded), A/B testing shows real users the new version and measures their reactions.
 
+This is the highest-fidelity way to measure user-facing quality. It is also the highest-risk.
+
+## The Traffic Split
+
+Start conservative. 90/10 is safer than 50/50 — if version B has a regression, 90% of users are still protected.
+
+```
+Version A (control):  90% of traffic
+Version B (treatment): 10% of traffic
+```
+
+```python
+def route_request(session_id: str) -> str:
+    """Stable routing — same session always goes to same version."""
+    bucket = int(hashlib.sha256(session_id.encode()).hexdigest(), 16) % 100
+    if bucket < 10:
+        return "B"  # Treatment — 10%
+    return "A"      # Control — 90%
+```
+
+Use consistent hashing so the same user always sees the same version within an experiment. Switching versions mid-session creates confusing experiences.
+
+## What to Measure
+
+```python
+@dataclass
+class ABMetrics:
+    version: str             # "A" or "B"
+    session_id: str
+
+    # User signals (most valuable)
+    thumbs_up: bool | None
+    thumbs_down: bool | None
+    task_completed: bool     # Did user achieve their goal?
+    conversation_turns: int  # Fewer turns = better resolution
+    escalated_to_human: bool # Escalation = agent failure
+
+    # Automatic signals
+    judge_score: float       # LLM-as-judge evaluation
+    latency_ms: float
+    total_tokens: int
+    cost_usd: float
+```
+
+User satisfaction signals (thumbs up/down, task completion) are slow to accumulate but are the ground truth. Automatic signals (judge score, latency) are immediate but proxy metrics.
+
+## The Prompt A/B Test Harness
+
+From `atlas-agents/ch02_prompt_architecture/prompt_ab_test.py:290`:
+
+```python
+# atlas-agents/ch02_prompt_architecture/prompt_ab_test.py:290
+def run_prompt_ab_test(
+    prompt_a: str,
+    prompt_b: str,
+    eval_cases: list[EvalCase],
+) -> ABTestReport:
+    results_a = []
+    results_b = []
+
+    for case in eval_cases:
+        # Run both prompts on every case
+        response_a = agent_with_prompt(prompt_a).run(case.input)
+        response_b = agent_with_prompt(prompt_b).run(case.input)
+
+        results_a.append(evaluate(case, response_a))
+        results_b.append(evaluate(case, response_b))
+
+    return ABTestReport(
+        prompt_a_metrics=aggregate(results_a),
+        prompt_b_metrics=aggregate(results_b),
+        winner=determine_winner(results_a, results_b),
+    )
+```
+
+The harness measures: keyword correctness, refusal behavior (for safety cases), tool call count, and latency — across all 10 eval cases.
+
+## Statistical Significance
+
+Don't call a winner after 10 samples. A/B tests need statistical power:
+
+| Expected effect size | Minimum samples per variant |
+|---|---|
+| Large (10%+ improvement) | ~100 sessions |
+| Medium (5% improvement) | ~400 sessions |
+| Small (2% improvement) | ~2,500 sessions |
+
+```python
+from scipy import stats
+
+def ab_test_significance(
+    a_successes: int, a_total: int,
+    b_successes: int, b_total: int,
+) -> dict:
+    _, p_value = stats.chi2_contingency([
+        [a_successes, a_total - a_successes],
+        [b_successes, b_total - b_successes],
+    ])[:2]
+
+    a_rate = a_successes / a_total
+    b_rate = b_successes / b_total
+
+    return {
+        "a_rate": a_rate,
+        "b_rate": b_rate,
+        "lift": (b_rate - a_rate) / a_rate,
+        "p_value": p_value,
+        "significant": p_value < 0.05,
+    }
+```
+
+## When to Stop an A/B Test
+
+Stop early and roll back version B if:
+- Version B hallucination rate exceeds version A by more than 5 percentage points
+- Version B escalation rate is 2× version A
+- Safety-related thumbs-down rate spikes
+
+Otherwise, run until you have statistical significance or 2 weeks of data — whichever comes first.

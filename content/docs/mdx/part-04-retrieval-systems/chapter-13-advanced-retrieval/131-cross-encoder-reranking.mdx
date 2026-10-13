@@ -1,9 +1,164 @@
 ---
-title: 13.1 Cross Encoder Reranking
+title: 13.1 Cross-Encoder Reranking
 lastUpdatedDate: '2026-08-05'
 ---
 
-# 13.1 Cross Encoder Reranking
+# 13.1 Cross-Encoder Reranking
 
-This section covers the details of 13.1 Cross Encoder Reranking.
+Retrieval quality is a two-stage problem. The first stage is fast but imprecise; the second stage is slow but accurate. Cross-encoder reranking is the second stage — and it makes a significant difference in the quality of what your LLM ultimately sees.
 
+## The Two-Stage Architecture
+
+```
+User query
+    │
+    ▼
+┌─────────────────────────────┐
+│  Stage 1: Bi-Encoder Recall │  ← Fast, approximate
+│  Retrieve top 20 candidates │    ~10–30ms
+└─────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────┐
+│  Stage 2: Cross-Encoder Rerank   │  ← Slow, precise
+│  Score all 20, keep top 3–5      │    ~100–200ms
+└──────────────────────────────────┘
+    │
+    ▼
+LLM context (3–5 high-quality chunks)
+```
+
+### Stage 1 — Bi-Encoder Recall
+
+Bi-encoders embed the query and document **independently**. The query becomes a vector, every document becomes a vector, and you retrieve the nearest neighbours by cosine similarity.
+
+- **Speed:** Very fast — the document vectors are pre-computed and indexed.
+- **Weakness:** The query and document never "see" each other during encoding. Nuance, negation, and complex phrasing can be lost.
+
+```python
+# Bi-encoder retrieval — query and doc embeddings are computed independently
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+model = SentenceTransformer("BAAI/bge-large-en-v1.5")
+
+query_embedding = model.encode("What are the side effects of metformin?")
+# document_embeddings were pre-computed at index time
+
+scores = np.dot(document_embeddings, query_embedding)
+top_20_indices = np.argsort(scores)[::-1][:20]
+```
+
+### Stage 2 — Cross-Encoder Reranking
+
+Cross-encoders take the query and a candidate document **together** as a single input and output a relevance score. Full bidirectional attention means the model can reason about how the specific query relates to the specific document.
+
+- **Speed:** Slow — must run a forward pass for every (query, document) pair.
+- **Quality:** Much higher than bi-encoders. The model asks: *"How relevant is THIS document to THIS query?"*
+
+```python
+from sentence_transformers import CrossEncoder
+
+# Load a cross-encoder trained on MS MARCO passage ranking
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+# Build (query, passage) pairs for all 20 candidates
+pairs = [(query, documents[i]) for i in top_20_indices]
+
+# Score them all — one forward pass per pair
+scores = reranker.predict(pairs)
+
+# Keep the top 3–5
+top_5 = sorted(zip(scores, top_20_indices), reverse=True)[:5]
+reranked_docs = [documents[idx] for _, idx in top_5]
+```
+
+## Why Not Just Use Cross-Encoders for Everything?
+
+The latency math is the answer. Scoring 10,000 documents with a cross-encoder at ~5ms per pair = 50 seconds. Scoring the same 10,000 with a bi-encoder = ~30ms (it's a single matrix multiplication against pre-computed vectors).
+
+The two-stage approach gets the best of both worlds:
+- Bi-encoder narrows the field to a manageable set (20–100 documents) in milliseconds.
+- Cross-encoder applies full attention only to that small set — fast enough for production.
+
+## Popular Reranking Models
+
+| Model | Size | Speed | Notes |
+|---|---|---|---|
+| `cross-encoder/ms-marco-MiniLM-L-6-v2` | 22M params | Fast | Good default, trained on MS MARCO |
+| `cross-encoder/ms-marco-electra-base` | 110M params | Medium | Higher quality |
+| `BAAI/bge-reranker-large` | 560M params | Slow | State-of-the-art open source |
+| Cohere Rerank API | Cloud | ~200ms | No hosting required |
+
+## Using the Cohere Rerank API
+
+For teams that don't want to host a reranker, the Cohere Rerank API is the easiest production option:
+
+```python
+import cohere
+
+co = cohere.Client("YOUR_API_KEY")
+
+results = co.rerank(
+    model="rerank-english-v3.0",
+    query="What are the side effects of metformin?",
+    documents=candidate_documents,   # your top-20 from Stage 1
+    top_n=3,                         # keep only the top 3
+)
+
+reranked = [candidate_documents[r.index] for r in results.results]
+```
+
+This is the `CohereRerank(top_n=3)` pattern applied after hybrid retrieval — retrieve broadly, rerank precisely.
+
+## Latency Budget
+
+A realistic production latency breakdown for two-stage retrieval:
+
+| Step | Latency |
+|---|---|
+| Query embedding (bi-encoder) | 5–15ms |
+| ANN search (vector DB) | 10–30ms |
+| Cross-encoder reranking (20 docs) | 100–200ms |
+| **Total retrieval** | **~150–250ms** |
+
+The ~150ms overhead for reranking is worth it when retrieval quality directly affects answer quality — which it almost always does in production RAG systems.
+
+## When to Skip Reranking
+
+Reranking isn't always necessary:
+
+- **Simple keyword-like queries** where BM25 already gets it right.
+- **Latency-critical paths** where every millisecond counts (e.g., real-time autocomplete).
+- **Small corpora** (< 1,000 documents) where recall is already close to perfect.
+
+For most production RAG systems serving complex user queries, the quality improvement from reranking justifies the latency cost.
+
+## Integration Pattern
+
+```python
+class TwoStageRetriever:
+    def __init__(self, vector_store, reranker, recall_k=20, final_k=5):
+        self.vector_store = vector_store
+        self.reranker = reranker
+        self.recall_k = recall_k
+        self.final_k = final_k
+
+    def retrieve(self, query: str) -> list[str]:
+        # Stage 1: fast recall
+        candidates = self.vector_store.similarity_search(query, k=self.recall_k)
+
+        # Stage 2: precise reranking
+        pairs = [(query, doc.page_content) for doc in candidates]
+        scores = self.reranker.predict(pairs)
+
+        ranked = sorted(
+            zip(scores, candidates),
+            key=lambda x: x[0],
+            reverse=True
+        )
+
+        return [doc.page_content for _, doc in ranked[:self.final_k]]
+```
+
+The two-stage pattern is the production standard for quality-critical retrieval. Use it whenever answer quality is more important than minimizing retrieval latency.

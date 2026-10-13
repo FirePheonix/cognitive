@@ -5,5 +5,150 @@ lastUpdatedDate: '2026-08-05'
 
 # 21.1 Permission Boundaries
 
-This section covers the details of 21.1 Permission Boundaries.
+Every agent should operate under the principle of **least privilege**: the minimum permissions needed to do its job, nothing more. An agent that only reads web pages should not have write access to your database.
 
+## The Role-Based Permission Model
+
+From `atlas-agents/ch14_guardrails/online/tool_permission_enforcer.py`, permissions are organized into roles with increasing capability:
+
+| Role | Permitted Tools |
+|------|----------------|
+| `viewer` | `read_file`, `list_directory`, `search_web` |
+| `analyst` | viewer tools + `query_database`, `fetch_api` |
+| `admin` | analyst tools + `write_file`, `run_command`, `execute_sql` |
+
+```python
+from enum import Enum
+
+class AgentRole(Enum):
+    VIEWER  = "viewer"
+    ANALYST = "analyst"
+    ADMIN   = "admin"
+
+ROLE_PERMISSIONS: dict[AgentRole, set[str]] = {
+    AgentRole.VIEWER: {
+        "read_file",
+        "list_directory",
+        "search_web",
+    },
+    AgentRole.ANALYST: {
+        "read_file",
+        "list_directory",
+        "search_web",
+        "query_database",
+        "fetch_api",
+    },
+    AgentRole.ADMIN: {
+        "read_file",
+        "list_directory",
+        "search_web",
+        "query_database",
+        "fetch_api",
+        "write_file",
+        "run_command",
+        "execute_sql",
+    },
+}
+
+def check_permission(role: AgentRole, tool_name: str) -> bool:
+    permitted = ROLE_PERMISSIONS.get(role, set())
+    return tool_name in permitted
+```
+
+## Enforcement at the Tool Layer
+
+Permissions are enforced **before tool execution** — not in the system prompt (which can be bypassed) but in the Python call path:
+
+```python
+class PermissionEnforcingToolRegistry:
+    def __init__(self, agent_role: AgentRole):
+        self.role = agent_role
+
+    def execute(self, tool_name: str, arguments: dict) -> ToolResult:
+        # Permission check — happens before ANY execution
+        if not check_permission(self.role, tool_name):
+            raise PermissionError(
+                f"Agent with role '{self.role.value}' is not permitted "
+                f"to call '{tool_name}'."
+            )
+
+        # Argument validation — happens before execution
+        validated_args = self._validate_arguments(tool_name, arguments)
+
+        # Audit log — every call is recorded
+        self._audit_log(tool_name, validated_args)
+
+        # Execute
+        return self._tools[tool_name](**validated_args)
+```
+
+No matter what the model decides to call, the permission check happens in Python code that cannot be overridden by prompt injection.
+
+## The Audit Log
+
+Every tool call is logged with full context:
+
+```python
+def _audit_log(self, tool_name: str, arguments: dict) -> None:
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "agent_id": self.agent_id,
+        "agent_role": self.role.value,
+        "tool": tool_name,
+        "arguments": arguments,    # Sanitized — no credentials
+        "session_id": self.session_id,
+    }
+    audit_logger.info(json.dumps(log_entry))
+```
+
+Audit logs answer: "Which agent called which tool with which arguments at what time?" This is essential for incident response and compliance.
+
+## Assigning Roles at Agent Creation
+
+The role is set at construction time, not at runtime:
+
+```python
+# Research agent — reads web, reads files, nothing else
+research_agent = GuardrailedAgent(
+    role=AgentRole.VIEWER,
+    model="claude-opus-4-5",
+)
+
+# Analytics agent — can query database but not write
+analytics_agent = GuardrailedAgent(
+    role=AgentRole.ANALYST,
+    model="claude-opus-4-5",
+)
+
+# Code execution agent — full capabilities, extra sandboxing
+code_agent = GuardrailedAgent(
+    role=AgentRole.ADMIN,
+    model="claude-opus-4-5",
+    sandbox=DockerSandbox(),   # compensate for elevated permissions
+)
+```
+
+> **Elevated permissions demand elevated isolation.** If your agent needs `run_command`, put it in a Docker container or E2B microVM. See [21.6 Sandboxing](./216-sandboxing).
+
+## Why Not Just Use System Prompt Instructions?
+
+```python
+# This looks like permission control — it isn't
+system_prompt = """
+You are a research assistant. You may only use read_file and search_web.
+Do not call write_file or run_command under any circumstances.
+"""
+```
+
+This instruction can be overridden by:
+- A sufficiently persuasive user message
+- An indirect injection in fetched content
+- A multi-step reasoning chain that convinces the model the restriction doesn't apply in this case
+
+Python code cannot be overridden by any of these.
+
+## Related Sections
+
+- [20.5 Tool Injection](../chapter-20-prompt-security/205-tool-injection) — malicious arguments passed to tools
+- [21.5 Secure Tool Execution](./215-secure-tool-execution) — the full enforcement harness
+- [21.6 Sandboxing](./216-sandboxing) — OS-level isolation for high-privilege agents

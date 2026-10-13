@@ -1,0 +1,904 @@
+---
+title: ML Pipelines
+description: 'A model is not a product. A pipeline is. The pipeline is everything from raw data to deployed prediction, and every step must be reproducible.'
+lastUpdatedDate: '2026-10-13'
+---
+
+# ML Pipelines
+
+> A model is not a product. A pipeline is. The pipeline is everything from raw data to deployed prediction, and every step must be reproducible.
+
+## Learning Objectives
+
+- Build an ML pipeline from scratch that chains imputation, scaling, encoding, and model training into a single reproducible object
+- Identify data leakage scenarios and explain how pipelines prevent them by fitting transformers only on training data
+- Construct a ColumnTransformer that applies different preprocessing to numeric and categorical features
+- Implement pipeline serialization and demonstrate that the same fitted pipeline produces identical results in training and production
+
+## The Problem
+
+You have a notebook that loads data, fills missing values with the median, scales features, trains a model, and prints accuracy. It works. You ship it.
+
+A month later, someone retrains the model and gets different results. The median was computed on the full dataset including test data (data leakage). The scaling parameters were not saved, so inference uses different statistics. The feature engineering code was copy-pasted between training and serving, and the copies diverged. A categorical column gained a new value in production that the encoder has never seen.
+
+These are not hypothetical. They are the most common reasons ML systems fail in production. Pipelines solve all of them by packaging every transformation step into a single, ordered, reproducible object.
+
+## The Concept
+
+### What a Pipeline Is
+
+A pipeline is an ordered sequence of data transformations followed by a model. Each step takes the output of the previous step as input. The entire pipeline is fitted once on training data. At inference time, the same fitted pipeline transforms new data and produces predictions.
+
+```mermaid
+flowchart LR
+    A[Raw Data] --> B[Impute Missing Values]
+    B --> C[Scale Numeric Features]
+    C --> D[Encode Categoricals]
+    D --> E[Train Model]
+    E --> F[Prediction]
+```
+
+The pipeline guarantees:
+- Transformations are fitted only on training data (no leakage)
+- The same transformations are applied at inference time
+- The entire object can be serialized and deployed as one artifact
+- Cross-validation applies the pipeline per fold, preventing subtle leakage
+
+### Data Leakage: The Silent Killer
+
+Data leakage happens when information from the test set or future data contaminates training. Pipelines prevent the most common forms.
+
+**Leaky (wrong):**
+```python
+X = df.drop("target", axis=1)
+y = df["target"]
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+X_train, X_test = X_scaled[:800], X_scaled[800:]
+y_train, y_test = y[:800], y[800:]
+```
+
+The scaler saw test data. The mean and standard deviation include test samples. This inflates accuracy estimates.
+
+**Correct:**
+```python
+X_train, X_test = X[:800], X[800:]
+
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+```
+
+With a pipeline, you do not need to think about this. The pipeline handles it automatically.
+
+### sklearn Pipeline
+
+sklearn's `Pipeline` chains transformers and an estimator. It exposes `.fit()`, `.predict()`, and `.score()` that apply all steps in order.
+
+```python
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+pipe = Pipeline([
+    ("scaler", StandardScaler()),
+    ("model", LogisticRegression()),
+])
+
+pipe.fit(X_train, y_train)
+predictions = pipe.predict(X_test)
+```
+
+When you call `pipe.fit(X_train, y_train)`:
+1. Scaler calls `fit_transform` on X_train
+2. Model calls `fit` on the scaled X_train
+
+When you call `pipe.predict(X_test)`:
+1. Scaler calls `transform` (not fit_transform) on X_test
+2. Model calls `predict` on the scaled X_test
+
+The scaler never sees test data during fitting. This is the whole point.
+
+### ColumnTransformer: Different Pipelines for Different Columns
+
+Real datasets have numeric and categorical columns that need different preprocessing. `ColumnTransformer` handles this.
+
+```python
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+
+numeric_pipe = Pipeline([
+    ("impute", SimpleImputer(strategy="median")),
+    ("scale", StandardScaler()),
+])
+
+categorical_pipe = Pipeline([
+    ("impute", SimpleImputer(strategy="most_frequent")),
+    ("encode", OneHotEncoder(handle_unknown="ignore")),
+])
+
+preprocessor = ColumnTransformer([
+    ("num", numeric_pipe, ["age", "income", "score"]),
+    ("cat", categorical_pipe, ["city", "gender", "plan"]),
+])
+
+full_pipeline = Pipeline([
+    ("preprocess", preprocessor),
+    ("model", GradientBoostingClassifier()),
+])
+```
+
+The `handle_unknown="ignore"` in OneHotEncoder is critical for production. When a new category appears (a city the model has never seen), it produces a zero vector instead of crashing.
+
+### Experiment Tracking
+
+A pipeline makes training reproducible, but you also need to track what happened across experiments: which hyperparameters were used, which dataset version, what the metrics were, which code was running.
+
+**MLflow** is the most common open-source solution:
+
+```python
+import mlflow
+
+with mlflow.start_run():
+    mlflow.log_param("max_depth", 5)
+    mlflow.log_param("n_estimators", 100)
+    mlflow.log_param("learning_rate", 0.1)
+
+    pipe.fit(X_train, y_train)
+    accuracy = pipe.score(X_test, y_test)
+
+    mlflow.log_metric("accuracy", accuracy)
+    mlflow.sklearn.log_model(pipe, "model")
+```
+
+Every run is recorded with parameters, metrics, artifacts, and the full model. You can compare runs, reproduce any experiment, and deploy any model version.
+
+**Weights & Biases (wandb)** provides the same functionality with a hosted dashboard:
+
+```python
+import wandb
+
+wandb.init(project="my-pipeline")
+wandb.config.update({"max_depth": 5, "n_estimators": 100})
+
+pipe.fit(X_train, y_train)
+accuracy = pipe.score(X_test, y_test)
+
+wandb.log({"accuracy": accuracy})
+```
+
+### Model Versioning
+
+After experiment tracking, you need to manage model versions. Which model is in production? Which is staging? Which was last week's?
+
+MLflow's Model Registry provides:
+- **Version tracking:** Every saved model gets a version number
+- **Stage transitions:** "Staging", "Production", "Archived"
+- **Approval workflow:** Models must be explicitly promoted to production
+- **Rollback:** Switch back to a previous version instantly
+
+### Data Versioning with DVC
+
+Code is versioned with git. Data should be versioned too, but git cannot handle large files. DVC (Data Version Control) solves this.
+
+```
+dvc init
+dvc add data/training.csv
+git add data/training.csv.dvc data/.gitignore
+git commit -m "Track training data"
+dvc push
+```
+
+DVC stores the actual data in remote storage (S3, GCS, Azure) and keeps a small `.dvc` file in git that records the hash. When you checkout a git commit, `dvc checkout` restores the exact data that was used.
+
+This means every git commit pins both the code and the data. Full reproducibility.
+
+### Reproducible Experiments
+
+A reproducible experiment requires four things:
+
+1. **Fixed random seeds:** Set seeds for numpy, random, and the framework (torch, sklearn)
+2. **Pinned dependencies:** requirements.txt or poetry.lock with exact versions
+3. **Versioned data:** DVC or similar
+4. **Config files:** All hyperparameters in a config, not hardcoded
+
+```python
+import numpy as np
+import random
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+    except ImportError:
+        pass
+```
+
+### From Notebook to Production Pipeline
+
+```mermaid
+flowchart TD
+    A[Jupyter Notebook] --> B[Extract functions]
+    B --> C[Build Pipeline object]
+    C --> D[Add config file for hyperparameters]
+    D --> E[Add experiment tracking]
+    E --> F[Add data validation]
+    F --> G[Add tests]
+    G --> H[Package for deployment]
+
+    style A fill:#fdd,stroke:#333
+    style H fill:#dfd,stroke:#333
+```
+
+The typical progression:
+
+1. **Notebook exploration:** Quick experiments, visualizations, feature ideas
+2. **Extract functions:** Move preprocessing, feature engineering, evaluation into modules
+3. **Build Pipeline:** Chain transformations into a sklearn Pipeline or custom class
+4. **Config management:** Move all hyperparameters into a YAML/JSON config
+5. **Experiment tracking:** Add MLflow or wandb logging
+6. **Data validation:** Check schema, distributions, and missing value patterns before training
+7. **Tests:** Unit tests for transformers, integration tests for the full pipeline
+8. **Deployment:** Serialize the pipeline, wrap in an API (FastAPI, Flask), containerize
+
+### Common Pipeline Mistakes
+
+| Mistake | Why it is bad | Fix |
+|---------|-------------|-----|
+| Fitting on full data before splitting | Data leakage | Use Pipeline with cross_val_score |
+| Feature engineering outside pipeline | Different transforms at train vs serve | Put all transforms in the Pipeline |
+| Not handling unknown categories | Production crash on new values | OneHotEncoder(handle_unknown="ignore") |
+| Hardcoded column names | Breaks when schema changes | Use column name lists from config |
+| No data validation | Silently wrong predictions on bad data | Add schema checks before prediction |
+| Training/serving skew | Model sees different features in prod | One Pipeline object for both |
+
+## Build It
+
+### Step 1: Custom Transformers from Scratch
+
+```python
+import numpy as np
+import warnings
+warnings.filterwarnings("ignore")
+
+
+def make_mixed_data(n_samples=500, seed=42):
+    rng = np.random.RandomState(seed)
+
+    age = rng.normal(35, 12, n_samples).clip(18, 80)
+    income = rng.lognormal(10.5, 0.8, n_samples)
+    score = rng.uniform(300, 850, n_samples)
+
+    cities = np.array(["new_york", "chicago", "la", "houston", "phoenix"])
+    city = rng.choice(cities, n_samples)
+
+    plans = np.array(["free", "basic", "premium"])
+    plan = rng.choice(plans, n_samples, p=[0.5, 0.3, 0.2])
+
+    mask = rng.random(n_samples) < 0.05
+    age_with_missing = age.copy()
+    age_with_missing[mask] = np.nan
+
+    mask2 = rng.random(n_samples) < 0.03
+    income_with_missing = income.copy()
+    income_with_missing[mask2] = np.nan
+
+    boundary = (
+        0.01 * (age - 35)
+        + 0.00001 * (income - 40000)
+        + 0.002 * (score - 600)
+        + 0.5 * (plan == "premium").astype(float)
+        - 0.3 * (plan == "free").astype(float)
+        + rng.normal(0, 0.5, n_samples)
+    )
+    target = (boundary > 0).astype(int)
+
+    return {
+        "age": age_with_missing,
+        "income": income_with_missing,
+        "score": score,
+        "city": city,
+        "plan": plan,
+        "target": target,
+    }
+
+
+def train_test_split_dict(data, test_ratio=0.2, seed=42):
+    rng = np.random.RandomState(seed)
+    n = len(data["target"])
+    idx = rng.permutation(n)
+    split = int(n * (1 - test_ratio))
+    train_idx, test_idx = idx[:split], idx[split:]
+
+    train = {k: v[train_idx] for k, v in data.items()}
+    test = {k: v[test_idx] for k, v in data.items()}
+    return train, test
+
+
+class MedianImputer:
+    def __init__(self):
+        self.medians = None
+
+    def fit(self, X):
+        self.medians = np.nanmedian(X, axis=0)
+        return self
+
+    def transform(self, X):
+        X_out = X.copy()
+        for col in range(X.shape[1]):
+            mask = np.isnan(X_out[:, col])
+            X_out[mask, col] = self.medians[col]
+        return X_out
+
+    def fit_transform(self, X):
+        return self.fit(X).transform(X)
+
+
+class StandardScaler:
+    def __init__(self):
+        self.means = None
+        self.stds = None
+
+    def fit(self, X):
+        self.means = np.nanmean(X, axis=0)
+        self.stds = np.nanstd(X, axis=0)
+        self.stds[self.stds == 0] = 1.0
+        return self
+
+    def transform(self, X):
+        return (X - self.means) / self.stds
+
+    def fit_transform(self, X):
+        return self.fit(X).transform(X)
+
+
+class OneHotEncoder:
+    def __init__(self, handle_unknown="ignore"):
+        self.categories = None
+        self.handle_unknown = handle_unknown
+
+    def fit(self, X):
+        self.categories = []
+        for col in range(X.shape[1]):
+            self.categories.append(sorted(set(X[:, col])))
+        return self
+
+    def transform(self, X):
+        encoded_cols = []
+        for col in range(X.shape[1]):
+            cats = self.categories[col]
+            for cat in cats:
+                encoded_cols.append((X[:, col] == cat).astype(float))
+        return np.column_stack(encoded_cols) if encoded_cols else np.zeros((X.shape[0], 0))
+
+    def fit_transform(self, X):
+        return self.fit(X).transform(X)
+```
+
+### Step 2: Pipeline from Scratch
+
+```python
+class PipelineFromScratch:
+    def __init__(self, steps):
+        self.steps = steps
+
+    def fit(self, X, y=None):
+        X_current = X.copy() if isinstance(X, np.ndarray) else X
+        for name, step in self.steps[:-1]:
+            X_current = step.fit_transform(X_current)
+        name, model = self.steps[-1]
+        model.fit(X_current, y)
+        return self
+
+    def predict(self, X):
+        X_current = X.copy() if isinstance(X, np.ndarray) else X
+        for name, step in self.steps[:-1]:
+            X_current = step.transform(X_current)
+        name, model = self.steps[-1]
+        return model.predict(X_current)
+
+    def score(self, X, y):
+        pred = self.predict(X)
+        return np.mean(pred == y)
+
+
+class ColumnTransformerScratch:
+    def __init__(self, transformers):
+        self.transformers = transformers
+
+    def fit(self, data):
+        for name, pipeline, columns in self.transformers:
+            X_subset = np.column_stack([data[c] for c in columns])
+            pipeline.fit(X_subset)
+        return self
+
+    def transform(self, data):
+        outputs = []
+        for name, pipeline, columns in self.transformers:
+            X_subset = np.column_stack([data[c] for c in columns])
+            outputs.append(pipeline.transform(X_subset))
+        return np.hstack(outputs)
+
+    def fit_transform(self, data):
+        return self.fit(data).transform(data)
+
+
+class TransformerPipeline:
+    def __init__(self, steps):
+        self.steps = steps
+
+    def fit(self, X):
+        X_current = X
+        for name, step in self.steps:
+            X_current = step.fit_transform(X_current)
+        return self
+
+    def transform(self, X):
+        X_current = X
+        for name, step in self.steps:
+            X_current = step.transform(X_current)
+        return X_current
+
+    def fit_transform(self, X):
+        return self.fit(X).transform(X)
+```
+
+### Step 3: Models and Full Pipeline
+
+```python
+class LogisticRegressionSimple:
+    def __init__(self, lr=0.01, n_iter=1000):
+        self.lr = lr
+        self.n_iter = n_iter
+        self.weights = None
+        self.bias = None
+
+    def _sigmoid(self, z):
+        return 1.0 / (1.0 + np.exp(-np.clip(z, -500, 500)))
+
+    def fit(self, X, y):
+        n_samples, n_features = X.shape
+        self.weights = np.zeros(n_features)
+        self.bias = 0.0
+
+        for _ in range(self.n_iter):
+            z = X @ self.weights + self.bias
+            pred = self._sigmoid(z)
+            dw = (1 / n_samples) * X.T @ (pred - y)
+            db = (1 / n_samples) * np.sum(pred - y)
+            self.weights -= self.lr * dw
+            self.bias -= self.lr * db
+
+    def predict(self, X):
+        z = X @ self.weights + self.bias
+        return (self._sigmoid(z) >= 0.5).astype(int)
+
+    def predict_proba(self, X):
+        z = X @ self.weights + self.bias
+        p = self._sigmoid(z)
+        return np.column_stack([1 - p, p])
+
+
+class DecisionTreeSimple:
+    def __init__(self, max_depth=5):
+        self.max_depth = max_depth
+        self.root = None
+
+    def fit(self, X, y):
+        self.root = self._build(X, y, 0)
+
+    def _gini(self, y):
+        if len(y) == 0:
+            return 0
+        p = np.mean(y)
+        return 1 - p ** 2 - (1 - p) ** 2
+
+    def _build(self, X, y, depth):
+        if depth >= self.max_depth or len(np.unique(y)) == 1 or len(y) < 4:
+            return {"value": round(np.mean(y))}
+
+        best_gain = -1
+        best_f, best_t = 0, 0
+        gini_parent = self._gini(y) * len(y)
+
+        for f in range(X.shape[1]):
+            thresholds = np.percentile(X[:, f], np.linspace(10, 90, 10))
+            for t in thresholds:
+                left = y[X[:, f] <= t]
+                right = y[X[:, f] > t]
+                if len(left) < 2 or len(right) < 2:
+                    continue
+                gain = gini_parent - self._gini(left) * len(left) - self._gini(right) * len(right)
+                if gain > best_gain:
+                    best_gain = gain
+                    best_f, best_t = f, t
+
+        if best_gain <= 0:
+            return {"value": round(np.mean(y))}
+
+        mask = X[:, best_f] <= best_t
+        return {
+            "feature": best_f,
+            "threshold": best_t,
+            "left": self._build(X[mask], y[mask], depth + 1),
+            "right": self._build(X[~mask], y[~mask], depth + 1),
+        }
+
+    def predict(self, X):
+        return np.array([self._pred(x, self.root) for x in X])
+
+    def _pred(self, x, node):
+        if "value" in node:
+            return node["value"]
+        if x[node["feature"]] <= node["threshold"]:
+            return self._pred(x, node["left"])
+        return self._pred(x, node["right"])
+
+
+class FullPipeline:
+    def __init__(self, model, numeric_cols, categorical_cols):
+        self.model = model
+        self.numeric_cols = numeric_cols
+        self.categorical_cols = categorical_cols
+        self.num_pipeline = TransformerPipeline([
+            ("impute", MedianImputer()),
+            ("scale", StandardScaler()),
+        ])
+        self.cat_encoder = OneHotEncoder(handle_unknown="ignore")
+
+    def fit(self, data):
+        X_num = np.column_stack([data[c] for c in self.numeric_cols])
+        X_cat = np.column_stack([data[c] for c in self.categorical_cols])
+
+        X_num_processed = self.num_pipeline.fit_transform(X_num)
+        X_cat_processed = self.cat_encoder.fit_transform(X_cat)
+
+        X = np.hstack([X_num_processed, X_cat_processed])
+        y = data["target"]
+
+        self.model.fit(X, y)
+        return self
+
+    def predict(self, data):
+        X_num = np.column_stack([data[c] for c in self.numeric_cols])
+        X_cat = np.column_stack([data[c] for c in self.categorical_cols])
+
+        X_num_processed = self.num_pipeline.transform(X_num)
+        X_cat_processed = self.cat_encoder.transform(X_cat)
+
+        X = np.hstack([X_num_processed, X_cat_processed])
+        return self.model.predict(X)
+
+    def score(self, data):
+        pred = self.predict(data)
+        return np.mean(pred == data["target"])
+```
+
+### Step 4: Cross-Validation with Pipeline
+
+```python
+def cross_validate_pipeline(pipeline_factory, data, n_folds=5, seed=42):
+    rng = np.random.RandomState(seed)
+    n = len(data["target"])
+    idx = rng.permutation(n)
+    fold_size = n // n_folds
+    scores = []
+
+    for fold in range(n_folds):
+        val_start = fold * fold_size
+        val_end = val_start + fold_size if fold < n_folds - 1 else n
+
+        val_idx = idx[val_start:val_end]
+        train_idx = np.concatenate([idx[:val_start], idx[val_end:]])
+
+        train_data = {k: v[train_idx] for k, v in data.items()}
+        val_data = {k: v[val_idx] for k, v in data.items()}
+
+        pipe = pipeline_factory()
+        pipe.fit(train_data)
+        score = pipe.score(val_data)
+        scores.append(score)
+
+    return scores
+```
+
+### Step 5: Full Demo
+
+```python
+def demo_data_leakage():
+    print("=" * 60)
+    print("DATA LEAKAGE DEMONSTRATION")
+    print("=" * 60)
+
+    rng = np.random.RandomState(42)
+    X = rng.randn(200, 5)
+    y = (X[:, 0] + 0.5 * X[:, 1] > 0).astype(int)
+
+    scaler_leaky = StandardScaler()
+    X_scaled_leaky = scaler_leaky.fit_transform(X)
+    X_train_leaky = X_scaled_leaky[:160]
+    X_test_leaky = X_scaled_leaky[160:]
+    y_train, y_test = y[:160], y[160:]
+
+    model_leaky = LogisticRegressionSimple(lr=0.1, n_iter=500)
+    model_leaky.fit(X_train_leaky, y_train)
+    acc_leaky = np.mean(model_leaky.predict(X_test_leaky) == y_test)
+
+    X_train = X[:160]
+    X_test = X[160:]
+    scaler_clean = StandardScaler()
+    X_train_clean = scaler_clean.fit_transform(X_train)
+    X_test_clean = scaler_clean.transform(X_test)
+
+    model_clean = LogisticRegressionSimple(lr=0.1, n_iter=500)
+    model_clean.fit(X_train_clean, y_train)
+    acc_clean = np.mean(model_clean.predict(X_test_clean) == y_test)
+
+    print(f"  Leaky (scaler fit on all data):    {acc_leaky:.3f}")
+    print(f"  Clean (scaler fit on train only):  {acc_clean:.3f}")
+    print(f"  Difference:                        {acc_leaky - acc_clean:+.3f}")
+    print()
+    print("  On this simple case the difference may be small,")
+    print("  but on real data with target encoding or feature")
+    print("  selection, leakage can inflate accuracy by 10-30%.")
+    print()
+
+
+def demo_pipeline_from_scratch():
+    print("=" * 60)
+    print("PIPELINE FROM SCRATCH")
+    print("=" * 60)
+
+    rng = np.random.RandomState(42)
+    X = rng.randn(300, 5)
+    y = (X[:, 0] + 0.5 * X[:, 1] - 0.3 * X[:, 2] > 0).astype(int)
+
+    X_train, X_test = X[:240], X[240:]
+    y_train, y_test = y[:240], y[240:]
+
+    pipe = PipelineFromScratch([
+        ("scaler", StandardScaler()),
+        ("model", LogisticRegressionSimple(lr=0.1, n_iter=500)),
+    ])
+
+    pipe.fit(X_train, y_train)
+    train_acc = pipe.score(X_train, y_train)
+    test_acc = pipe.score(X_test, y_test)
+
+    print(f"  Pipeline (scaler + logistic regression):")
+    print(f"  Train accuracy: {train_acc:.3f}")
+    print(f"  Test accuracy:  {test_acc:.3f}")
+    print()
+
+
+def demo_full_pipeline():
+    print("=" * 60)
+    print("FULL PIPELINE WITH MIXED DATA TYPES")
+    print("=" * 60)
+
+    data = make_mixed_data(n_samples=500)
+    train, test = train_test_split_dict(data)
+
+    pipe = FullPipeline(
+        model=DecisionTreeSimple(max_depth=5),
+        numeric_cols=["age", "income", "score"],
+        categorical_cols=["city", "plan"],
+    )
+
+    pipe.fit(train)
+    train_acc = pipe.score(train)
+    test_acc = pipe.score(test)
+
+    print(f"  Full pipeline (impute + scale + encode + tree):")
+    print(f"  Train accuracy: {train_acc:.3f}")
+    print(f"  Test accuracy:  {test_acc:.3f}")
+    print()
+
+
+def demo_cross_validation():
+    print("=" * 60)
+    print("CROSS-VALIDATION WITH PIPELINE")
+    print("=" * 60)
+
+    data = make_mixed_data(n_samples=500)
+
+    def make_pipeline():
+        return FullPipeline(
+            model=DecisionTreeSimple(max_depth=5),
+            numeric_cols=["age", "income", "score"],
+            categorical_cols=["city", "plan"],
+        )
+
+    scores = cross_validate_pipeline(make_pipeline, data, n_folds=5)
+
+    print(f"  5-fold CV scores: {[f'{s:.3f}' for s in scores]}")
+    print(f"  Mean: {np.mean(scores):.3f} +/- {np.std(scores):.3f}")
+    print()
+    print("  Each fold fits the preprocessor on its own training split.")
+    print("  No data leakage across folds.")
+    print()
+
+
+def demo_unknown_categories():
+    print("=" * 60)
+    print("HANDLING UNKNOWN CATEGORIES")
+    print("=" * 60)
+
+    train_cats = np.array([["new_york"], ["chicago"], ["la"], ["houston"]])
+    encoder = OneHotEncoder(handle_unknown="ignore")
+    encoder.fit(train_cats)
+
+    print(f"  Known categories: {encoder.categories[0]}")
+
+    train_encoded = encoder.transform(train_cats)
+    print(f"  'new_york' encoded: {train_encoded[0]}")
+
+    unknown = np.array([["seattle"]])
+    unknown_encoded = encoder.transform(unknown)
+    print(f"  'seattle' (unknown) encoded: {unknown_encoded[0]}")
+    print(f"  Unknown category produces zero vector (no crash).")
+    print()
+
+
+def demo_model_comparison():
+    print("=" * 60)
+    print("MODEL COMPARISON VIA PIPELINE")
+    print("=" * 60)
+
+    data = make_mixed_data(n_samples=500)
+
+    models = [
+        ("Logistic Regression", lambda: LogisticRegressionSimple(lr=0.05, n_iter=1000)),
+        ("Decision Tree d=3", lambda: DecisionTreeSimple(max_depth=3)),
+        ("Decision Tree d=5", lambda: DecisionTreeSimple(max_depth=5)),
+        ("Decision Tree d=10", lambda: DecisionTreeSimple(max_depth=10)),
+    ]
+
+    for name, model_fn in models:
+        def make_pipe(m=model_fn):
+            return FullPipeline(
+                model=m(),
+                numeric_cols=["age", "income", "score"],
+                categorical_cols=["city", "plan"],
+            )
+
+        scores = cross_validate_pipeline(make_pipe, data, n_folds=5)
+        print(f"  {name:>25s}:  {np.mean(scores):.3f} +/- {np.std(scores):.3f}")
+
+    print()
+
+
+def demo_experiment_tracking():
+    print("=" * 60)
+    print("EXPERIMENT TRACKING (manual log)")
+    print("=" * 60)
+
+    data = make_mixed_data(n_samples=500)
+    experiments = []
+
+    configs = [
+        {"model": "tree", "max_depth": 3},
+        {"model": "tree", "max_depth": 5},
+        {"model": "tree", "max_depth": 10},
+        {"model": "logistic", "lr": 0.01, "n_iter": 500},
+        {"model": "logistic", "lr": 0.1, "n_iter": 1000},
+    ]
+
+    for i, config in enumerate(configs):
+        if config["model"] == "tree":
+            model_fn = lambda c=config: DecisionTreeSimple(max_depth=c["max_depth"])
+        else:
+            model_fn = lambda c=config: LogisticRegressionSimple(lr=c["lr"], n_iter=c["n_iter"])
+
+        def make_pipe(m=model_fn):
+            return FullPipeline(
+                model=m(),
+                numeric_cols=["age", "income", "score"],
+                categorical_cols=["city", "plan"],
+            )
+
+        scores = cross_validate_pipeline(make_pipe, data, n_folds=5)
+        result = {
+            "run_id": i + 1,
+            "config": config,
+            "mean_accuracy": np.mean(scores),
+            "std_accuracy": np.std(scores),
+        }
+        experiments.append(result)
+
+    print(f"  {'Run':>4}  {'Config':>40}  {'Accuracy':>10}  {'Std':>8}")
+    print(f"  {'-'*4}  {'-'*40}  {'-'*10}  {'-'*8}")
+    for exp in experiments:
+        config_str = str(exp["config"])[:40]
+        print(
+            f"  {exp['run_id']:>4d}  {config_str:>40}  "
+            f"{exp['mean_accuracy']:>10.3f}  {exp['std_accuracy']:>8.3f}"
+        )
+
+    best = max(experiments, key=lambda e: e["mean_accuracy"])
+    print(f"\n  Best run: #{best['run_id']}")
+    print(f"  Config: {best['config']}")
+    print(f"  Accuracy: {best['mean_accuracy']:.3f} +/- {best['std_accuracy']:.3f}")
+    print()
+
+
+def demo_reproducibility():
+    print("=" * 60)
+    print("REPRODUCIBILITY CHECK")
+    print("=" * 60)
+
+    data = make_mixed_data(n_samples=500, seed=42)
+
+    def make_pipe():
+        return FullPipeline(
+            model=DecisionTreeSimple(max_depth=5),
+            numeric_cols=["age", "income", "score"],
+            categorical_cols=["city", "plan"],
+        )
+
+    run1 = cross_validate_pipeline(make_pipe, data, n_folds=5, seed=42)
+    run2 = cross_validate_pipeline(make_pipe, data, n_folds=5, seed=42)
+    run3 = cross_validate_pipeline(make_pipe, data, n_folds=5, seed=99)
+
+    print(f"  Run 1 (seed=42): {[f'{s:.4f}' for s in run1]}")
+    print(f"  Run 2 (seed=42): {[f'{s:.4f}' for s in run2]}")
+    print(f"  Run 3 (seed=99): {[f'{s:.4f}' for s in run3]}")
+    print(f"  Run 1 == Run 2: {all(abs(a-b) < 1e-10 for a,b in zip(run1, run2))}")
+    print(f"  Run 1 == Run 3: {all(abs(a-b) < 1e-10 for a,b in zip(run1, run3))}")
+    print()
+    print("  Same seed, same data, same results. That is reproducibility.")
+    print()
+
+
+if __name__ == "__main__":
+    demo_data_leakage()
+    demo_pipeline_from_scratch()
+    demo_full_pipeline()
+    demo_cross_validation()
+    demo_unknown_categories()
+    demo_model_comparison()
+    demo_experiment_tracking()
+    demo_reproducibility()
+    print("All pipeline demos complete.")
+```
+
+## Exercises
+
+1. Build a pipeline that handles a dataset with 3 numeric columns and 2 categorical columns. Use `ColumnTransformer` to apply median imputation + scaling to numerics and most-frequent imputation + one-hot encoding to categoricals. Train with 5-fold cross-validation.
+
+2. Deliberately introduce data leakage: fit the scaler on the full dataset before splitting. Compare the cross-validation score (leaky) to the pipeline cross-validation score (clean). How large is the difference?
+
+3. Serialize your pipeline with `joblib.dump`. Load it in a separate script and run predictions. Verify the predictions are identical.
+
+4. Add a custom transformer to the pipeline that creates polynomial features (degree 2) for the two most important numeric columns. Where should it go in the pipeline?
+
+5. Set up MLflow tracking for the pipeline. Run 5 experiments with different hyperparameters. Use the MLflow UI (`mlflow ui`) to compare runs and pick the best model.
+
+## Key Terms
+
+| Term | What people say | What it actually means |
+|------|----------------|----------------------|
+| Pipeline | "Chain of transforms + model" | An ordered sequence of fitted transformers and a model, applied as one unit to prevent leakage |
+| Data leakage | "Test info leaked into training" | Using information from outside the training set to build the model, inflating performance estimates |
+| ColumnTransformer | "Different preprocessing per column" | Applies different pipelines to different subsets of columns, combining results |
+| Experiment tracking | "Logging your runs" | Recording parameters, metrics, artifacts, and code versions for every training run |
+| MLflow | "Track and deploy models" | Open-source platform for experiment tracking, model registry, and deployment |
+| DVC | "Git for data" | Version control system for large data files, storing hashes in git and data in remote storage |
+| Model registry | "Model version catalog" | A system that tracks model versions with stage labels (staging, production, archived) |
+| Training/serving skew | "It worked in the notebook" | Differences between how data is processed during training versus inference, causing silent errors |
+| Reproducibility | "Same code, same result" | The ability to get identical results from the same code, data, and configuration |
+
+## Further Reading
+
+- [scikit-learn Pipeline docs](https://scikit-learn.org/stable/modules/compose.html) -- the official pipeline reference
+- [MLflow documentation](https://mlflow.org/docs/latest/index.html) -- experiment tracking and model registry
+- [DVC documentation](https://dvc.org/doc) -- data versioning
+- [Sculley et al., Hidden Technical Debt in Machine Learning Systems (2015)](https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html) -- the seminal paper on ML systems complexity
+- [Google ML Best Practices: Rules of ML](https://developers.google.com/machine-learning/guides/rules-of-ml) -- practical production ML advice

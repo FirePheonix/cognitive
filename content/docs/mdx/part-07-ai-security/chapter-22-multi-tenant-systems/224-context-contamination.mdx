@@ -5,5 +5,200 @@ lastUpdatedDate: '2026-08-05'
 
 # 22.4 Context Contamination
 
-This section covers the details of 22.4 Context Contamination.
+Context contamination occurs when one tenant's data appears in another tenant's context window. It is distinct from data isolation failures at the storage layer — contamination can happen even when storage is correctly isolated, through bugs in the application layer that assembles the prompt.
 
+## How Context Contamination Happens
+
+### 1. Shared Conversation History
+
+A session management bug allows a conversation from Tenant A to be reused for Tenant B:
+
+```python
+# VULNERABLE: session_id is user-controlled, not validated against tenant_id
+def get_conversation_history(session_id: str) -> list[dict]:
+    return redis.lrange(f"session:{session_id}", 0, -1)
+
+# Attack: Tenant B uses a known session_id from Tenant A
+# → They receive Tenant A's conversation history in their context
+```
+
+**Fix:** Always validate that the session's tenant matches the authenticated tenant:
+
+```python
+def get_conversation_history(session_id: str, tenant_id: str) -> list[dict]:
+    session_data = redis.hgetall(f"session:{session_id}")
+
+    # Verify ownership before returning
+    if session_data.get("tenant_id") != tenant_id:
+        raise AuthorizationError(
+            f"Session {session_id} does not belong to tenant {tenant_id}"
+        )
+
+    return json.loads(session_data.get("history", "[]"))
+```
+
+### 2. Wrong Namespace in Vector Store Query
+
+A missing or incorrect tenant filter means retrieval returns documents from other tenants:
+
+```python
+# VULNERABLE: no tenant filter
+def retrieve_documents(query: str) -> list[str]:
+    return vector_store.similarity_search(query, k=5)  # searches ALL tenants
+
+# Fix: mandatory tenant filter (see section 22.1)
+def retrieve_documents(query: str, tenant_id: str) -> list[str]:
+    return vector_store.similarity_search(
+        query, k=5, filter={"tenant_id": tenant_id}
+    )
+```
+
+### 3. Shared Scratchpad or Tool State
+
+When multiple tenants share an agent with persistent scratchpad state (e.g., a global Python REPL), one tenant's execution state can leak into another's:
+
+```python
+# VULNERABLE: global tool state shared across all requests
+python_repl_state = {}  # persists across all agent calls
+
+def run_python(code: str) -> str:
+    exec(code, python_repl_state)
+    return str(python_repl_state.get("result", ""))
+
+# Fix: per-request, per-tenant isolated execution state
+def run_python(code: str, tenant_id: str, session_id: str) -> str:
+    # Each request gets a fresh execution context
+    local_state = {}
+    exec(code, local_state)
+    return str(local_state.get("result", ""))
+```
+
+### 4. Cached Prompts with Wrong Tenant
+
+A caching bug that ignores tenant in the cache key (see section 22.2) can inject another tenant's system prompt or documents.
+
+## The Zero-Trust Context Rule
+
+Every piece of data injected into a context window should be treated as potentially wrong until its `tenant_id` has been verified:
+
+```python
+class ZeroTrustContextBuilder:
+    """
+    Builds a context window with mandatory tenant verification
+    on every injected element.
+    """
+
+    def __init__(self, tenant_id: str):
+        self.tenant_id = tenant_id
+        self.context_elements = []
+        self.rejected_elements = []
+
+    def add_retrieved_docs(self, docs: list[dict]) -> "ZeroTrustContextBuilder":
+        for doc in docs:
+            if doc.get("tenant_id") == self.tenant_id:
+                self.context_elements.append(("doc", doc["content"]))
+            else:
+                self.rejected_elements.append({
+                    "type": "doc",
+                    "doc_id": doc.get("id"),
+                    "actual_tenant": doc.get("tenant_id"),
+                    "expected_tenant": self.tenant_id
+                })
+                logger.error(
+                    "CONTEXT_CONTAMINATION_PREVENTED",
+                    extra={
+                        "doc_id": doc.get("id"),
+                        "actual_tenant": doc.get("tenant_id"),
+                        "expected_tenant": self.tenant_id
+                    }
+                )
+
+        return self
+
+    def add_memory(self, memories: list[dict]) -> "ZeroTrustContextBuilder":
+        for mem in memories:
+            if mem.get("tenant_id") == self.tenant_id:
+                self.context_elements.append(("memory", mem["content"]))
+            else:
+                self.rejected_elements.append({"type": "memory", **mem})
+                logger.error("MEMORY_CONTAMINATION_PREVENTED", extra=mem)
+
+        return self
+
+    def build(self) -> str:
+        if self.rejected_elements:
+            # Alert: contamination was attempted/would have occurred
+            alert_security_team(
+                "Context contamination prevented",
+                {"tenant": self.tenant_id, "rejected": self.rejected_elements}
+            )
+
+        return "\n\n".join(content for _, content in self.context_elements)
+```
+
+## Context Contamination Detection
+
+Add runtime detection to catch contamination before it reaches the LLM:
+
+```python
+def detect_context_contamination(
+    context: str,
+    tenant_id: str,
+    known_tenant_markers: list[str]  # e.g., tenant-specific entity names, IDs
+) -> bool:
+    """
+    Heuristic check: does the context contain markers from OTHER tenants?
+    This is a belt-and-suspenders check, not a primary defense.
+    """
+    # Get markers for all OTHER tenants (not the current one)
+    other_tenant_markers = get_other_tenant_markers(tenant_id)
+
+    for marker in other_tenant_markers:
+        if marker.lower() in context.lower():
+            logger.critical(
+                "POTENTIAL_CONTEXT_CONTAMINATION",
+                extra={
+                    "tenant_id": tenant_id,
+                    "detected_marker": marker,
+                    "context_preview": context[:200]
+                }
+            )
+            return True
+
+    return False
+```
+
+## Audit Points for Context Contamination
+
+Every location in the code where data is injected into a prompt is a potential contamination point. Audit them all:
+
+```python
+CONTEXT_INJECTION_POINTS = [
+    "retrieved_documents",     # from vector store
+    "conversation_history",    # from session store
+    "long_term_memories",      # from memory store
+    "tool_results",            # from external tool calls
+    "system_prompt_variables", # dynamic values in system prompt
+    "user_profile_data",       # user metadata
+]
+
+# For each injection point, add a tenant_id assertion before injection
+def build_prompt_with_audit(
+    query: str,
+    tenant_id: str,
+    retrieved_docs: list[dict],
+    memories: list[dict],
+    conversation: list[dict]
+) -> str:
+    builder = ZeroTrustContextBuilder(tenant_id)
+
+    builder.add_retrieved_docs(retrieved_docs)
+    builder.add_memory(memories)
+    # Conversation history is validated by session ownership, not tenant_id field
+
+    context = builder.build()
+
+    return f"Context:\n{context}\n\nConversation:\n{format_conversation(conversation)}\n\nQuestion: {query}"
+```
+
+Context contamination is often a "silent" failure — the model produces an answer, just one that includes the wrong tenant's information. Without explicit contamination detection, it can go unnoticed until a user complains. Instrument every injection point.

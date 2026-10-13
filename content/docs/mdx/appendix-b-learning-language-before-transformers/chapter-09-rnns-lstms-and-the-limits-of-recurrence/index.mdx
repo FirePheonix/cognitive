@@ -43,6 +43,8 @@ h₀ →[RNN]→h₁→[RNN]→h₂→[RNN]→h₃→[RNN]→h₄→[RNN]→h₅
   h₆ is a compressed summary of the entire 6-token sequence.
 ```
 
+![The RNN: A Loop in Time — RNN unrolled across 6 time steps showing weight sharing, the recurrence equation h_t = tanh(W_h · h_{t-1} + W_x · x_t + b), typical shapes, and a single RNN cell zoomed in](/appendix-b/09-rnns-lstms-and-the-limits-of-recurrence/rnn-unrolled-loop.png)
+
 Where:
 - `x_t` is the embedding of the current token
 - `h_{t-1}` is the hidden state from the previous step (the "memory")
@@ -190,6 +192,8 @@ The Long Short-Term Memory network was proposed by Sepp Hochreiter and Jürgen S
 The key insight is that the problem with vanilla RNNs is *multiplicative* — gradients shrink because they're repeatedly *multiplied* by numbers less than 1. The LSTM's cell state uses *additive* updates instead. Addition doesn't shrink gradients the way multiplication does. Information can flow relatively unchanged across hundreds of steps.
 
 But you can't just add everything — you'd accumulate garbage indefinitely. So the LSTM uses **gates** — learned sigmoid functions that act like valves, controlling how much of the new information enters the cell state and how much of the old information remains.
+
+![LSTMs: Gated Memory — LSTM cell with forget gate, input gate, candidate, and output gate; cell state updated additively (c_t = f_t * c_{t-1} + i_t * g_t); full equations and key idea that additive updates preserve gradients over long time spans](/appendix-b/09-rnns-lstms-and-the-limits-of-recurrence/lstm-gated-memory.png)
 
 ```text
 LSTM cell — one time step:
@@ -502,3 +506,56 @@ Appendix C covers how attention works and how the Transformer is built from it. 
 - A **GRU** simplifies the LSTM to two gates (update and reset), achieving similar performance with fewer parameters.
 - Despite major improvements over RNNs, LSTMs still have three fundamental problems: **sequential computation** (can't parallelize), **information bottleneck** (fixed-size hidden state), and **practical context limits** (~100–200 tokens).
 - The solution — attention — lets every position directly attend to every other position without going through a sequential bottleneck. That story is in Appendix C.
+
+---
+
+### The Mathematics of Sequence Memory: LSTM Gate Equations
+
+**The language modeling objective:** RNNs are trained to predict the next token:
+$$P(x_{t+1} \mid x_{\le t})$$
+Over an entire sequence, the training loss is:
+$$\mathcal{L} = -\sum_{t=1}^{T} \log P_\theta(x_t \mid x_{<t})$$
+This is exactly the same objective used by GPT-4 — RNNs were training on the same task, just with a weaker architecture.
+
+**Perplexity — the measurement unit of language models:**
+Perplexity converts the loss into a more interpretable number — roughly "how many words is the model equally likely to choose from at each step?":
+$$\text{PPL} = \exp\left(-\frac{1}{T}\sum_t \log P(x_t \mid x_{<t})\right)$$
+A perplexity of 10 means the model is, on average, as confused as if it were choosing uniformly from 10 options. Lower is better. GPT-3 achieves PPL ~20 on some benchmarks; humans are ~15.
+
+> **Important:** Perplexity can't be compared across models with different tokenizers. A model that splits words into more tokens will have numerically different (often lower) perplexity for reasons unrelated to actual language understanding.
+
+**Why gradients die over long sequences — the math:**
+When you backpropagate through an RNN unrolled over $T$ steps, the gradient at step $k$ depends on a chain of matrix products:
+$$\frac{\partial h_t}{\partial h_k} = \prod_{i=k+1}^{t} \frac{\partial h_i}{\partial h_{i-1}}$$
+If the spectral radius of each Jacobian is less than 1, this product shrinks exponentially toward zero — the vanishing gradient problem. If greater than 1, it grows exponentially — the exploding gradient problem. You can't reliably learn dependencies spanning more than ~20-30 steps.
+
+**Gradient clipping — the cheap fix for exploding gradients:**
+$$g \leftarrow g \cdot \min\left(1, \frac{\tau}{\|g\|}\right)$$
+If the gradient norm exceeds threshold $\tau$, scale it down proportionally. This prevents the optimizer from taking catastrophically large steps when gradients explode. It doesn't fix vanishing gradients.
+
+**LSTM gate equations — how memory works:**
+The LSTM maintains two states: $h_t$ (hidden state, like RNN) and $c_t$ (cell state, the long-term memory). Four gates control information flow:
+
+Forget gate — what fraction of old memory to keep:
+$$f_t = \sigma(W_f[x_t, h_{t-1}] + b_f)$$
+
+Input gate — what new information to write:
+$$i_t = \sigma(W_i[x_t, h_{t-1}] + b_i)$$
+
+Candidate memory — what the new information is:
+$$\tilde{c}_t = \tanh(W_c[x_t, h_{t-1}] + b_c)$$
+
+Cell state update — the additive mechanism that preserves gradients:
+$$c_t = f_t \odot c_{t-1} + i_t \odot \tilde{c}_t$$
+
+Output — what to expose from cell state:
+$$h_t = o_t \odot \tanh(c_t)$$
+
+The critical insight is the **additive** update to $c_t$. Because the cell state is updated by addition (not multiplication), gradients can flow back through time without shrinking. The forget gate $f_t$ can stay near 1 for many steps, letting the model remember things from far back.
+
+**Exposure bias — the train-test mismatch:**
+During training, the RNN sees the *true* previous token:
+$$x_t^{\text{in}} = x_t^{\text{gold}}$$
+During inference, it sees its *own previous prediction*:
+$$x_t^{\text{in}} = \hat{x}_t$$
+This mismatch — called exposure bias — means the model has never been trained to recover from its own mistakes. One wrong prediction cascades into increasingly wrong predictions. It's a fundamental problem with teacher forcing, and it partially motivated the move to non-autoregressive and diffusion-based approaches.

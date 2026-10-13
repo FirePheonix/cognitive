@@ -377,3 +377,47 @@ Agent Loop:   When tool calling is reliable and the loop is formalized,
 - The **agent loop** (ReAct pattern): Thought → Action → Observe → Thought → ... until done. The model drives; tools execute.
 - **Token cost** of tool calling: ~2.7× a plain response. Agent loops multiply this. Plan context budgets accordingly.
 - **Naming evolution**: Function Call → Tool Use → MCP. The concept is the same; MCP aims to standardize the protocol across models and tools.
+
+---
+
+## The Formal Framework: Agent as Policy
+
+**Agent trajectory notation:**
+An agent's behavior over a task can be written as a trajectory:
+
+$$\tau = (o_0, a_0, o_1, a_1, \dots, o_T, a_T)$$
+
+Where $o_t$ is the observation at step $t$ (what the agent sees — tool results, user messages, environment state) and $a_t$ is the action (tool call, response). The agent is a **policy** that maps history to action:
+
+$$a_t \sim \pi_\theta(a_t \mid h_t)$$
+
+Where $h_t = (o_0, a_0, \dots, o_t)$ is the full history.
+
+This is exactly the reinforcement learning framing. The difference between a language model and an agent is just this feedback loop: the agent's actions change the world, and the world's responses change what the agent does next.
+
+**The tool registry formalism:**
+A tool set is:
+
+$$\mathcal{T} = \{(\text{name}_i, \text{schema}_i, \text{fn}_i)\}$$
+
+The model sees the names and schemas (JSON Schema definitions), generates a structured call $(\text{name}, \text{args})$, and the harness executes $\text{fn}_i(\text{args})$ and returns the result.
+
+In production, a reliable tool system needs: schema validation (are the args type-correct?), retry with error feedback (when the call fails, tell the model why), permission control (not all tools available to all callers), and audit logging (every tool call recorded).
+
+**ReAct — grounding reasoning in action:**
+The ReAct pattern (Yao et al., 2022) interleaves natural language reasoning with tool use:
+```
+Thought: I need to find the current population of Tokyo
+Action: search_web(query="Tokyo population 2026")
+Observation: Tokyo's population is approximately 13.9 million
+Thought: I have enough to answer
+Final Answer: ...
+```
+vs. pure Chain-of-Thought which reasons without any external feedback. The key addition is the Observation step — real tool results, not imagined ones. This grounds the agent's reasoning in verified facts.
+
+**Tree-of-Thought — searching over reasoning paths:**
+CoT is a single linear reasoning path. Tree-of-Thought (ToT) maintains a search tree:
+
+$$s = (x, z_1, \dots, z_i)$$
+
+The agent generates multiple candidate next thoughts, evaluates each (with another LM call or heuristic), and expands the most promising. With backtracking. This turns reasoning into search — more expensive but more reliable on problems where the first idea might be wrong.

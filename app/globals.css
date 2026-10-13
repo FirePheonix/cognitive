@@ -5,6 +5,7 @@
 @import './styles/fd/neutral.css';
 @import './styles/site/theme.css';
 @import './styles/site/markdown.css';
+@import '../node_modules/katex/dist/katex.min.css';
 @plugin 'tailwindcss-animate';
 
 html,

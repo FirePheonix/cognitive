@@ -5,5 +5,207 @@ lastUpdatedDate: '2026-08-05'
 
 # 3.5 Streaming Tokens
 
-This section covers the details of 3.5 Streaming Tokens.
+By default, an API call waits until the model has finished generating the entire response before returning anything. For a response that takes 5 seconds to generate, you're staring at a spinner for 5 seconds, then get everything at once. **Streaming** changes this: tokens are sent to the client as they're generated, one by one.
 
+This isn't just a nice UX feature — it has real architectural implications for how you build agents.
+
+## Why Streaming Matters
+
+**1. Perceived latency drops dramatically**
+
+A response that takes 5 seconds to fully generate but starts streaming after 200ms *feels* fast to users. The human perception of "latency" is anchored to time-to-first-visible-output, not total completion time.
+
+**2. Early stopping**
+
+If the model starts generating something wrong or irrelevant, the user (or your code) can interrupt the stream rather than waiting for the full response. Saves tokens, saves cost.
+
+**3. Real-time tool call detection**
+
+Streaming agents can detect tool call JSON as it arrives — enabling faster pipeline orchestration (parse the tool name, start fetching permissions, etc.) before the full call is complete.
+
+**4. Progressive rendering**
+
+Chat interfaces, code editors, and document tools can render incrementally rather than triggering a single large DOM update.
+
+## How Streaming Works at the Protocol Level
+
+Two mechanisms are used in practice:
+
+### Server-Sent Events (SSE)
+
+The dominant protocol for LLM streaming APIs. The server sends a stream of plain-text events over a persistent HTTP connection:
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+
+data: {"choices":[{"delta":{"content":"The"}}]}
+
+data: {"choices":[{"delta":{"content":" quick"}}]}
+
+data: {"choices":[{"delta":{"content":" brown"}}]}
+
+data: [DONE]
+```
+
+Each `data:` line is a JSON object with a delta — the incremental content. The connection stays open until `[DONE]` is sent.
+
+### Chunked Transfer Encoding
+
+An HTTP/1.1 feature where the response body is sent in chunks without a known Content-Length. Used internally by some providers; the semantics at the application layer are the same.
+
+## Streaming with the OpenAI SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI()
+
+with client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "Explain black holes in 3 sentences."}],
+    stream=True,
+) as stream:
+    for chunk in stream:
+        delta = chunk.choices[0].delta
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()  # newline at the end
+```
+
+The `flush=True` is important — without it, Python's buffered stdout may not display characters as they arrive.
+
+## Streaming with the Anthropic SDK
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+with client.messages.stream(
+    model="claude-opus-4-5",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Explain black holes in 3 sentences."}],
+) as stream:
+    for text in stream.text_stream:
+        print(text, end="", flush=True)
+
+print()
+```
+
+## Streaming with Async (Production Pattern)
+
+In production async services (FastAPI, etc.):
+
+```python
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from openai import AsyncOpenAI
+
+app = FastAPI()
+client = AsyncOpenAI()
+
+async def token_generator(prompt: str):
+    async with client.chat.completions.stream(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        async for text in stream.text_stream:
+            yield f"data: {text}\n\n"
+    yield "data: [DONE]\n\n"
+
+@app.get("/stream")
+async def stream_response(prompt: str):
+    return StreamingResponse(
+        token_generator(prompt),
+        media_type="text/event-stream",
+    )
+```
+
+## The Tool Call Complication
+
+Streaming gets more complex when tool use is involved. Tool calls look like this in the stream:
+
+```
+data: {"delta":{"type":"input_json_delta","partial_json":""}}
+data: {"delta":{"type":"input_json_delta","partial_json":"{\"query\""}}
+data: {"delta":{"type":"input_json_delta","partial_json":": \"black holes\""}}
+data: {"delta":{"type":"input_json_delta","partial_json":"}"}}
+```
+
+The tool call JSON arrives in fragments. Your agent **cannot execute the tool until the entire JSON is accumulated** — a partial JSON object is unparseable.
+
+The correct pattern for streaming agents:
+
+```python
+import json
+import anthropic
+
+client = anthropic.Anthropic()
+
+accumulated_tool_calls = {}
+
+with client.messages.stream(
+    model="claude-opus-4-5",
+    max_tokens=1024,
+    tools=[{"name": "search", "description": "...", "input_schema": {...}}],
+    messages=[{"role": "user", "content": "Search for black holes"}],
+) as stream:
+    for event in stream:
+        if event.type == "content_block_start":
+            if event.content_block.type == "tool_use":
+                # Start accumulating this tool call
+                accumulated_tool_calls[event.index] = {
+                    "id": event.content_block.id,
+                    "name": event.content_block.name,
+                    "input_json": "",
+                }
+        elif event.type == "content_block_delta":
+            if event.delta.type == "input_json_delta":
+                accumulated_tool_calls[event.index]["input_json"] += event.delta.partial_json
+        elif event.type == "content_block_stop":
+            if event.index in accumulated_tool_calls:
+                tool_call = accumulated_tool_calls[event.index]
+                tool_call["input"] = json.loads(tool_call["input_json"])
+                # NOW you can execute the tool
+                result = execute_tool(tool_call["name"], tool_call["input"])
+```
+
+## Buffering for Smoother Output
+
+With speculative decoding or bursty generation, tokens sometimes arrive in irregular bursts. A small buffer smooths this out:
+
+```python
+import asyncio
+
+buffer = []
+FLUSH_INTERVAL = 0.05  # 50ms
+
+async def buffered_stream(stream):
+    async for token in stream:
+        buffer.append(token)
+        
+        if len(buffer) >= 5 or time_since_last_flush > FLUSH_INTERVAL:
+            yield "".join(buffer)
+            buffer.clear()
+```
+
+## Streaming Best Practices
+
+| Scenario | Recommendation |
+|---|---|
+| User-facing chat interface | Always stream — start rendering immediately |
+| Background batch processing | Disable streaming — lower overhead, simpler code |
+| Agent with tool calls | Stream text, accumulate tool call JSON, execute after completion |
+| Server-sent events to browser | Use `text/event-stream` content type, heartbeat pings every 15s |
+| Error handling | Always handle stream interruption gracefully — network drops happen |
+
+## Summary
+
+- Streaming sends tokens to the client as they're generated, not all at once
+- Perceived latency drops dramatically — users see output in milliseconds, not seconds
+- Protocol: Server-Sent Events (SSE) with JSON deltas per token
+- Both OpenAI and Anthropic SDKs support streaming with clean iterator interfaces
+- Tool call JSON must be **fully accumulated** before execution — you can't parse partial JSON
+- For production async services, use async generators with StreamingResponse

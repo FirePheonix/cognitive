@@ -5,5 +5,135 @@ lastUpdatedDate: '2026-08-05'
 
 # 17.6 Error Analysis
 
-This section covers the details of 17.6 Error Analysis.
+Not all errors are equal. The first decision in error analysis is: is this error **transient** (retry will likely succeed) or **permanent** (retrying will waste resources)?
 
+## Error Classification
+
+| Category | Examples | Strategy |
+|----------|----------|----------|
+| **Transient** | 429 rate limited, 503 unavailable, timeout | Retry with backoff |
+| **Permanent** | 400 bad request, 401 unauthorized, 404 not found | Fail fast, report |
+| **Agent logic** | Model refuses, tool returns empty, parsing fails | Retry with modified approach |
+| **Infrastructure** | DB down, Redis unreachable, disk full | Circuit break, degrade gracefully |
+
+```python
+def classify_error(error: Exception) -> ErrorCategory:
+    if isinstance(error, RateLimitError):
+        return ErrorCategory.TRANSIENT
+    if isinstance(error, AuthenticationError):
+        return ErrorCategory.PERMANENT
+    if isinstance(error, APIStatusError):
+        if error.status_code in (429, 500, 502, 503, 504):
+            return ErrorCategory.TRANSIENT
+        if error.status_code in (400, 401, 403, 404):
+            return ErrorCategory.PERMANENT
+    if isinstance(error, TimeoutError):
+        return ErrorCategory.TRANSIENT
+    return ErrorCategory.UNKNOWN
+```
+
+## The Rollback Harness
+
+For code-writing agents, consecutive failures indicate the agent is stuck in a bad loop. The rollback harness at `atlas-agents/ch15_agent_harness/online/rollback_harness.py:172` auto-restores the original file and resets:
+
+```python
+MAX_RETRIES = 3
+
+class RollbackHarness:
+    def __init__(self, workspace: Path):
+        self.workspace = workspace
+        self.snapshots: dict[str, str] = {}
+        self.consecutive_failures = 0
+
+    def snapshot_file(self, path: str) -> None:
+        """Save the current state of a file before modification."""
+        full_path = self.workspace / path
+        if full_path.exists():
+            self.snapshots[path] = full_path.read_text()
+
+    def on_failure(self, path: str, error: str) -> RollbackAction:
+        self.consecutive_failures += 1
+
+        if self.consecutive_failures >= MAX_RETRIES:
+            # Restore original file and tell the agent to start over
+            if path in self.snapshots:
+                (self.workspace / path).write_text(self.snapshots[path])
+
+            self.consecutive_failures = 0
+            return RollbackAction(
+                action="restart",
+                message=(
+                    f"After {MAX_RETRIES} consecutive failures, the file has been "
+                    f"restored to its original state. Please reconsider your approach."
+                ),
+            )
+
+        return RollbackAction(action="retry", message=f"Error: {error}. Try again.")
+
+    def on_success(self):
+        self.consecutive_failures = 0
+```
+
+## Error Patterns to Monitor
+
+### 1. Repeated Tool Failures
+
+```python
+# Alert if the same tool fails more than N times in a session
+def check_tool_failure_rate(trace: Trace, tool_name: str, threshold: int = 3) -> bool:
+    failures = [
+        s for s in trace.spans
+        if s.name == tool_name and s.status == "error"
+    ]
+    return len(failures) >= threshold
+```
+
+When a tool fails repeatedly, the agent is usually stuck. Inject an explicit error message into the context: "This tool has failed 3 times. Consider an alternative approach."
+
+### 2. Context Window Exceeded
+
+```
+anthropic.BadRequestError: prompt is too long
+```
+
+The agent accumulated too many tool results. Solutions:
+- Truncate tool outputs before injection
+- Summarize previous steps rather than keeping them verbatim
+- Use a model with a larger context window
+
+### 3. Model Refusing Requests (Policy)
+
+The model declines to proceed, not because of a security violation, but because the task approaches something it won't do. Track refusals separately from errors — they indicate a prompt or task design issue, not an infrastructure failure.
+
+### 4. Malformed Outputs Breaking Downstream Parsing
+
+```python
+# Fragile: breaks if model outputs anything besides pure JSON
+result = json.loads(response.content)
+
+# Robust: extract JSON from anywhere in the response
+import re
+def extract_json(text: str) -> dict:
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON found in response: {text[:200]}")
+    return json.loads(match.group())
+```
+
+## Error Alerting
+
+```python
+# Error rate alert — alert if >5% of requests fail in a 5-minute window
+def check_error_rate(window_minutes: int = 5, threshold: float = 0.05) -> bool:
+    since = datetime.utcnow() - timedelta(minutes=window_minutes)
+    total = db.count("spans", since=since, kind="agent")
+    errors = db.count("spans", since=since, kind="agent", status="error")
+    rate = errors / total if total > 0 else 0
+    return rate > threshold
+```
+
+## Related Sections
+
+- [19.1 Retries](../chapter-19-reliability-engineering/191-retries) — implementing retry logic for transient errors
+- [19.3 Circuit Breakers](../chapter-19-reliability-engineering/193-circuit-breakers) — stopping cascading failures
+- [19.6 Graceful Degradation](../chapter-19-reliability-engineering/196-graceful-degradation) — what to return when things fail

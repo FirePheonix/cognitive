@@ -5,5 +5,242 @@ lastUpdatedDate: '2026-08-05'
 
 # 22.3 Memory Isolation
 
-This section covers the details of 22.3 Memory Isolation.
+Agent memory systems — conversation history, long-term user preferences, retrieved facts — must be strictly isolated per tenant. A memory system that allows one tenant's stored information to surface in another tenant's session is a data leakage vulnerability.
 
+## The Memory Isolation Problem
+
+Agent memory spans several storage tiers, each requiring its own isolation strategy:
+
+| Memory tier | Storage | Isolation requirement |
+|---|---|---|
+| Short-term (conversation) | In-memory / Redis | Session-scoped, tenant-scoped |
+| Working memory (tool results) | In-memory per request | Request-scoped |
+| Long-term (user preferences) | Vector DB / SQL | Tenant + user scoped |
+| Fine-tuned knowledge | Model weights | Separate model per tenant |
+
+## Short-Term Memory: Session Isolation
+
+Conversation history must be scoped to a specific tenant and user:
+
+```python
+import redis
+import json
+from typing import Optional
+
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+
+class IsolatedConversationMemory:
+    """
+    Conversation memory scoped to a specific tenant and session.
+    No code path allows cross-tenant memory access.
+    """
+
+    def __init__(self, tenant_id: str, session_id: str, max_turns: int = 50):
+        self.tenant_id = tenant_id
+        self.session_id = session_id
+        self.max_turns = max_turns
+
+        # Memory key is always tenant-scoped
+        self.key = f"memory:tenant:{tenant_id}:session:{session_id}"
+
+    def add_turn(self, role: str, content: str) -> None:
+        turn = json.dumps({"role": role, "content": content})
+        r.rpush(self.key, turn)
+        r.expire(self.key, 86400)  # 24-hour TTL
+
+        # Keep only the most recent N turns
+        r.ltrim(self.key, -self.max_turns * 2, -1)
+
+    def get_history(self) -> list[dict]:
+        raw_turns = r.lrange(self.key, 0, -1)
+        return [json.loads(t) for t in raw_turns]
+
+    def clear(self) -> None:
+        r.delete(self.key)
+
+
+# Usage: tenant_id comes from authentication, never from request body
+memory = IsolatedConversationMemory(
+    tenant_id=request.authenticated_tenant_id,
+    session_id=request.session_id
+)
+```
+
+## Long-Term Memory: Vector Store Isolation
+
+Long-term memories (user preferences, important facts, past interactions) are stored in a vector database. The same namespace/collection isolation patterns from section 22.1 apply:
+
+### ChromaDB: Separate Collections per Tenant
+
+```python
+import chromadb
+
+chroma_client = chromadb.HttpClient(host="localhost", port=8000)
+
+class TenantMemoryStore:
+    def __init__(self, tenant_id: str):
+        self.tenant_id = tenant_id
+        # Each tenant has their own collection
+        self.collection = chroma_client.get_or_create_collection(
+            name=f"memory_tenant_{tenant_id.replace('-', '_')}",
+            metadata={"tenant_id": tenant_id}
+        )
+
+    def store_memory(self, memory_id: str, content: str, metadata: dict = None) -> None:
+        safe_metadata = {
+            **(metadata or {}),
+            "tenant_id": self.tenant_id  # always include tenant_id in metadata
+        }
+        self.collection.add(
+            ids=[memory_id],
+            documents=[content],
+            metadatas=[safe_metadata]
+        )
+
+    def retrieve_memories(self, query: str, n_results: int = 5) -> list[dict]:
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=n_results
+        )
+
+        memories = []
+        for doc, metadata, distance in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0]
+        ):
+            # Verify tenant_id on every retrieved memory
+            assert metadata["tenant_id"] == self.tenant_id, \
+                f"SECURITY: memory tenant mismatch for tenant {self.tenant_id}"
+
+            memories.append({
+                "content": doc,
+                "metadata": metadata,
+                "relevance": 1 - distance
+            })
+
+        return memories
+```
+
+### Qdrant: Namespace Isolation
+
+```python
+from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+qdrant = QdrantClient("localhost", port=6333)
+
+def store_tenant_memory(
+    tenant_id: str,
+    user_id: str,
+    memory_text: str,
+    embedding: list[float],
+    memory_id: str
+) -> None:
+    qdrant.upsert(
+        collection_name="agent_memories",
+        points=[{
+            "id": memory_id,
+            "vector": embedding,
+            "payload": {
+                "tenant_id": tenant_id,   # mandatory field
+                "user_id": user_id,
+                "content": memory_text,
+            }
+        }]
+    )
+
+def retrieve_tenant_memories(
+    tenant_id: str,
+    user_id: str,
+    query_embedding: list[float],
+    limit: int = 5
+) -> list[dict]:
+    # MANDATORY: filter by both tenant_id AND user_id
+    tenant_filter = Filter(
+        must=[
+            FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id)),
+            FieldCondition(key="user_id", match=MatchValue(value=user_id))
+        ]
+    )
+
+    results = qdrant.search(
+        collection_name="agent_memories",
+        query_vector=query_embedding,
+        query_filter=tenant_filter,
+        limit=limit
+    )
+
+    return [
+        {"content": r.payload["content"], "score": r.score}
+        for r in results
+    ]
+```
+
+## The Memory Injection Check
+
+Before injecting any retrieved memory into a prompt, verify ownership:
+
+```python
+def safe_inject_memories(
+    memories: list[dict],
+    tenant_id: str,
+    prompt: str
+) -> str:
+    """
+    Validate all memories belong to the current tenant before injection.
+    Raises IsolationError if any memory has wrong tenant_id.
+    """
+    for mem in memories:
+        if mem.get("tenant_id") != tenant_id:
+            raise IsolationError(
+                f"Attempted to inject memory with tenant_id={mem.get('tenant_id')} "
+                f"into context for tenant_id={tenant_id}"
+            )
+
+    memory_context = "\n".join(
+        f"[Memory]: {mem['content']}"
+        for mem in memories
+    )
+
+    return f"Relevant memories:\n{memory_context}\n\n{prompt}"
+```
+
+Never skip this check, even in internal code paths. A bug in session management could result in memories from the wrong tenant being retrieved — the injection check is the last line of defense.
+
+## Fine-Tuned Models: Per-Tenant Model Checkpoints
+
+When tenants require their own fine-tuned models (trained on tenant-specific data), isolation requires completely separate model weights:
+
+```python
+import os
+from pathlib import Path
+
+class TenantModelRegistry:
+    """
+    Manages separate fine-tuned model checkpoints per tenant.
+    """
+
+    def __init__(self, models_base_dir: str = "/models"):
+        self.base_dir = Path(models_base_dir)
+
+    def get_model_path(self, tenant_id: str) -> Optional[Path]:
+        """Returns path to tenant's fine-tuned model, or None if using base."""
+        model_path = self.base_dir / f"tenant_{tenant_id}" / "checkpoint-final"
+        return model_path if model_path.exists() else None
+
+    def load_tenant_model(self, tenant_id: str):
+        model_path = self.get_model_path(tenant_id)
+
+        if model_path:
+            # Load tenant-specific fine-tuned model
+            return load_model(str(model_path))
+        else:
+            # Fall back to shared base model (no tenant-specific fine-tuning)
+            return load_base_model()
+```
+
+Per-tenant fine-tuned models are expensive (separate GPU serving, storage per tenant) but necessary when:
+- Data privacy regulations require that model weights cannot be shared across tenants (HIPAA BAAs, GDPR data processing agreements).
+- Tenant data contains information that should not influence other tenants' model behavior.
+- Tenants have fundamentally different domains requiring different model specialization.

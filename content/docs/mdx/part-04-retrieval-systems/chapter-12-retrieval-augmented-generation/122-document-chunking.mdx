@@ -5,5 +5,121 @@ lastUpdatedDate: '2026-08-05'
 
 # 12.2 Document Chunking
 
-This section covers the details of 12.2 Document Chunking.
+You cannot put an entire book — or even a long document — into a context window. You must split it into chunks first. How you split determines how well retrieval works.
 
+Bad chunking is the most common cause of RAG failure. Good chunking preserves the meaning and context of each retrieved piece.
+
+## The Three Chunking Strategies
+
+### 1. Character Chunking
+
+Split every N characters, regardless of content structure.
+
+```python
+# Naïve character chunking
+def character_chunk(text: str, size: int = 500, overlap: int = 50) -> list[str]:
+    chunks = []
+    for i in range(0, len(text), size - overlap):
+        chunks.append(text[i:i + size])
+    return chunks
+```
+
+**Problem:** Splits mid-sentence, mid-paragraph, mid-concept. A section on "API Authentication" may be split into three chunks, each useless without the others.
+
+From `atlas-agents/ch11_memory/online/adaptive_chunker.py` — the adaptive chunker specifically addresses the problem of character chunking destroying section coherence.
+
+### 2. Semantic Chunking
+
+Split by natural boundaries — paragraphs, sections, headings.
+
+```python
+import re
+
+def semantic_chunk(text: str, max_chunk_size: int = 1500) -> list[str]:
+    # Split on double newlines (paragraph boundaries)
+    paragraphs = re.split(r'\n\n+', text)
+
+    chunks = []
+    current_chunk = ""
+    for para in paragraphs:
+        if len(current_chunk) + len(para) > max_chunk_size and current_chunk:
+            chunks.append(current_chunk.strip())
+            current_chunk = para
+        else:
+            current_chunk += "\n\n" + para if current_chunk else para
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    return chunks
+```
+
+**Advantage:** Each chunk is a complete thought. Retrieved chunks make sense in isolation.
+
+### 3. Hierarchical Chunking
+
+Two levels: **parent chunks** (large, for context) and **child chunks** (small, for search). Index the children for retrieval, but return the parent when a child matches.
+
+```
+Document
+  └── Parent chunk (2,000 chars) — "API Authentication"
+        ├── Child chunk (400 chars) — "OAuth 2.0 setup"
+        ├── Child chunk (400 chars) — "Token refresh"
+        └── Child chunk (400 chars) — "Scopes and permissions"
+
+Search matches child → return parent (with full context)
+```
+
+This gives you the precision of small chunks and the context of large ones.
+
+## The Header-Aware Approach
+
+From `atlas-agents/ch11_memory/online/adaptive_chunker.py:108`:
+
+```python
+# atlas-agents/ch11_memory/online/adaptive_chunker.py:108
+from langchain.text_splitter import MarkdownHeaderTextSplitter
+
+headers_to_split_on = [
+    ("#", "h1"),
+    ("##", "h2"),
+    ("###", "h3"),
+]
+
+splitter = MarkdownHeaderTextSplitter(
+    headers_to_split_on=headers_to_split_on,
+    strip_headers=False,    # Keep the heading in the chunk
+)
+
+chunks = splitter.split_text(markdown_document)
+# Each chunk includes its section heading as metadata
+# chunk.metadata = {"h1": "API Reference", "h2": "Authentication", "h3": "OAuth 2.0"}
+```
+
+Keeping headers with their content means retrieved chunks always know **what section they're from**. This is critical for generating accurate citations and for the LLM to understand context.
+
+## Chunk Size Trade-offs
+
+| Chunk size | Retrieval precision | Context richness | Token cost |
+|---|---|---|---|
+| Small (200–400 chars) | High — focused matches | Low — missing surrounding context | Low |
+| Medium (800–1,200 chars) | Medium | Medium | Medium |
+| Large (2,000–3,000 chars) | Low — too much noise | High | High |
+
+**Recommended default:** 800–1,200 characters with 10–15% overlap between adjacent chunks.
+
+## Overlap
+
+Adjacent chunks should share a small overlap to prevent answers from falling in the gap between two chunks:
+
+```python
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=150,      # 15% overlap
+    separators=["\n\n", "\n", ". ", " ", ""],
+)
+chunks = splitter.split_documents(documents)
+```
+
+The overlap ensures that a sentence split between chunk N and chunk N+1 appears fully in at least one of them.

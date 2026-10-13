@@ -5,5 +5,217 @@ lastUpdatedDate: '2026-08-05'
 
 # 9.8 Tool Timeouts
 
-This section covers the details of 9.8 Tool Timeouts.
+Every external call must have a timeout. This is not optional. Without a timeout, one slow API call will hang your entire agent indefinitely — no response, no error, just silence.
 
+## The Three Timeout Layers
+
+| Layer | Default budget | What it protects |
+|---|---|---|
+| HTTP request timeout | 5–10 seconds | Individual API calls |
+| Subprocess timeout | 30 seconds | Code execution, shell commands |
+| Total agent turn budget | 60–120 seconds | The entire tool-calling loop |
+
+Set all three. They protect against different failure modes.
+
+## HTTP Request Timeout
+
+Reference: `atlas-agents/ch03_tools_and_skills/online/api_skill.py:22`
+
+```python
+import requests
+
+class RestAPISkill:
+    """HTTP skill with enforced timeout and response size limits."""
+
+    REQUEST_TIMEOUT = 5  # seconds — hard limit per HTTP call
+
+    def call(self, endpoint: str, method: str = "GET", payload: dict = None) -> str:
+        try:
+            response = requests.request(
+                method,
+                endpoint,
+                json=payload,
+                timeout=self.REQUEST_TIMEOUT,  # (connect_timeout, read_timeout)
+            )
+            response.raise_for_status()
+
+            # Truncate large responses — don't flood the context window
+            text = response.text
+            if len(text) > 2000:
+                return text[:2000] + "...[truncated — response too large]"
+
+            return text
+
+        except requests.Timeout:
+            return f"Error: Request to {endpoint} timed out after {self.REQUEST_TIMEOUT}s"
+        except requests.ConnectionError:
+            return f"Error: Could not connect to {endpoint}"
+        except requests.HTTPError as e:
+            return f"Error: HTTP {e.response.status_code} from {endpoint}"
+        except Exception as e:
+            return f"Error: Unexpected error calling {endpoint}: {e}"
+```
+
+The `timeout=5` in `requests.request()` applies to both the connection attempt and the read. To set them separately: `timeout=(3, 5)` means 3 seconds to connect, 5 seconds to read.
+
+## Subprocess Timeout
+
+For tools that run code, shell commands, or subprocesses:
+
+```python
+import subprocess
+
+class CodeExecutionSkill:
+    """Executes code in a subprocess with a hard timeout."""
+
+    EXECUTION_TIMEOUT = 30  # seconds
+
+    def execute_python(self, code: str) -> str:
+        import tempfile
+        import os
+
+        # Write code to a temp file
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".py",
+            delete=False,
+            encoding="utf-8",
+        ) as f:
+            f.write(code)
+            temp_path = f.name
+
+        try:
+            result = subprocess.run(
+                ["python", temp_path],
+                capture_output=True,
+                text=True,
+                timeout=self.EXECUTION_TIMEOUT,  # Hard kill after 30s
+            )
+            output = result.stdout
+            if result.returncode != 0:
+                output += f"\nError: {result.stderr}"
+            return output[:2000]  # Truncate output
+
+        except subprocess.TimeoutExpired:
+            return f"Error: Code execution timed out after {self.EXECUTION_TIMEOUT}s"
+        except Exception as e:
+            return f"Error: Execution failed: {e}"
+        finally:
+            os.unlink(temp_path)
+```
+
+30 seconds is generous for most code snippets. For data processing tasks, you may need more. For interactive tools (user-facing), 10 seconds is a better ceiling.
+
+## Total Agent Turn Budget
+
+Wrap the entire agent loop in a wall-clock budget:
+
+```python
+import signal
+import time
+from contextlib import contextmanager
+
+class TimeoutError(Exception):
+    pass
+
+@contextmanager
+def time_budget(seconds: float):
+    """Context manager that raises TimeoutError after `seconds`."""
+    def handler(signum, frame):
+        raise TimeoutError(f"Agent turn exceeded {seconds}s budget")
+
+    old_handler = signal.signal(signal.SIGALRM, handler)
+    signal.alarm(int(seconds))
+
+    try:
+        yield
+    finally:
+        signal.alarm(0)  # Cancel the alarm
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+def run_agent_with_budget(user_message: str, budget_seconds: float = 60.0) -> str:
+    try:
+        with time_budget(budget_seconds):
+            return run_agent(user_message)
+    except TimeoutError:
+        return "I was unable to complete this request within the time limit. Please try a simpler query."
+```
+
+> **Note:** `signal.SIGALRM` is Unix-only. On Windows, use `concurrent.futures.ThreadPoolExecutor` with a `future.result(timeout=budget_seconds)` call instead.
+
+## Windows-Compatible Timeout
+
+```python
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+def run_with_timeout(fn, args=(), kwargs={}, timeout_seconds=60):
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(fn, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except FuturesTimeout:
+            return "Error: Operation timed out"
+```
+
+## Timeout Configuration by Tool Type
+
+```python
+TOOL_TIMEOUTS = {
+    # Fast, in-memory operations
+    "read_file":          5,
+    "list_directory":     5,
+
+    # External HTTP APIs
+    "search_web":        10,
+    "call_api":           5,
+    "fetch_url":         10,
+
+    # Slow external services
+    "run_query":         30,
+    "execute_code":      30,
+    "analyze_document":  45,
+
+    # Default for anything not listed
+    "default":           15,
+}
+
+
+class TimeoutAwareRegistry:
+    def execute(self, tool_name: str, args: dict) -> str:
+        timeout = TOOL_TIMEOUTS.get(tool_name, TOOL_TIMEOUTS["default"])
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._execute, tool_name, args)
+            try:
+                return future.result(timeout=timeout)
+            except TimeoutError:
+                return f"Error: {tool_name} timed out after {timeout}s"
+```
+
+## Logging Slow Tools
+
+Even when tools complete within their timeout, log slow executions so you can tune timeouts:
+
+```python
+import time
+import logging
+
+logger = logging.getLogger(__name__)
+SLOW_THRESHOLD_MS = 2000  # Log warning for tools taking > 2s
+
+def timed_execute(tool_name: str, args: dict) -> str:
+    start = time.time()
+    result = registry.execute(tool_name, args)
+    elapsed_ms = (time.time() - start) * 1000
+
+    if elapsed_ms > SLOW_THRESHOLD_MS:
+        logger.warning(
+            f"Slow tool execution: {tool_name} took {elapsed_ms:.0f}ms",
+            extra={"tool": tool_name, "elapsed_ms": elapsed_ms}
+        )
+
+    return result
+```
+
+This data tells you where to invest optimization effort and where to tighten timeouts.

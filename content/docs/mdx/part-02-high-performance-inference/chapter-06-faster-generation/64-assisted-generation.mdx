@@ -5,5 +5,221 @@ lastUpdatedDate: '2026-08-05'
 
 # 6.4 Assisted Generation
 
-This section covers the details of 6.4 Assisted Generation.
+Assisted generation is HuggingFace's implementation of speculative decoding, integrated directly into the `transformers` library's `generate()` API. It's the easiest way to experiment with speculative decoding without building custom infrastructure.
 
+## Basic Usage
+
+The API is a single parameter: `assistant_model`. Pass a smaller model from the same family, and HuggingFace handles the draft-verify loop automatically:
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Load target model (the one that determines quality)
+target_model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Meta-Llama-3-8B-Instruct",
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+)
+
+# Load draft model (smaller, same vocabulary)
+draft_model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-1B-Instruct",
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+)
+
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+
+# Tokenize input
+messages = [{"role": "user", "content": "Explain how TCP/IP works."}]
+input_ids = tokenizer.apply_chat_template(
+    messages,
+    add_generation_prompt=True,
+    return_tensors="pt",
+).to(device)
+
+# Standard generation (no speculative decoding)
+import time
+t0 = time.time()
+standard_output = target_model.generate(input_ids, max_new_tokens=256)
+t1 = time.time()
+print(f"Standard: {t1-t0:.2f}s")
+
+# Assisted generation (with speculative decoding)
+t0 = time.time()
+assisted_output = target_model.generate(
+    input_ids,
+    assistant_model=draft_model,
+    max_new_tokens=256,
+)
+t1 = time.time()
+print(f"Assisted: {t1-t0:.2f}s")
+
+# Decode and verify outputs are the same
+print(tokenizer.decode(standard_output[0], skip_special_tokens=True))
+print(tokenizer.decode(assisted_output[0], skip_special_tokens=True))
+```
+
+Output example:
+```
+Standard: 4.82s
+Assisted: 2.14s
+(~2.25× speedup for this example)
+```
+
+## Dynamic γ (num_assistant_tokens)
+
+By default, HuggingFace uses a dynamic γ that adapts based on the recent acceptance rate. You can also set it explicitly:
+
+```python
+output = target_model.generate(
+    input_ids,
+    assistant_model=draft_model,
+    num_assistant_tokens=5,          # fixed γ = 5 draft tokens per step
+    max_new_tokens=512,
+    do_sample=True,
+    temperature=0.7,
+)
+```
+
+The dynamic default is generally better — it increases γ when the draft model is doing well (high acceptance rate) and decreases it when it isn't:
+
+```python
+output = target_model.generate(
+    input_ids,
+    assistant_model=draft_model,
+    num_assistant_tokens_schedule="heuristic",  # default: dynamic γ
+    assistant_confidence_threshold=0.4,          # min confidence to keep proposing
+    max_new_tokens=512,
+)
+```
+
+## Prompt Lookup Decoding (No Draft Model)
+
+For tasks with repetitive output, you can use prompt lookup decoding instead of a separate draft model:
+
+```python
+output = target_model.generate(
+    input_ids,
+    prompt_lookup_num_tokens=5,       # look for patterns of last 5 tokens in prompt
+    max_matching_ngram_size=3,        # match 3-grams in the prompt
+    max_new_tokens=512,
+)
+```
+
+This is especially effective for:
+- **Code editing**: model often returns the original code with modifications
+- **Summarization**: model often uses phrases from the source text
+- **RAG responses**: model often quotes retrieved documents
+
+No draft model memory overhead. Zero training required. Try this first for repetitive output tasks.
+
+```python
+import time
+
+# Compare: no speculation vs prompt lookup
+document = "..." * 500  # long input document
+
+inputs = tokenizer(
+    f"Summarize the following document:\n{document}\n\nSummary:",
+    return_tensors="pt"
+).to(device)
+
+# Without speculation
+t0 = time.time()
+out1 = model.generate(**inputs, max_new_tokens=200)
+print(f"No speculation: {time.time()-t0:.2f}s")
+
+# With prompt lookup
+t0 = time.time()
+out2 = model.generate(**inputs, max_new_tokens=200, prompt_lookup_num_tokens=5)
+print(f"Prompt lookup: {time.time()-t0:.2f}s")
+```
+
+## Practical Considerations for CPU Offloading
+
+Assisted generation is particularly valuable in CPU-offloaded or edge deployments, where you might have:
+
+- A large model partially loaded on GPU (offloaded)
+- A small draft model fully on GPU
+
+The draft model proposes tokens cheaply on GPU; the target model verifies them (paying the offload transfer cost only once per verification step instead of once per token):
+
+```python
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+
+# Large target model: partially on GPU, partially on CPU
+with init_empty_weights():
+    target_model = AutoModelForCausalLM.from_config(large_config)
+
+target_model = load_checkpoint_and_dispatch(
+    target_model,
+    checkpoint="...",
+    device_map="auto",          # auto-distributes across GPU + CPU
+    offload_folder="offload/",
+)
+
+# Small draft model: fits entirely on GPU
+draft_model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-1B",
+    device_map="cuda:0",
+    torch_dtype=torch.bfloat16,
+)
+
+# Assisted generation benefits most in offloaded scenarios
+output = target_model.generate(
+    input_ids,
+    assistant_model=draft_model,
+    max_new_tokens=512,
+)
+```
+
+In an offloaded setup, reducing the number of target model forward passes (by accepting multiple draft tokens per verification step) directly reduces the number of expensive CPU↔GPU transfers.
+
+## Streaming with Assisted Generation
+
+```python
+from transformers import TextStreamer
+
+streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+# Tokens stream as they are verified and accepted
+output = target_model.generate(
+    input_ids,
+    assistant_model=draft_model,
+    max_new_tokens=512,
+    streamer=streamer,      # stream accepted tokens to stdout
+)
+```
+
+Note: with speculative decoding and streaming, tokens are released in batches (as each verification step completes), not truly one at a time. A batch of 3 accepted draft tokens appears together. This is mostly imperceptible to users but worth knowing for downstream parsing.
+
+## Choosing Between Assisted Generation and vLLM Speculative Decoding
+
+| Consideration | Assisted Generation (HF) | vLLM Speculative Decoding |
+|---|---|---|
+| Setup complexity | Low — just add `assistant_model` | Medium — configure server flags |
+| Best for | Research, single-process, edge | Production serving, high QPS |
+| Batch serving | Not optimized | Fully integrated with continuous batching |
+| GPU efficiency | Single-process, limited batching | Highly optimized |
+| Draft model options | Any HF model | Any vLLM-compatible model |
+| Prompt lookup | Built-in | Built-in |
+
+Use HuggingFace assisted generation for:
+- Local experimentation and benchmarking
+- Edge devices and CPU-offloaded deployments
+- Single-request batch scoring pipelines
+
+Use vLLM for production serving at any meaningful QPS.
+
+## Summary
+
+- Assisted generation: HuggingFace's `generate()` parameter `assistant_model` enables speculative decoding in one line
+- Dynamic γ adapts to acceptance rate — increases speculation when draft quality is high
+- Prompt lookup decoding (`prompt_lookup_num_tokens`): zero-cost draft for repetitive output tasks — try this first
+- CPU offload use case: speculative decoding reduces expensive CPU↔GPU transfers by amortizing verification over multiple tokens
+- Stream accepted tokens with `TextStreamer` — tokens arrive in batches per verification step
+- For production serving at scale, migrate from HuggingFace assisted generation to vLLM

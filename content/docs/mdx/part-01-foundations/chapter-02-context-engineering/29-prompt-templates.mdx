@@ -5,5 +5,152 @@ lastUpdatedDate: '2026-08-05'
 
 # 2.9 Prompt Templates
 
-This section covers the details of 2.9 Prompt Templates.
+A prompt template is a prompt treated like code: versioned, parameterized, tested, and reviewed. Not a string you paste into ChatGPT. A module in your codebase, with inputs and outputs, that gets deployed like any other software artifact.
 
+This might sound like overkill for a few lines of text. But consider: a single unreviewed prompt change can silently break every response your system generates. Templates are how you prevent that.
+
+---
+
+## The Basic Template Pattern
+
+Instead of this:
+
+```python
+# ❌ Hardcoded, untestable, unversionable
+response = client.chat(
+    system="You are a helpful assistant. Answer the user's question.",
+    user=user_message
+)
+```
+
+Do this:
+
+```python
+# ✅ Parameterized, testable, versionable
+from templates import load_template
+
+template = load_template("coding_assistant_v3")
+system_prompt = template.render(
+    user_role=user.role,
+    project=session.project_name,
+    loaded_files=session.loaded_files,
+)
+response = client.chat(system=system_prompt, user=user_message)
+```
+
+The template lives in a file (`templates/coding_assistant_v3.jinja2`), tracked in version control, reviewed like any other code change.
+
+---
+
+## Multi-Persona Routing
+
+One of the most powerful uses of prompt templates is persona routing: classify the incoming request, then respond with the template designed for that request type.
+
+From `atlas-agents/ch02_prompt_architecture/online/multi_persona_router.py:88`:
+
+```python
+PERSONAS = {
+    "concise_analyst": load_template("personas/concise_analyst"),
+    "thorough_researcher": load_template("personas/thorough_researcher"),
+    "structured_reporter": load_template("personas/structured_reporter"),
+}
+
+def route_request(user_message: str, context: dict) -> str:
+    # Step 1: Classify the intent
+    intent = classify_intent(user_message)
+    # e.g., "quick_lookup" | "deep_research" | "formatted_output"
+    
+    # Step 2: Map intent to persona
+    persona_map = {
+        "quick_lookup": "concise_analyst",
+        "deep_research": "thorough_researcher",
+        "formatted_output": "structured_reporter",
+    }
+    persona_name = persona_map.get(intent, "concise_analyst")
+    
+    # Step 3: Render the appropriate template
+    template = PERSONAS[persona_name]
+    return template.render(**context)
+```
+
+The three personas for the same underlying agent produce measurably different behavior:
+
+| Persona | Typical response | Best for |
+|---------|-----------------|----------|
+| Concise Analyst | 2-3 sentences, direct answer | Quick factual lookups |
+| Thorough Researcher | Full analysis with caveats | Complex investigative tasks |
+| Structured Reporter | Headers, bullets, tables | Documents, reports, summaries |
+
+The key word is "measurably." Intuition about which persona works best for which request type is wrong surprisingly often. You need A/B tests to know.
+
+---
+
+## Persona Templates in Practice
+
+Here's what the `concise_analyst` template might look like:
+
+```jinja2
+{# templates/personas/concise_analyst.jinja2 #}
+You are a technical analyst who values precision and brevity.
+
+Rules:
+- Answer in 1-3 sentences unless the question genuinely requires more
+- State your confidence level if uncertain
+- No filler phrases ("Great question!", "Certainly!", "Of course!")
+- If you don't know, say so in one sentence
+
+Current context:
+User role: {{ user_role }}
+Project: {{ project }}
+```
+
+And the `thorough_researcher`:
+
+```jinja2
+{# templates/personas/thorough_researcher.jinja2 #}
+You are a senior technical researcher. Your job is to give complete,
+accurate answers that anticipate follow-up questions.
+
+Approach:
+1. Answer the direct question first
+2. Provide relevant background
+3. Note important caveats or edge cases
+4. Suggest next steps or related considerations
+
+Do not truncate analysis for brevity. Depth is valued here.
+
+Current context:
+User role: {{ user_role }}
+Project: {{ project }}
+Loaded reference: {{ loaded_files | join(', ') }}
+```
+
+Same agent. Different templates. Measurably different behavior.
+
+---
+
+## Why A/B Test Personas?
+
+Developer intuition about prompts is notoriously unreliable. You'll spend an afternoon crafting what seems like a perfect persona, deploy it, and discover it actually performs *worse* on your eval set than the version you wrote in five minutes six months ago.
+
+The A/B test harness in `atlas-agents/ch02_prompt_architecture/prompt_ab_test.py` measures:
+- **Keyword correctness**: does the response contain the expected terms?
+- **Refusal behavior**: does the agent refuse tasks it should accept, or accept tasks it should refuse?
+- **Tool call count**: is the agent using tools efficiently or calling them redundantly?
+- **Latency**: does the new template produce longer/shorter responses?
+
+Run the A/B test before merging any persona change. Not because you're paranoid, but because the model's behavior is genuinely hard to predict from reading the prompt alone.
+
+---
+
+## Template as Contract
+
+Think of a prompt template as a contract between the context builder and the model:
+
+- **Input**: the parameters the template expects (`user_role`, `project`, `loaded_files`)
+- **Output**: the behavior the model should exhibit given that template
+- **Test suite**: the eval cases that verify the contract holds
+
+When you change the template, you're changing the contract. Run the tests, check the diffs, review the eval results. Merge if it's better. Revert if it's not.
+
+This discipline is what makes a prompt-heavy system maintainable at scale.

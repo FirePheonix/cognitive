@@ -5,5 +5,226 @@ lastUpdatedDate: '2026-08-05'
 
 # 22.1 Tenant Isolation
 
-This section covers the details of 22.1 Tenant Isolation.
+In a multi-tenant AI system, multiple customers share the same infrastructure. The cardinal rule: **one tenant's data must never appear in another tenant's context, responses, or logs.** A single isolation failure can be a data breach.
 
+## The Four Isolation Layers
+
+Robust tenant isolation is not a single mechanism — it is a defense-in-depth stack:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Layer 1: Data Isolation                                │
+│  Separate vector store namespaces / collections         │
+├─────────────────────────────────────────────────────────┤
+│  Layer 2: Context Isolation                             │
+│  Never mix tenants in the same context window           │
+├─────────────────────────────────────────────────────────┤
+│  Layer 3: Cache Isolation                               │
+│  Tenant-scoped cache keys; no cross-tenant cache hits   │
+├─────────────────────────────────────────────────────────┤
+│  Layer 4: Compute Isolation                             │
+│  Separate infrastructure per tenant (regulated sectors) │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Layer 1: Data Isolation in the Vector Store
+
+### Namespace Pattern (Qdrant)
+
+```python
+from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+client = QdrantClient("localhost", port=6333)
+
+def tenant_retrieval(
+    tenant_id: str,
+    query_embedding: list[float],
+    top_k: int = 5
+) -> list[dict]:
+    """
+    MANDATORY: tenant_id filter is always applied.
+    It is not optional and cannot be overridden by user input.
+    """
+    tenant_filter = Filter(
+        must=[
+            FieldCondition(
+                key="tenant_id",
+                match=MatchValue(value=tenant_id)
+            )
+        ]
+    )
+
+    results = client.search(
+        collection_name="documents",
+        query_vector=query_embedding,
+        query_filter=tenant_filter,  # non-negotiable
+        limit=top_k
+    )
+
+    return [
+        {"id": r.id, "content": r.payload["content"], "score": r.score}
+        for r in results
+    ]
+```
+
+The `tenant_id` filter is applied at the query level — not derived from user input, but from the authenticated session context. Users cannot override it.
+
+### Separate Collections (ChromaDB)
+
+An alternative isolation strategy: one collection per tenant. Higher overhead but stronger isolation:
+
+```python
+import chromadb
+
+client = chromadb.HttpClient(host="localhost", port=8000)
+
+def get_tenant_collection(tenant_id: str):
+    """Get or create a collection dedicated to this tenant."""
+    # Sanitize tenant_id to be a valid collection name
+    safe_tenant_id = tenant_id.replace("-", "_").lower()
+    collection_name = f"tenant_{safe_tenant_id}"
+
+    return client.get_or_create_collection(
+        name=collection_name,
+        metadata={"tenant_id": tenant_id}
+    )
+
+def tenant_add_documents(tenant_id: str, documents: list[dict]):
+    collection = get_tenant_collection(tenant_id)
+    collection.add(
+        documents=[d["content"] for d in documents],
+        ids=[d["id"] for d in documents],
+        metadatas=[{"tenant_id": tenant_id} for _ in documents]
+    )
+
+def tenant_query(tenant_id: str, query: str, n_results: int = 5) -> list[str]:
+    collection = get_tenant_collection(tenant_id)
+    results = collection.query(query_texts=[query], n_results=n_results)
+    return results["documents"][0]
+```
+
+## Layer 2: Context Isolation
+
+Never merge tenant contexts in a single LLM call:
+
+```python
+async def handle_request(request: AgentRequest) -> str:
+    tenant_id = request.authenticated_tenant_id  # from JWT / session
+
+    # Retrieve ONLY this tenant's documents
+    docs = tenant_retrieval(tenant_id, embed(request.query))
+
+    # Build context containing ONLY this tenant's data
+    context = build_context(docs)
+
+    # Assert before injection
+    assert all(doc["tenant_id"] == tenant_id for doc in docs), \
+        f"CRITICAL: cross-tenant data in context for tenant {tenant_id}"
+
+    # LLM call with isolated context
+    return await llm.ainvoke(
+        system=f"You are an assistant for tenant {tenant_id}.",
+        context=context,
+        query=request.query
+    )
+```
+
+The `assert` is not optional for development — it is a mandatory runtime check that should log a security alert and fail the request rather than serve potentially contaminated data.
+
+## Layer 3: Cache Isolation
+
+See section 22.2 for detailed cache isolation. The key rule: `tenant_id` must always be part of the cache key.
+
+```python
+def get_cache_key(tenant_id: str, query: str) -> str:
+    """Cache key is always scoped to tenant. Cross-tenant hits are impossible."""
+    return f"cache:tenant:{tenant_id}:query:{hashlib.sha256(query.encode()).hexdigest()}"
+```
+
+## Layer 4: Compute Isolation
+
+For regulated industries (healthcare HIPAA, finance PCI-DSS, government FedRAMP), shared compute is not acceptable. Options:
+
+| Isolation level | Approach | Cost multiplier |
+|---|---|---|
+| Namespace isolation | Shared infra, tenant filter | 1× |
+| Collection isolation | Shared DB, separate collections | 1.2× |
+| Database isolation | Separate DB instance per tenant | 3–5× |
+| Infrastructure isolation | Dedicated VMs/containers | 10–20× |
+| Air-gapped | Separate cloud account + VPC | 50×+ |
+
+Most SaaS applications use namespace isolation. Healthcare and financial services typically require at minimum database isolation.
+
+## Enforcing Isolation at the Service Layer
+
+Build isolation enforcement into the service layer rather than relying on developers to remember:
+
+```python
+from functools import wraps
+
+def require_tenant_isolation(func):
+    """Decorator that injects tenant context and validates isolation."""
+    @wraps(func)
+    async def wrapper(request: AgentRequest, *args, **kwargs):
+        # Extract tenant from authenticated session — never from request body
+        tenant_id = get_authenticated_tenant(request.auth_token)
+
+        if not tenant_id:
+            raise AuthorizationError("Missing tenant context")
+
+        # Inject into request — downstream code uses this, not user-provided value
+        request.tenant_id = tenant_id
+
+        result = await func(request, *args, **kwargs)
+
+        # Post-call: validate no cross-tenant data leaked into result
+        validate_result_isolation(result, tenant_id)
+
+        return result
+
+    return wrapper
+
+
+@require_tenant_isolation
+async def agent_query(request: AgentRequest) -> str:
+    # tenant_id is guaranteed to be set and validated here
+    docs = tenant_retrieval(request.tenant_id, embed(request.query))
+    return await generate_answer(request.query, docs)
+```
+
+The decorator pattern ensures isolation logic runs on every request, regardless of which developer wrote the handler. Isolation should be structural, not voluntary.
+
+## The Tenant Isolation Audit
+
+Run this check regularly:
+
+```python
+def isolation_audit(tenant_a: str, tenant_b: str, shared_retriever) -> dict:
+    """
+    Verify that tenant A's queries cannot surface tenant B's documents.
+    """
+    # Get a sample of tenant B's documents
+    tenant_b_docs = get_tenant_documents(tenant_b, sample_size=20)
+
+    # Try to retrieve tenant B's documents using tenant A's context
+    cross_tenant_leaks = []
+    for doc in tenant_b_docs:
+        query = doc["content"][:100]  # use doc content as query (worst case)
+        retrieved = shared_retriever.retrieve(query, tenant_id=tenant_a, k=10)
+
+        leaked = [r for r in retrieved if r.get("tenant_id") == tenant_b]
+        if leaked:
+            cross_tenant_leaks.append({
+                "query": query,
+                "leaked_doc_id": leaked[0]["id"]
+            })
+
+    return {
+        "isolation_pass": len(cross_tenant_leaks) == 0,
+        "leak_count": len(cross_tenant_leaks),
+        "leaks": cross_tenant_leaks
+    }
+```
+
+Zero tolerance for leaks. If `isolation_pass` is False, the system should be taken offline until the root cause is identified and resolved.

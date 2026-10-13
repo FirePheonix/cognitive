@@ -5,5 +5,117 @@ lastUpdatedDate: '2026-08-05'
 
 # 2.8 Long-Context Strategies
 
-This section covers the details of 2.8 Long-Context Strategies.
+Modern frontier models have enormous context windows. GPT-4o handles 128K tokens. Claude 3.5 Sonnet takes 200K. Gemini 1.5 Pro goes up to 1 million tokens. The temptation is to just dump everything in and let the model sort it out.
 
+This works, sometimes. But it's expensive, it's slow, and — counterintuitively — it can reduce quality when the model has to find the needle in a haystack of irrelevant content.
+
+The real question isn't "how large is the context window?" It's "what should actually go in it?"
+
+---
+
+## Long Context vs RAG: When to Use Which
+
+These are not competing approaches — they're tools suited to different situations.
+
+| Situation | Better Approach |
+|-----------|----------------|
+| You have 1-3 documents that are always fully relevant | Long context |
+| You have thousands of documents, most not relevant | RAG |
+| The document structure matters (cross-references, tables) | Long context |
+| You need real-time updates (new docs added daily) | RAG |
+| Latency is critical | RAG (retrieve only what's needed) |
+| Accuracy over a large corpus is critical | RAG + reranking |
+| Prototyping quickly | Long context |
+| Cost-sensitive production system | RAG |
+
+The decision framework from the book: **use long context when the full document is always needed; use RAG when you have thousands of documents and need selective retrieval.**
+
+---
+
+## The Long Context Case
+
+When does a large context window genuinely earn its cost?
+
+**Code review over an entire repository.** If the model needs to understand how different modules interact, partial context misses the dependencies. Loading the full codebase (within limits) gives the model the complete picture.
+
+**Contract analysis.** A 50-page contract might have clauses in section 2 that modify terms in section 18. RAG that retrieves only "relevant" chunks might miss this connection. The full document in context preserves the relationships.
+
+**Debugging across multiple interacting files.** The bug in `payment_service.py` is caused by an assumption in `config/defaults.py`. If you only retrieve `payment_service.py`, you won't find it.
+
+For these cases, the long context window is genuinely the right tool. Pay for it when it buys you something.
+
+---
+
+## The RAG Case
+
+For most production systems, RAG is the right default. It lets you:
+
+- Serve a knowledge base of 100,000 documents without paying for 100K tokens per request
+- Update knowledge without any model retraining or prompt changes
+- Retrieve only the 3-5 most relevant chunks, keeping context tight
+
+The classic RAG pipeline:
+
+```python
+def rag_retrieve(query: str, collection, n_results: int = 5) -> list[str]:
+    """Retrieve the most relevant document chunks for a query."""
+    results = collection.query(
+        query_texts=[query],
+        n_results=n_results,
+    )
+    return results["documents"][0]
+
+def rag_prompt(query: str, retrieved_docs: list[str]) -> str:
+    docs_block = "\n\n---\n\n".join(retrieved_docs)
+    return f"""Answer the following question using only the provided documents.
+If the answer isn't in the documents, say so.
+
+Documents:
+{docs_block}
+
+Question: {query}"""
+```
+
+The tradeoff: retrieval adds latency (a vector DB query takes 50-200ms) and introduces retrieval errors. If the retriever doesn't find the right chunks, the model can't answer correctly — and it won't always tell you the chunks it got were insufficient.
+
+---
+
+## The Hybrid Approach
+
+For complex tasks, combine both: retrieve the most relevant chunks via RAG, then pass them in context together with a structural summary of the full document.
+
+```python
+def hybrid_context(
+    query: str,
+    document: str,
+    collection,
+    chunk_budget: int = 3000,
+    summary_budget: int = 500,
+) -> str:
+    # 1. Get a dense summary of the full document (cheap, fits in budget)
+    summary = summarize(document, max_tokens=summary_budget)
+    
+    # 2. Retrieve the most relevant chunks
+    chunks = rag_retrieve(query, collection, n_results=4)
+    chunks_text = "\n\n".join(chunks)
+    
+    return f"""Document overview:
+{summary}
+
+Most relevant sections:
+{chunks_text}"""
+```
+
+The summary gives the model structural context ("this is a 50-page contract about software licensing"). The chunks give it the specific content needed to answer the query. Together, they're more useful than either alone — and cheaper than loading the full document.
+
+---
+
+## Practical Recommendations
+
+**Start with RAG.** For most applications, RAG is cheaper, faster, and more maintainable than large context. Build your retrieval pipeline first.
+
+**Add long context for specific failure modes.** If you notice the model missing cross-document dependencies or failing on questions that require holistic understanding, then invest in larger context.
+
+**Watch the lost-in-the-middle problem.** Research has shown that models perform worse on information buried in the middle of a very long context. Put the most important content at the beginning or end of the window, not the middle.
+
+**Budget aggressively.** Long context is expensive. A 100K-token prompt at GPT-4o pricing costs ~$0.25 in input tokens alone. At 10,000 requests per day, that's $2,500/day in input costs before you've generated a single token. Know what you're paying for.

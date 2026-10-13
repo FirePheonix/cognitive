@@ -5,5 +5,97 @@ lastUpdatedDate: '2026-08-05'
 
 # 8.1 Why JSON Fails
 
-This section covers the details of 8.1 Why JSON Fails.
+LLMs don't output JSON. They output text that *looks* like JSON. This is not a minor distinction — it's the source of an entire class of production bugs.
 
+A language model is completing a token sequence. It has no concept of "serializing a data structure." It learned what JSON looks like from training data, and it mimics that pattern. Most of the time, the mimicry is good enough. Sometimes it isn't, and "sometimes" in production means thousands of failures per day at scale.
+
+## The Three Failure Modes
+
+### 1. Syntactically Invalid JSON
+
+The model produces output that JSON parsers reject outright:
+
+```text
+{
+  "title": "Research Report",
+  "findings": ["finding one", "finding two",],   // trailing comma
+  "sources": ['https://example.com'],             // single quotes
+  "summary": "This is a summary with an unescaped "quote" in it."
+}
+```
+
+Common syntax failures:
+- Trailing commas in arrays and objects
+- Single-quoted strings instead of double-quoted
+- Unescaped special characters inside strings
+- Truncated output when the model hits its context limit mid-object
+- Extra text before or after the JSON block ("Here is the JSON: {...}")
+
+### 2. Semantically Wrong Structure
+
+The JSON parses, but it doesn't match your schema:
+
+```json
+{
+  "report_title": "...",    // you expected "title"
+  "summary": "...",
+  "confidence_level": "high" // you expected "confidence"
+}
+```
+
+The model invented field names that seemed reasonable to it. Your code crashes on `KeyError: 'title'`.
+
+### 3. Hallucinated Extra Fields
+
+The model adds fields you didn't ask for:
+
+```json
+{
+  "title": "...",
+  "summary": "...",
+  "findings": [...],
+  "sources": [...],
+  "confidence": "high",
+  "author": "AI Assistant",       // hallucinated
+  "date_generated": "2026-08-05", // hallucinated
+  "disclaimer": "This is AI-generated content..." // hallucinated
+}
+```
+
+Extra fields are less dangerous than missing fields, but they pollute your data model and can cause strict validators to reject the output.
+
+## Why This Happens
+
+The model is optimizing for *plausible token sequences*, not *correct data structures*. When it generates:
+
+```
+{"title": "
+```
+
+...the next token is chosen based on what typically follows that pattern in training data. It doesn't "know" it's inside a JSON string. It doesn't track bracket depth. It doesn't verify it closed all its objects before outputting a newline.
+
+Truncation is particularly nasty: if your output limit is 512 tokens and the JSON needs 600, you get a cleanly truncated object:
+
+```json
+{
+  "title": "Long Report",
+  "findings": [
+    "First finding here",
+    "Second finding here"
+```
+
+No closing bracket. Valid JSON? No. Detectable without trying to parse? Also no.
+
+## The Core Lesson
+
+> "If you depend on raw JSON parsing from an LLM, you will get surprised in production."
+
+The solution isn't to write better prompts (though that helps at the margins). The solution is a layered defense:
+
+1. Constrain what the model can generate ([Grammar-Constrained Generation](./83-grammar-constrained-generation))
+2. Validate what it produces ([Schema Validation](./84-schema-validation))
+3. Repair what fails validation ([Output Repair](./85-output-repair))
+4. Retry with error context ([Retry Loops](./86-retry-loops))
+5. Fall back gracefully if all else fails ([Fallback Chains](./87-fallback-chains))
+
+The rest of this chapter walks through each layer.

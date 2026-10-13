@@ -5,5 +5,175 @@ lastUpdatedDate: '2026-08-05'
 
 # 10.10 Multi-Agent Systems
 
-This section covers the details of 10.10 Multi-Agent Systems.
+## When to Add More Agents
 
+The temptation in AI engineering is to reach for more agents. Specialists! Pipelines! Crews! Before doing that, understand the coordination tax:
+
+**Every agent you add brings:**
+- Higher latency (more sequential LLM calls)
+- More API spend (more models running)
+- Compounded hallucination risk (errors can cascade between agents)
+- More debugging complexity (harder to trace where things went wrong)
+
+The question is not "can I model this as multiple agents?" The answer to that is almost always yes. The question is: **"are the roles genuinely distinct enough to justify the cost?"**
+
+A good signal: if you can describe each agent's responsibility in a single sentence without overlapping with another agent's sentence, the split probably makes sense.
+
+## The Four Coordination Patterns
+
+![The Crew pipeline](/part-03/chapter-10/crew-pipeline.png)
+*Fig: The Crew pipeline: Researcher → Writer → Critic → Publisher. Sequential agents where each receives the previous agent's output as context.*
+
+### 1. Sequential Pipeline
+
+Agent A's output becomes Agent B's input. Completely predictable. Easy to debug.
+
+```
+Researcher → Writer → Critic → Publisher
+```
+
+From `atlas-agents/ch06_multi_agent/newsletter_crew.py:182`, a 4-agent crew runs in this exact order:
+
+```python
+# From atlas-agents/ch06_multi_agent/newsletter_crew.py
+crew = Crew(
+    agents=[researcher, writer, critic, publisher],
+    tasks=[research_task, write_task, critique_task, publish_task],
+    process=Process.sequential
+)
+```
+
+Each agent sees the accumulated output of all previous agents. The Critic reads the Writer's draft. The Publisher sees the Critic's revisions.
+
+**Best for:** Known, ordered workflows where later steps depend on earlier steps.
+
+### 2. Hierarchical
+
+A manager agent delegates to specialists and evaluates their work.
+
+```
+        Manager
+       /   |   \
+  Expert Expert Expert
+```
+
+```python
+crew = Crew(
+    agents=[manager, researcher, analyst, writer],
+    tasks=[...],
+    process=Process.hierarchical,
+    manager_agent=manager
+)
+```
+
+The manager doesn't just route — it evaluates output and can reject work, ask for revisions, or reassign tasks. This is more expensive (the manager makes additional LLM calls to evaluate) but produces better quality control.
+
+**Best for:** When you need a quality gate between workers and the final output.
+
+### 3. Handoffs
+
+![The triage router architecture](/part-03/chapter-10/handoffs-triage.png)
+*Fig: The triage router architecture: user request flows through a router to specialized Billing, Technical, or General agents.*
+
+One agent passes control to another — the receiving agent continues from where the first left off. From `atlas-agents/ch04_handoffs/triage.py:157`:
+
+```python
+# From atlas-agents/ch04_handoffs/triage.py
+triage_agent = Agent(
+    name="Triage",
+    instructions="Route to the correct specialist based on the user's issue.",
+    handoffs=[billing_agent, technical_agent, general_agent]
+)
+
+# When the triage agent determines the issue is billing-related:
+# → transfers full conversation context to billing_agent
+# → billing_agent continues as if it handled the conversation from the start
+```
+
+Handoffs preserve conversation context. The billing agent knows everything the user said to the triage agent — it doesn't ask them to repeat themselves.
+
+**Best for:** Routing and triage. One entry point, multiple specialists.
+
+### 4. Debate
+
+Two agents argue, a third judges.
+
+```
+Advocate ←→ Critic
+              ↓
+            Jury
+```
+
+From `atlas-agents/ch06_multi_agent/online/debate_with_jury.py`:
+
+1. Advocate proposes a solution
+2. Critic attacks it
+3. Advocate rebuts
+4. Critic responds
+5. Jury synthesizes a verdict
+
+**Best for:** High-stakes decisions where correctness matters more than speed. Security architecture reviews, medical reasoning, legal analysis.
+
+## The Semantic Router
+
+For handoffs, you don't always need an LLM to route. The semantic router from `atlas-agents/ch04_handoffs/online/dynamic_routing.py:75` pre-embeds route descriptions and routes via cosine similarity:
+
+```python
+# From atlas-agents/ch04_handoffs/online/dynamic_routing.py
+class SemanticRouter:
+    def __init__(self, routes: dict[str, str]):
+        # Pre-embed all route descriptions once at startup
+        self.route_embeddings = {
+            name: embed(description)
+            for name, description in routes.items()
+        }
+
+    def route(self, query: str) -> str:
+        query_embedding = embed(query)
+        scores = {
+            name: cosine_similarity(query_embedding, emb)
+            for name, emb in self.route_embeddings.items()
+        }
+        return max(scores, key=scores.get)
+
+# Usage:
+router = SemanticRouter({
+    "billing": "payment issues, invoices, refunds, subscription charges",
+    "technical": "bugs, errors, installation problems, API issues",
+    "general": "account settings, feature questions, general help",
+})
+
+# Routes without an LLM call — just a vector similarity lookup
+destination = router.route("I was charged twice this month")
+# → "billing"
+```
+
+No LLM call at routing time. The embeddings are computed once, cached in memory, and routing is a fast cosine similarity lookup. At high request volumes, this saves significant cost and latency compared to using a model to classify each request.
+
+## Pattern Selection Guide
+
+```
+Do you need routing/triage?
+  └─ YES → Handoffs
+
+Is the order of steps fixed?
+  └─ YES → Sequential pipeline
+
+Do you need quality control between steps?
+  └─ YES → Hierarchical
+
+Is correctness-critical and controversial?
+  └─ YES → Debate
+
+Otherwise → Single agent (seriously, try this first)
+```
+
+## Common Mistakes
+
+**Adding agents for parallelism.** Parallel tool calls within a single agent (see [10.4 Tool Loops](/docs/part-03-building-ai-applications/chapter-10-agent-engineering/104-tool-loops)) are cheaper and simpler than spawning multiple agents.
+
+**Overly granular agents.** A "spelling checker agent" and a "grammar checker agent" should just be one `writing_quality_agent` with a well-written prompt.
+
+**Agents without defined interfaces.** Each agent's input and output format must be specified. An agent that "does writing stuff" is not a specification.
+
+**No observability.** In a multi-agent system, tracing which agent made which decision is critical for debugging. Log agent names and turn numbers alongside every LLM call.

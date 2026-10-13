@@ -272,3 +272,28 @@ That's what alignment training (Chapter 18) is for. But first — Chapter 17 cov
 - **Instruction tuning**: SFT on *diverse* instruction types teaches the model to generalize to new instructions.
 - **Chat templates** format multi-turn conversations into a flat token sequence the model can process. Different model families use different templates — use the wrong one and inference breaks.
 - SFT teaches imitation of good responses, not preference between responses. Alignment training (Chapter 18) teaches the latter.
+
+---
+
+## SFT: The Math Behind Instruction Following
+
+**What SFT is training:**
+Supervised Fine-Tuning gives the base model examples of (instruction, ideal response) pairs and trains it to generate those responses. The objective is just next-token prediction, restricted to the response tokens:
+
+$$(x, y) = (\text{instruction/context}, \text{ideal response})$$
+
+$$\mathcal{L}_{\text{SFT}} = -\sum_{t \in \text{response}} \log \pi_\theta(y_t \mid x, y_{<t})$$
+
+The model only gets gradient signal on the response — not the instruction. The instruction provides context; the response is what's being trained.
+
+**Why SFT doesn't solve everything:**
+SFT teaches the model to *imitate* the training data. If the training data contains a mediocre response, the model learns to produce mediocre responses for similar inputs. SFT optimizes "does the output look like the target?" — it can't distinguish between a response that's close-but-safe vs. one that's confidently wrong.
+
+This is why preference data and RLHF/DPO come next: they add the signal "this response is better than that response" — which SFT fundamentally cannot express.
+
+**Preference data — the building block of alignment:**
+The transition from SFT to alignment training requires a different kind of data:
+
+$$(x, y_w, y_l)$$
+
+Where $x$ is the prompt, $y_w$ is the "winner" (preferred response), and $y_l$ is the "loser" (rejected response). Relative preferences are more reliable than absolute quality ratings, because humans find it much easier to say "this one is better" than to rate quality on a 1-10 scale.

@@ -25,27 +25,7 @@ output = activation(w₁x₁ + w₂x₂ + w₃x₃ + ... + wₙxₙ + b)
 
 That's the whole neuron. `w₁, w₂, ... wₙ` are weights — numbers the network learns. `b` is a bias — also learned. `x₁ ... xₙ` are inputs. The activation function (ReLU, GELU, sigmoid...) introduces non-linearity so that stacking neurons actually accomplishes something more than a single linear operation would.
 
-```text
-Neuron: inputs × weights → sum → activation → output
-
-  x₁ ──w₁──┐
-  x₂ ──w₂──┼──→  z = w·x + b  ──→  a = activation(z)  ──→  output
-  x₃ ──w₃──┘
-  xₙ ──wₙ──┘         ↑ bias b also added here
-
-Activation functions — what they do to z:
-
-  ReLU               GELU (smooth)          Sigmoid
-  out |  /           out |  /               out |____----
-      | /                | /                    |   /
-  ────+/─────        ────+/─────          0.5 ──+--/
-      |                  |                    | /
-      0      z            0      z             0      z
-
-  max(0, z)          z·Φ(z)               1/(1+e^-z)
-  negatives → 0      smooth near 0        squashes to (0,1)
-  fast, sparse       used in GPT/BERT      used in older nets
-```
+![Neuron structure and activation functions — inputs × weights, sum with bias, activation, output; ReLU, GELU, and Sigmoid compared](/appendix-b/07-how-neural-networks-learn/neurons-and-functions.png)
 
 A network is just thousands or millions of these neurons arranged in layers, all connected, all learning their weights simultaneously.
 
@@ -75,120 +55,13 @@ A network is just thousands or millions of these neurons arranged in layers, all
 
 Before stacking neurons into layers, see the numbers move — not as abstract symbols but as actual grids.
 
-### One neuron: inputs × weights → one number
+![One neuron computes one number (top) and a layer is many neurons in parallel via matrix multiply (bottom)](/appendix-b/07-how-neural-networks-learn/neuron-and-layer-diagram.png)
 
-```text
-INPUTS  x   (3 values coming in)
-         x₁      x₂      x₃
-    ┌────────┬────────┬────────┐
-    │   0.50 │  -1.20 │   0.80 │
-    └────────┴────────┴────────┘
-
-WEIGHTS  w   (one learnable weight per input)
-         w₁      w₂      w₃
-    ┌────────┬────────┬────────┐
-    │   0.34 │   0.13 │   0.23 │
-    └────────┴────────┴────────┘
-
-STEP 1 — multiply element-wise   w ⊙ x
-       w₁x₁    w₂x₂    w₃x₃
-    ┌────────┬────────┬────────┐
-    │  +0.17 │  -0.15 │  +0.19 │
-    └────────┴────────┴────────┘
-
-STEP 2 — sum everything + bias   z = w·x + b
-    (0.34×0.50) + (0.13×-1.20) + (0.23×0.80) + 0.0
-  =   0.170    +   -0.154     +    0.186     + 0.0
-  =   0.202
-
-STEP 3 — activation   a = sigmoid(z)
-    sigmoid(0.202) = 1 / (1 + e^-0.202) = 0.550   ← neuron's output
-```
-
-One number out. That's the whole neuron.
-
-### One layer: many neurons at once = one matrix multiply
-
-A layer runs many neurons simultaneously. The weight matrix `W` packs all neurons' weights together — each **column** is one neuron.
-
-```text
-INPUT  X   (batch=2 tokens, each 3-dim)
-              dim₀    dim₁    dim₂
-tok1  ┌────────┬────────┬────────┐
-      │  +1.00 │  +0.50 │  -1.00 │
-      ├────────┼────────┼────────┤
-tok2  │  +0.20 │  +0.80 │  +0.30 │
-      └────────┴────────┴────────┘
-      shape: (2, 3)
-
-WEIGHT MATRIX  W   (in=3, out=4 neurons)
-         n₀      n₁      n₂      n₃
-d₀  ┌────────┬────────┬────────┬────────┐
-    │  +0.30 │  -0.20 │  +0.50 │  +0.10 │
-    ├────────┼────────┼────────┼────────┤
-d₁  │  +0.40 │  +0.60 │  -0.30 │  +0.20 │
-    ├────────┼────────┼────────┼────────┤
-d₂  │  -0.10 │  +0.30 │  +0.40 │  -0.40 │
-    └────────┴────────┴────────┴────────┘
-    shape: (3, 4)
-
-STEP 1 — Z = X @ W   (matrix multiply)
-  Every row of X · every column of W simultaneously
-
-             n₀      n₁      n₂      n₃
-tok1  ┌────────┬────────┬────────┬────────┐
-      │  +0.60 │  +0.10 │  +0.30 │  +0.70 │
-      ├────────┼────────┼────────┼────────┤
-tok2  │  +0.35 │  +0.49 │  -0.13 │  +0.10 │
-      └────────┴────────┴────────┴────────┘
-      shape: (2, 4)
-
-  Verify tok1→n₀ by hand:
-  X[tok1] · W[:,n₀] = (1.00×0.30) + (0.50×0.40) + (-1.00×-0.10) = 0.60  ✓
-
-STEP 2 — add bias b = [+0.10, -0.10, +0.20, 0.00]
-
-             n₀      n₁      n₂      n₃
-tok1  ┌────────┬────────┬────────┬────────┐
-      │  +0.70 │   0.00 │  +0.50 │  +0.70 │
-      ├────────┼────────┼────────┼────────┤
-tok2  │  +0.45 │  +0.39 │  +0.07 │  +0.10 │
-      └────────┴────────┴────────┴────────┘
-
-STEP 3 — ReLU activation   A = max(0, Z+b)   (negatives → 0)
-
-             n₀      n₁      n₂      n₃
-tok1  ┌────────┬────────┬────────┬────────┐
-      │  +0.70 │   0.00 │  +0.50 │  +0.70 │
-      ├────────┼────────┼────────┼────────┤
-tok2  │  +0.45 │  +0.39 │  +0.07 │  +0.10 │
-      └────────┴────────┴────────┴────────┘
-      shape: (2, 4)   ← both tokens processed simultaneously
-```
-
-The single line `Z = X @ W + b` computes 4 neurons × 2 tokens = 8 numbers in one GPU operation.
+The single line `Z = X @ W + b` computes all neurons × all tokens in one GPU operation. One neuron, one number out. A layer, many numbers out simultaneously.
 
 ### Shapes change as you stack layers
 
-```text
-                                      cols = features
-Input  X          ┌───┬───┬───┐       (2, 3)   ← 3-dim embeddings
-                  │   │   │   │
-      rows=tokens │   │   │   │
-                  └───┴───┴───┘
-
-After Layer 1     ┌───┬───┬───┬───┐   (2, 4)   ← X @ W₁  (3→4)
-  (3 → 4 dims)    │   │   │   │   │
-                  └───┴───┴───┴───┘
-
-After Layer 2     ┌───┬───┐           (2, 2)   ← A₁ @ W₂  (4→2)
-  (4 → 2 dims)    │   │   │
-                  └───┴───┘
-
-In a real LLM:    (batch, seq_len, 768) → through 12 blocks → (batch, seq_len, 50257)
-                                                                      ↑
-                                                        one score per vocabulary token
-```
+![Shapes change as you stack layers — input X(2,3) flows through linear layers changing feature dimensions, and in a real LLM (batch, seq_len, 768) flows through transformer blocks to final logits (batch, seq_len, 50257)](/appendix-b/07-how-neural-networks-learn/shapes-stacking-layers.png)
 
 The batch dimension (rows) never changes — all tokens are always processed in parallel. Only the feature dimension (cols) changes, controlled by each weight matrix's shape.
 
@@ -226,6 +99,8 @@ That's the key insight from Chapter 6. The "computation of a layer" and "a matri
 
 Stack several layers and you have a deep neural network. Each layer transforms the representation produced by the previous one. Early layers tend to detect simple patterns; later layers combine those into more complex abstractions. The "depth" is what gives deep learning its power.
 
+![Building a multi-layer network — three stacked linear layers with ReLU activations, shapes flowing (2,3)→(2,4)→(2,4)→(2,2), with intuition of what each layer learns and PyTorch implementation](/appendix-b/07-how-neural-networks-learn/multi-layer-network.png)
+
 In PyTorch, a network is a class that inherits from `nn.Module`. You define what layers exist in `__init__` and how data flows through them in `forward`.
 
 ```notebook
@@ -250,29 +125,15 @@ In PyTorch, a network is a class that inherits from `nn.Module`. You define what
 
 Those three numbers at the end are the network's raw output — called **logits**. They're scores, not probabilities. To get probabilities, you run them through softmax. To get a prediction, you pick the highest one.
 
+![Forward pass detail — logits table → softmax formula → probability table → argmax → predicted class 0](/appendix-b/07-how-neural-networks-learn/forward-pass-detail.png)
+
 ---
 
 ## The Forward Pass
 
 When data flows from the input through every layer to the output, that's called the **forward pass**. Data goes in, math happens, predictions come out.
 
-```text
-Forward pass — data flowing left to right through 3 layers:
-
-  Input        Layer 1          Layer 2         Output
-  (16 dims)    (16→64, ReLU)    (64→32, ReLU)   (32→3, raw scores)
-
-  [x₀ ]       [n₀ ]            [m₀ ]           [score₀]
-  [x₁ ]  W₁   [n₁ ]  W₂        [m₁ ]  W₃       [score₁]
-  [ · ] ────→ [ · ] ────────→  [ · ] ────────→  [score₂]
-  [ · ]       [ · ]            [ · ]
-  [x₁₅]       [n₆₃]            [m₃₁]
-
-  shape:       (16,)→(64,)      (64,)→(32,)     (32,)→(3,)
-                   ↑ expand         ↑ compress       ↑ classify
-
-  logits → softmax → probabilities → argmax → predicted class
-```
+![The forward pass — input (16 dims) flows through Layer 1 (16→64, ReLU), Layer 2 (64→32, ReLU), Layer 3 (32→3), producing logits that go through softmax→argmax to a predicted class](/appendix-b/07-how-neural-networks-learn/forward-pass-full-network.png)
 
 Every time you call `model(x)`, you're running a forward pass. At the start of training, the weights are random, so the predictions are also essentially random. The network has no idea what it's doing yet.
 
@@ -526,3 +387,43 @@ A random model starts at loss ≈ 10.82 (because it's picking randomly over 50,2
 - The **vanishing gradient problem** occurs when gradients shrink exponentially as they travel backward through deep networks. **Residual connections** (`x = x + layer(x)`) solve it.
 
 With this foundation in place, the next question is whether a network built from these principles can understand language. The answer is: not with a plain feed-forward architecture. The problem is deeper than it looks.
+
+---
+
+### The Math Behind the Learning: Backpropagation Unpacked
+
+A neural network learns by measuring how wrong it is (the loss), then working backwards through every operation to figure out how each weight contributed to that wrongness. This process is **backpropagation** — just the chain rule from calculus, applied systematically.
+
+**Forward pass — building the computation graph:**
+For a two-layer network:
+$$z_1 = W_1 x + b_1, \quad h = \phi(z_1), \quad z_2 = W_2 h + b_2$$
+$$\hat{y} = \text{softmax}(z_2), \quad \mathcal{L} = -\log \hat{y}_y$$
+
+Each arrow in this computation stores a local derivative. Backprop uses the chain rule to combine them:
+$$\frac{\partial z}{\partial x} = \frac{\partial z}{\partial y} \cdot \frac{\partial y}{\partial x}$$
+
+**Gradients through a linear layer:**
+For $z = Wx + b$, if you know the upstream gradient $\delta_z = \partial \mathcal{L} / \partial z$, then:
+$$\frac{\partial \mathcal{L}}{\partial W} = \delta_z x^\top \quad \text{(outer product)}$$
+$$\frac{\partial \mathcal{L}}{\partial b} = \delta_z$$
+$$\frac{\partial \mathcal{L}}{\partial x} = W^\top \delta_z \quad \text{(the gradient that flows to the previous layer)}$$
+Intuition: $\delta_z x^\top$ is "how much does each weight matter?" — it's the upstream error scaled by the input that produced it.
+
+**Activation function derivatives — why they matter:**
+$$\sigma'(x) = \sigma(x)(1 - \sigma(x)) \quad \text{(sigmoid — saturates near 0 and 1)}$$
+$$\tanh'(x) = 1 - \tanh^2(x) \quad \text{(tanh — also saturates)}$$
+$$\text{ReLU}'(x) = \mathbf{1}[x > 0] \quad \text{(binary, doesn't saturate)}$$
+Modern transformers use GELU — smooth, doesn't hard-zero negatives like ReLU.
+
+**The beautiful result: Softmax + Cross-Entropy gradient:**
+When you combine softmax with cross-entropy loss, the gradient simplifies to something elegant:
+$$\boxed{\frac{\partial \mathcal{L}}{\partial z} = p - y}$$
+"Predicted probabilities minus true labels." The gradient is largest where the model is most wrong, and zero where it's exactly right. This is why neural networks converge — the gradient naturally focuses effort on mistakes.
+
+**Debugging checklist — things to check before assuming the model is broken:**
+1. Can the model overfit a tiny dataset (10 examples)? If not, the architecture is broken.
+2. Is the initial loss at the right value? (For 10-class classification: $\log(10) \approx 2.3$)
+3. Do gradients flow? Check gradient norms — zero means vanishing gradients, infinity means exploding.
+4. Are parameters actually updating? Print weights before and after one step.
+5. Are your padding/mask operations correct?
+6. Is the model in `train` mode (not `eval`) during training?

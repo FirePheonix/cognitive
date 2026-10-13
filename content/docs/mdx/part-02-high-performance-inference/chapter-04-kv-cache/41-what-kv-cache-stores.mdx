@@ -1,9 +1,136 @@
 ---
-title: 4.1 What KV Cache Stores
+title: 4.1 What the KV Cache Stores
 lastUpdatedDate: '2026-08-05'
 ---
 
-# 4.1 What KV Cache Stores
+# 4.1 What the KV Cache Stores
 
-This section covers the details of 4.1 What KV Cache Stores.
+The KV cache is one of the most important optimizations in LLM inference. Without it, generating a 1000-token response would require 1000 full forward passes over the entire conversation. With it, each step only processes a single new token. Understanding what the cache actually stores — and why — makes the rest of Chapter 4 click into place.
 
+## The Attention Mechanism and Its Cost
+
+Every Transformer layer performs multi-head attention. For each token at position `i`, attention computes three projections:
+
+```
+Q_i = W_Q × h_i    (Query  — "what am I looking for?")
+K_i = W_K × h_i    (Key    — "what do I contain?")
+V_i = W_V × h_i    (Value  — "what do I output if attended?")
+```
+
+Where `h_i` is the token's hidden state. During attention, token `i` attends to all previous tokens:
+
+```
+Attention(Q_i, K_{1..i}, V_{1..i}) = softmax(Q_i · K_{1..i}ᵀ / √d_k) × V_{1..i}
+```
+
+This requires the K and V vectors for **every prior token**. The Q vector is only used in the current step and can be discarded immediately.
+
+## Without the Cache: O(n²) Recomputation
+
+Without a KV cache, generating token number 500 in a sequence would require:
+
+1. Recompute K and V for tokens 1–499 from scratch
+2. Compute Q for token 500
+3. Run attention: Q × K^T for all 500 pairs
+
+And for token 501: recompute tokens 1–500 again. This is O(n²) compute just for the attention mechanism, plus all the FFN layers. On a 1000-token generation with 32 layers, that's tens of millions of redundant matrix multiplications.
+
+## With the Cache: Store K and V, Never Recompute
+
+The insight: K_i and V_i for a given token depend only on that token's position and the model weights — they never change once computed. So compute them once and store them.
+
+The KV cache stores, for every token generated so far:
+
+```
+For each layer L in [0, num_layers):
+  For each attention head H in [0, num_heads):
+    K[L][H][token_pos] = key vector     (head_dim floats)
+    V[L][H][token_pos] = value vector   (head_dim floats)
+```
+
+At each decode step:
+- Only compute K and V for the **new token**
+- Append to the cache
+- Retrieve the full K and V history from cache for attention
+
+This reduces attention computation from O(n²) to O(n) total across all decode steps.
+
+## Cache Structure and Dimensions
+
+For a typical 7B model (Llama-3-8B):
+
+```
+num_layers  = 32
+num_heads   = 32 (or 8 with GQA)
+head_dim    = 128
+dtype       = fp16 (2 bytes)
+
+KV cache size per token = 2 × num_layers × num_heads × head_dim × bytes
+                        = 2 × 32 × 8 × 128 × 2    (with GQA, 8 KV heads)
+                        = 131,072 bytes
+                        ≈ 128 KB per token
+
+For 1,000 tokens: ~128 MB
+For 10,000 tokens: ~1.28 GB
+```
+
+For a 70B model:
+
+```
+num_layers  = 80
+num_heads   = 64 (or 8 with GQA)
+head_dim    = 128
+
+KV cache per token ≈ 1 MB
+For 10,000 tokens: ~10 GB
+```
+
+These numbers make it clear why context length is a GPU memory constraint, not just a compute one.
+
+## Memory Formula
+
+The precise formula:
+
+```
+KV cache bytes = 2          (K and V)
+               × num_layers
+               × num_kv_heads
+               × head_dim
+               × seq_len
+               × bytes_per_element
+```
+
+| Model | KV heads | head_dim | MB per 1K tokens |
+|---|---|---|---|
+| Llama-3-8B | 8 | 128 | ~0.5 MB |
+| Llama-3-70B | 8 | 128 | ~2.5 MB |
+| GPT-3.5 (est.) | 16 | 128 | ~2 MB |
+| Mistral-7B | 8 | 128 | ~0.5 MB |
+
+> Note: Models with GQA (Grouped-Query Attention) have fewer KV heads than query heads — this is why Llama-3-70B has only 8 KV heads despite 64 query heads. See Chapter 4.2 for details.
+
+## What Lives in the Cache Across a Conversation
+
+As a conversation progresses, the cache grows:
+
+```
+Turn 1: System prompt + user message = 200 tokens
+  → KV cache: 200 × ~128 KB = 25.6 MB
+
+Turn 2: + assistant response + user follow-up = +150 tokens  
+  → KV cache: 350 × ~128 KB = 44.8 MB
+
+Turn 10: accumulated 2,000 tokens
+  → KV cache: 2,000 × ~128 KB = 256 MB
+```
+
+At some point, the cache hits GPU memory limits or the model's context window limit — whichever comes first. This is why context window management (truncation, summarization, compression) matters in long-running agents.
+
+## Summary
+
+- The KV cache stores Key and Value vectors for every processed token, at every layer, for every attention head
+- Without the cache, autoregressive generation is O(n²) — computationally intractable for long outputs
+- With the cache, each decode step only computes K/V for the single new token — O(1) per step
+- Cache size = 2 × layers × KV_heads × head_dim × seq_len × bytes
+- For a 7B model: roughly 128 KB per token; for a 70B model: roughly 1 MB per token
+- Memory pressure from the KV cache is a primary constraint on context length and concurrency

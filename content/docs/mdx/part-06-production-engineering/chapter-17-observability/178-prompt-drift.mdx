@@ -5,5 +5,154 @@ lastUpdatedDate: '2026-08-05'
 
 # 17.8 Prompt Drift
 
-This section covers the details of 17.8 Prompt Drift.
+> "One untracked edit, shipped on a Friday, can silently regress every agent you run."
 
+Prompt drift is the unintentional degradation of agent behavior caused by prompt modifications. It's insidious because:
+
+- The change may seem minor ("just tweaking the wording")
+- The regression may be subtle (worse accuracy, not total failure)
+- It may only affect a subset of inputs (not caught by manual testing)
+- It may take days or weeks to surface in user feedback
+
+## Why Prompts Are Code
+
+Prompts are the primary determinant of agent behavior. A 5-word change to a system prompt can:
+
+- Change the model's output format, breaking downstream parsing
+- Reduce accuracy on a specific task class
+- Remove a constraint that was preventing harmful outputs
+- Alter tone in a way that affects user trust metrics
+
+Treat prompts with the same discipline as code: version control, code review, automated testing before merge.
+
+## The Prevention Stack
+
+### 1. Git-Track Every Prompt
+
+```
+project/
+├── prompts/
+│   ├── research_agent.txt          ← git-tracked
+│   ├── code_review_agent.txt       ← git-tracked
+│   └── summarization_agent.txt     ← git-tracked
+```
+
+Every change to a prompt creates a diff:
+
+```diff
+- You are a helpful research assistant. Answer questions clearly.
++ You are a research assistant. Answer questions clearly and concisely,
++ citing sources where possible.
+```
+
+The diff is reviewable. The history is queryable: `git log prompts/research_agent.txt`.
+
+### 2. Run Evals Before Merging Prompt Changes
+
+```yaml
+# .github/workflows/prompt-eval.yml
+on:
+  pull_request:
+    paths:
+      - 'prompts/**'    # Only run when prompts change
+
+jobs:
+  eval:
+    steps:
+      - name: Run eval suite against modified prompts
+        run: pytest tests/evals/ -v --tb=short
+      - name: Fail if pass rate drops
+        run: python scripts/check_eval_delta.py --threshold 0.02
+```
+
+No prompt change merges without passing the eval suite.
+
+### 3. A/B Test Prompt Variants
+
+The A/B testing harness at `atlas-agents/ch02_prompt_architecture/prompt_ab_test.py:290`:
+
+```python
+class PromptABTest:
+    def __init__(
+        self,
+        prompt_a: str,    # Current production prompt
+        prompt_b: str,    # Proposed new prompt
+        eval_cases: list[EvalCase],
+        traffic_split: float = 0.5,
+    ):
+        self.prompt_a = prompt_a
+        self.prompt_b = prompt_b
+        self.eval_cases = eval_cases
+        self.split = traffic_split
+
+    def run(self) -> ABTestResult:
+        results_a = self._evaluate_prompt(self.prompt_a)
+        results_b = self._evaluate_prompt(self.prompt_b)
+
+        return ABTestResult(
+            prompt_a_pass_rate=results_a.pass_rate,
+            prompt_b_pass_rate=results_b.pass_rate,
+            delta=results_b.pass_rate - results_a.pass_rate,
+            recommendation="deploy_b" if results_b.pass_rate > results_a.pass_rate + 0.02 else "keep_a",
+            failing_cases_b=results_b.failing_cases,
+        )
+```
+
+The A/B test produces a numeric pass rate for both variants. Ship the one that scores higher. Revert if production metrics diverge after deployment.
+
+## The Prompt Change Workflow
+
+```
+1. Edit prompt in feature branch
+         │
+         ▼
+2. Run eval suite locally
+   pass rate ≥ current baseline?
+         │
+         ├── NO  → iterate on the prompt
+         │
+         └── YES → open PR
+                      │
+                      ▼
+              3. CI runs eval suite
+                      │
+                      ▼
+              4. Human review of diff
+                 + eval results
+                      │
+                      ▼
+              5. Merge to main
+                      │
+                      ▼
+              6. Monitor production metrics
+                 for 24–48 hours post-deploy
+```
+
+## Detecting Drift After It Happens
+
+If you didn't catch a prompt regression before deployment:
+
+```python
+def detect_prompt_drift_from_metrics(
+    metric: str,
+    before: datetime,
+    after: datetime,
+    threshold: float = 0.10,
+) -> bool:
+    """
+    Compare a metric before and after a prompt deployment.
+    Returns True if significant degradation detected.
+    """
+    before_value = metrics.average(metric, since=before, until=after - timedelta(hours=1))
+    after_value = metrics.average(metric, since=after)
+
+    relative_drop = (before_value - after_value) / before_value
+    return relative_drop > threshold
+```
+
+Metrics to watch: task success rate, user satisfaction signals, refusal rate, error rate, latency (prompt changes can affect output length, which affects cost and latency).
+
+## Related Sections
+
+- [17.7 Model Drift](./177-model-drift) — drift from provider model updates vs. your own changes
+- [17.9 Retrieval Drift](./179-retrieval-drift) — drift from stale vector store content

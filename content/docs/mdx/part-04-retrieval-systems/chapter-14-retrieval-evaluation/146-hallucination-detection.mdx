@@ -5,5 +5,226 @@ lastUpdatedDate: '2026-08-05'
 
 # 14.6 Hallucination Detection
 
-This section covers the details of 14.6 Hallucination Detection.
+Hallucination detection is the practice of programmatically identifying when an LLM generates claims that are not supported by the evidence it was given. In a RAG system, the evidence is the retrieved documents. In a general generation system, the evidence is common knowledge or a reference knowledge base.
 
+## The Guardrail Architecture: Layer 4
+
+In the guardrail stack from atlas-agents, hallucination detection is Layer 4 — the last check before the response is delivered:
+
+```
+Layer 1: Input validation (is this a safe/valid query?)
+Layer 2: Context injection (retrieval + grounding)
+Layer 3: Output format validation (structured JSON, length limits)
+Layer 4: Hallucination check ← you are here
+Layer 5: PII/safety filtering
+```
+
+```python
+# From atlas-agents/ch14_guardrails/guardrailed_agent.py
+
+def check_hallucination(
+    question: str,
+    answer: str,
+    retrieved_docs: list[str]
+) -> dict:
+    """
+    Does the answer contain claims not supported by retrieved docs?
+    
+    Returns:
+        {
+            "has_hallucination": bool,
+            "risk_score": float,  # 0.0 (clean) to 1.0 (highly hallucinated)
+            "unsupported_claims": list[str]
+        }
+    """
+    context = "\n\n".join(
+        f"[Document {i+1}]: {doc}"
+        for i, doc in enumerate(retrieved_docs)
+    )
+
+    judge_prompt = f"""
+    You are evaluating an AI-generated answer for factual accuracy relative to source documents.
+    
+    Question: {question}
+    
+    Source documents:
+    {context}
+    
+    Answer to evaluate:
+    {answer}
+    
+    Task:
+    1. Break the answer into individual factual claims.
+    2. For each claim, determine if it is:
+       - SUPPORTED: explicitly backed by a source document
+       - UNSUPPORTED: not found in any source document (potential hallucination)
+       - CONTRADICTED: the source documents say something different
+    
+    Return JSON:
+    {{
+      "claims": [
+        {{"claim": "...", "status": "SUPPORTED|UNSUPPORTED|CONTRADICTED", "evidence": "quote or null"}}
+      ],
+      "risk_score": 0.0,
+      "has_hallucination": false,
+      "unsupported_claims": []
+    }}
+    """
+
+    response = llm_judge.invoke(judge_prompt)
+    return json.loads(response.content)
+```
+
+## The RAGAS Hallucination Metric (Faithfulness)
+
+RAGAS provides a standardized implementation:
+
+```python
+from ragas.metrics import faithfulness
+from ragas import evaluate
+from datasets import Dataset
+
+# Build evaluation dataset
+data = {
+    "question": questions,
+    "answer": generated_answers,
+    "contexts": retrieved_contexts  # list of lists of strings
+}
+
+dataset = Dataset.from_dict(data)
+result = evaluate(dataset, metrics=[faithfulness])
+
+# faithfulness score: 1.0 = no hallucination, 0.0 = complete hallucination
+print(f"Mean faithfulness: {result['faithfulness']:.3f}")
+```
+
+Internally, RAGAS:
+1. Uses an LLM to decompose the answer into atomic statements.
+2. For each statement, asks whether it is inferrable from the context.
+3. Reports (supported statements) / (total statements).
+
+## SelfCheckGPT: Consistency-Based Detection
+
+SelfCheckGPT takes a different approach — it doesn't require retrieved documents at all. The insight: **factual claims are consistent across multiple samples; hallucinations vary**.
+
+```python
+from selfcheckgpt.modeling_selfcheck import SelfCheckMQAG, SelfCheckBERTScore
+
+# Generate the answer multiple times with different temperatures
+def selfcheck_hallucination(question: str, num_samples: int = 5) -> dict:
+    samples = []
+    for _ in range(num_samples):
+        response = llm.invoke(
+            question,
+            temperature=0.7  # introduce variability to expose hallucinations
+        )
+        samples.append(response.content)
+
+    # The first sample is the "main" answer
+    main_answer = samples[0]
+
+    # Check consistency: does this sentence appear consistently across samples?
+    selfcheck = SelfCheckBERTScore(rescale_with_baseline=True)
+    
+    sentences = split_into_sentences(main_answer)
+    hallucination_scores = selfcheck.predict(
+        sentences=sentences,
+        sampled_passages=samples[1:]  # compare main answer against other samples
+    )
+
+    # High score = sentence appears consistently = likely factual
+    # Low score = sentence varies across samples = likely hallucinated
+    sentence_assessments = [
+        {
+            "sentence": sent,
+            "consistency_score": float(score),
+            "likely_hallucinated": float(score) < 0.5
+        }
+        for sent, score in zip(sentences, hallucination_scores)
+    ]
+
+    return {
+        "main_answer": main_answer,
+        "sentence_assessments": sentence_assessments,
+        "overall_hallucination_risk": 1 - (sum(s["consistency_score"] for s in sentence_assessments) / len(sentence_assessments))
+    }
+```
+
+SelfCheckGPT is particularly useful when you don't have retrieved documents to verify against — for general-knowledge questions or conversational responses.
+
+## Cheap Model as Hallucination Guard
+
+For high-throughput production systems, use a small, cheap model as the hallucination checker rather than the same expensive model that generated the answer:
+
+```python
+import litellm
+
+def cheap_hallucination_check(question: str, answer: str, docs: list[str]) -> float:
+    """
+    Use a small model to assess hallucination risk. Returns risk score 0.0–1.0.
+    This is meant to be fast and cheap, not perfect.
+    """
+    short_context = "\n".join(doc[:200] for doc in docs)  # truncate for speed
+
+    response = litellm.completion(
+        model="gpt-4o-mini",  # cheap model
+        messages=[{
+            "role": "user",
+            "content": f"""Does this answer contain claims NOT in the source docs?
+            
+Sources: {short_context}
+Answer: {answer}
+
+Reply with a number 0.0-1.0 where 0=fully grounded, 1=fully hallucinated. 
+Reply with the number only."""
+        }],
+        max_tokens=5
+    )
+
+    try:
+        return float(response.choices[0].message.content.strip())
+    except ValueError:
+        return 0.5  # unknown → moderate risk
+```
+
+At ~$0.00015 per check, this is cheap enough to run on every response.
+
+## Hallucination Detection in the Response Pipeline
+
+```python
+async def generate_with_hallucination_guard(
+    question: str,
+    docs: list[str],
+    max_retries: int = 2,
+    risk_threshold: float = 0.3
+) -> str:
+    for attempt in range(max_retries + 1):
+        answer = await llm.ainvoke(
+            build_rag_prompt(question, docs)
+        )
+
+        risk = cheap_hallucination_check(question, answer, docs)
+
+        if risk <= risk_threshold:
+            return answer
+
+        if attempt < max_retries:
+            # Retry with stronger grounding instruction
+            docs = retrieve_more_documents(question, k=10)  # expand retrieval
+        
+    # After retries, return with a caveat
+    return f"{answer}\n\n⚠️ Note: This answer could not be fully verified against source documents."
+```
+
+## Hallucination Rate Benchmarks
+
+Typical hallucination rates in production RAG systems (measured by faithfulness):
+
+| System setup | Typical faithfulness |
+|---|---|
+| No RAG (pure generation) | 0.60–0.75 |
+| Basic RAG (top-5 chunks) | 0.80–0.90 |
+| RAG + reranking | 0.88–0.94 |
+| RAG + compression + reranking | 0.91–0.96 |
+
+The takeaway: RAG substantially reduces hallucination, but it doesn't eliminate it. Layer 4 hallucination detection catches the residual cases.

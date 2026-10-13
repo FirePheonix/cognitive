@@ -264,3 +264,58 @@ Empirical result (OpenAI o1):
 - **Self-consistency**: sample N reasoning chains, take the majority vote answer. Wrong paths are diverse (random errors), correct paths converge. Trades inference cost for accuracy.
 - **Thinking models** (o1, DeepSeek-R1): trained with RL on verifiable tasks. Learn to explore, backtrack, and self-verify — behaviors that emerge from optimizing for correct final answers.
 - **Test-time compute scaling**: same model weights + more inference compute → better answers. Per-query scaling. A new axis of improvement alongside parameter and data scaling.
+
+---
+
+## GRPO and Modern Reasoning RL
+
+### Self-Consistency — the Simplest Test-Time Boost
+
+Instead of generating one reasoning path, generate $K$ different ones (using temperature sampling), then take the majority vote:
+
+$$\hat{y} = \arg\max_y \sum_{k=1}^{K} \mathbf{1}[y^{(k)} = y]$$
+
+Intuition: if 7 out of 10 independently generated reasoning paths reach the same answer, it's probably right. This is test-time ensembling. Cost: $K$ times the inference compute. Benefit: often a 5–15% accuracy improvement on reasoning benchmarks with $K=10$.
+
+### Test-Time Compute as a New Scaling Axis
+
+A key realization from 2024–2025: you don't only scale capabilities by making models bigger and training longer. You can also scale at inference time:
+
+$$\text{Performance} = f(\text{training compute},\ \text{test-time compute})$$
+
+Test-time compute can mean: longer reasoning chains (more reasoning tokens), multiple samples + voting (self-consistency), structured search (Tree-of-Thought, MCTS), or iterative refinement (generate → verify → revise).
+
+This is what o1/o3 and similar models do: they "think for longer" on hard problems by generating extended internal reasoning before answering.
+
+### Why RL Works for Math and Code — Verifiable Rewards
+
+For tasks like math and coding, you can verify correctness programmatically:
+
+$$r(x, y) = \mathbf{1}[\text{verify}(y) = \text{correct}]$$
+
+Run unit tests on code. Check if the math answer equals the ground truth. This gives a binary, unambiguous, scalable reward signal — which is exactly what RL needs. The model can self-improve by generating solutions and automatically filtering/reinforcing the ones that pass verification.
+
+Open text generation doesn't have this luxury — "is this a good paragraph?" has no easy automated verifier. This is why reasoning RL has been most successful in math and code.
+
+### GRPO — the Efficient RL Algorithm for Reasoning
+
+GRPO (Group Relative Policy Optimization) sidesteps the need for a separate critic/value network:
+
+1. Sample $G$ responses to the same question: $y_1, \dots, y_G$
+2. Score each with a reward function
+3. Normalize rewards within the group:
+
+$$A_i = \frac{r_i - \mu_G}{\sigma_G + \epsilon}$$
+
+4. Responses above group average get positive advantage; below get negative
+
+The key: no separate value model needed. Group normalization provides the baseline automatically. This makes GRPO much simpler and cheaper than PPO while achieving comparable or better results for reasoning tasks.
+
+### PPO vs GRPO
+
+| | PPO | GRPO |
+|---|---|---|
+| Value model | Required (trained separately) | Not needed |
+| Advantage estimate | Critic network | Group-relative normalization |
+| Complexity | Higher | Lower |
+| Best for | General RLHF | Reasoning/verifiable tasks |

@@ -5,5 +5,106 @@ lastUpdatedDate: '2026-08-05'
 
 # 8.2 JSON Mode
 
-This section covers the details of 8.2 JSON Mode.
+JSON mode is the first guardrail: you tell the model to output JSON, and the provider enforces that the output is *syntactically valid* JSON. It doesn't guarantee your schema is respected — just that the output can be parsed.
 
+## OpenAI
+
+```python
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {"role": "system", "content": "You are a research assistant. Output JSON only."},
+        {"role": "user", "content": "Summarize the latest findings on LLM reasoning."}
+    ],
+    response_format={"type": "json_object"},  # JSON mode
+)
+
+import json
+data = json.loads(response.choices[0].message.content)  # Guaranteed to parse
+```
+
+> **Important:** When using `json_object` mode, your prompt must mention "JSON" explicitly. OpenAI will return an error otherwise.
+
+## Gemini
+
+```python
+from google import genai
+from google.genai import types
+
+response = client.models.generate_content(
+    model="gemini-2.0-flash",
+    contents="Summarize the latest findings on LLM reasoning.",
+    config=types.GenerateContentConfig(
+        response_mime_type="application/json",  # JSON mode
+    ),
+)
+
+import json
+data = json.loads(response.text)
+```
+
+## Anthropic
+
+Anthropic doesn't have a dedicated JSON mode. The two patterns that work:
+
+**Pattern 1 — System prompt instruction:**
+```python
+response = client.messages.create(
+    model="claude-sonnet-4-6",
+    system="Respond only with valid JSON. No explanation, no markdown fences.",
+    messages=[{"role": "user", "content": "Summarize findings on LLM reasoning."}],
+    max_tokens=1024,
+)
+```
+
+**Pattern 2 — XML-style structured prompting:**
+```python
+prompt = """
+Analyze this research and return your answer in this exact JSON format:
+<json>
+{"title": "...", "summary": "...", "confidence": "high|medium|low"}
+</json>
+"""
+```
+
+Then extract the JSON with a regex: `re.search(r'<json>(.*?)</json>', response, re.DOTALL)`.
+
+**Pattern 3 — Use tool calling** (most reliable for Anthropic):
+
+Define a tool with the schema you want, force the model to call it, read the arguments as your structured output. Covered in [Chapter 9](../chapter-09-function-calling/).
+
+## What JSON Mode Guarantees
+
+| Guarantee | JSON Mode |
+|---|---|
+| Output can be parsed with `json.loads()` | ✅ Yes |
+| All required fields are present | ❌ No |
+| Field types are correct | ❌ No |
+| No extra fields | ❌ No |
+| Field values are semantically valid | ❌ No |
+
+JSON mode is necessary but not sufficient. You still need schema validation.
+
+## A Note on Prompt Engineering
+
+JSON mode works better with clearer prompts. Don't just say "output JSON" — show the model the schema:
+
+```python
+system_prompt = """
+You are a research assistant. Always respond with JSON in this exact format:
+{
+  "title": "string — the report title",
+  "summary": "string — 2-3 sentences",
+  "findings": ["string", ...],
+  "sources": ["string URL", ...],
+  "confidence": "high" | "medium" | "low"
+}
+No other text. No markdown fences. Only the JSON object.
+"""
+```
+
+Showing the schema in the prompt roughly doubles schema compliance even before you add validation. It's cheap and always worth doing.
+
+## When JSON Mode Is Enough
+
+For internal tooling where occasional failures are acceptable and you can log+alert on parse errors, JSON mode alone may be sufficient. For production user-facing features, proceed to [Schema Validation](./84-schema-validation).

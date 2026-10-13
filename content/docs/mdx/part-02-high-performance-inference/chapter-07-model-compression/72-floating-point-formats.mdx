@@ -1,25 +1,158 @@
 ---
-title: 7.2 Floating Point Formats
+title: 7.2 Floating-Point Formats
 lastUpdatedDate: '2026-08-05'
 ---
 
-# 7.2 Floating Point Formats
+# 7.2 Floating-Point Formats
 
-This section covers the details of 7.2 Floating Point Formats.
+Before diving into quantization algorithms, you need to understand what you're quantizing from. Model weights are stored as floating-point numbers, and the choice of floating-point format determines precision, memory usage, and what hardware operations are available.
 
-## FP32
+## How Floating-Point Numbers Work
 
-Placeholder for FP32.
+A floating-point number is encoded as:
 
-## FP16
+```
+value = (-1)^sign × 2^(exponent - bias) × (1 + mantissa)
 
-Placeholder for FP16.
+Where:
+  sign:     1 bit  (positive or negative)
+  exponent: range bits (determines max/min value)
+  mantissa: precision bits (determines resolution)
+```
 
-## BF16
+More exponent bits = wider range (can represent very large or very small numbers).  
+More mantissa bits = higher precision (finer granularity between values).
 
-Placeholder for BF16.
+## The Hierarchy of Formats
 
-## FP8
+| Format | Total bits | Exponent bits | Mantissa bits | Max value | VRAM for 7B | Notes |
+|---|---|---|---|---|---|---|
+| fp32 | 32 | 8 | 23 | ±3.4×10³⁸ | 28 GB | Training standard |
+| bf16 | 16 | 8 | 7 | ±3.4×10³⁸ | 14 GB | Same range as fp32, lower precision |
+| fp16 | 16 | 5 | 10 | ±65,504 | 14 GB | Risk of overflow on large values |
+| fp8 (E4M3) | 8 | 4 | 3 | ±448 | 7 GB | Emerging standard |
+| fp8 (E5M2) | 8 | 5 | 2 | ±57,344 | 7 GB | More range, less precision |
+| int8 | 8 | — | — | -128 to 127 | 7 GB | Integer, no native float ops |
+| int4 | 4 | — | — | -8 to 7 | 3.5 GB | Very coarse quantization |
 
-Placeholder for FP8.
+## fp32: The Training Standard
 
+32-bit float is the historical default for neural network training. High precision, no overflow risk.
+
+The problem: **28 GB for a 7B model** — impractical for serving. Almost no one serves models in fp32. It's used primarily in training (or mixed-precision training where the master copy is fp32).
+
+## bf16 and fp16: The Serving Defaults
+
+Both are 16-bit formats that cut fp32 memory in half. They differ in how they allocate bits:
+
+**fp16 (IEEE 754 half-precision)**:
+- 5 exponent bits → max value ±65,504
+- Risk: if any weight or activation exceeds ~65,000, you get `inf` or `NaN`
+- Historically the ML default, still widely used
+
+**bf16 (Brain Float 16, Google's format)**:
+- 8 exponent bits → same range as fp32 (±3.4×10³⁸)
+- Only 7 mantissa bits → lower precision than fp16
+- No overflow risk — safe to use anywhere fp32 is used
+- Preferred for serving on modern hardware (A100, H100 have native bf16 support)
+
+```python
+import torch
+
+# Check bf16 support
+print(torch.cuda.is_bf16_supported())  # True on A100, H100, RTX 3090+
+
+# Load in bf16 (preferred for modern hardware)
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Meta-Llama-3-8B-Instruct",
+    torch_dtype=torch.bfloat16,
+)
+
+# Load in fp16 (older hardware, or when bf16 not available)
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Meta-Llama-3-8B-Instruct",
+    torch_dtype=torch.float16,
+)
+```
+
+**Rule of thumb**: prefer bf16 for modern hardware. Use fp16 only if your GPU doesn't support bf16 or you have legacy code.
+
+## fp8: The Emerging Standard
+
+8-bit floating point is increasingly used for both weights and activations. Two variants:
+
+- **E4M3**: 4 exponent bits, 3 mantissa bits → max ±448, higher precision
+- **E5M2**: 5 exponent bits, 2 mantissa bits → max ±57,344, more range
+
+H100 natively supports fp8 matrix multiplications, making fp8 not just a storage format but a compute format. TensorRT-LLM uses fp8 for inference on H100s.
+
+```python
+# vLLM fp8 inference on H100
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-8B-Instruct \
+    --dtype fp8   # native H100 fp8 inference
+```
+
+Typical fp8 quality: within 0.5–1% of bf16 on standard benchmarks.
+
+## Integer Formats: int8 and int4
+
+Integer formats are not floating-point — they represent exact integer values in a fixed range. This makes them unsuitable as a direct computation format (you can't multiply int8 weights directly and get a meaningful result without scaling).
+
+Instead, integers are used as a **storage format**, with dequantization at inference time:
+
+```
+Storage:    weight stored as int4 value (0–15, offset encoded)
+Inference:  weight = int4_value × scale + zero_point  (back to float)
+Compute:    float multiplication with dequantized weight
+```
+
+The computation still happens in fp16 or bf16. The memory savings come from storing weights in int4/int8 until they're needed.
+
+```
+int4 weight matrix (4 GB for 7B model) → loaded into GPU registers
+Dequantized to fp16 on the fly → fp16 matrix multiplication
+Result: same math as fp16, but 4× less memory transfer from HBM
+```
+
+This is why int4 speeds up memory-bandwidth-bound decode: fewer bytes to read from HBM, even if the arithmetic is still in fp16.
+
+## Visual Comparison: Precision
+
+```
+Range of values represented (0 to 1 range shown as example):
+
+fp16:  0.000, 0.001, 0.002, ... (very dense, 1024 values in [0,1])
+int8:  0.000, 0.004, 0.008, ... (256 distinct values)
+int4:  0.000, 0.067, 0.133, ... (16 distinct values — very coarse)
+
+A weight that should be 0.031:
+  fp16: stored as 0.031 (very close)
+  int8: stored as 0.032 (small error)
+  int4: stored as 0.000 or 0.067 (large error — nearest available value)
+```
+
+This coarseness is why int4 quantization has more quality impact than int8. Each weight is rounded to one of only 16 values per block — any fine-grained weight variation is lost.
+
+## Hardware Support Matrix
+
+| Format | A100 compute | H100 compute | RTX 4090 | Notes |
+|---|---|---|---|---|
+| fp32 | Yes | Yes | Yes | Universal |
+| bf16 | Yes | Yes | Yes | A100+ generation |
+| fp16 | Yes | Yes | Yes | All modern GPUs |
+| fp8 | No | Yes | Partial | H100+ native |
+| int8 | Yes (via CUTLASS) | Yes | Partial | Requires special kernels |
+| int4 | No native | No native | No | Always dequantize to float |
+
+Int4 never runs natively — it's always dequantized before arithmetic. Int8 can run natively on A100/H100 using CUTLASS or cuBLAS integer kernels.
+
+## Summary
+
+- fp32: highest precision, too large for serving (28 GB for 7B model) — training use only
+- bf16: same range as fp32, lower precision — preferred serving format for modern GPUs
+- fp16: standard before bf16 — still widely used, risk of overflow on large values
+- fp8: emerging, H100-native — halves memory vs fp16, minimal quality loss
+- int8: 2× memory savings vs fp16, used as storage format with runtime dequantization
+- int4: 4× memory savings vs fp16, coarse precision — notable quality impact, use when hardware requires
+- Rule: use bf16 for serving → move to int8 if memory pressure → move to int4 only when forced by hardware constraints

@@ -1,0 +1,40 @@
+---
+title: LLM Fundamentals
+description: 'How language models actually work — from tokens and embeddings to transformers, GPT, and modern LLM systems'
+isChapterOverview: true
+lastUpdatedDate: '2026-10-13'
+---
+
+# LLM Fundamentals
+
+This section builds a complete mental model of how large language models work — from the ground up. No shortcuts. Each part answers exactly one question, then hands off to the next.
+
+---
+
+## Part A — Foundations of Language Representation
+
+How does text become something a computer can compute with? This part answers that question completely: tokens, embeddings, tensors, vector databases, and the math that ties them together.
+
+## Part B — Learning Language Before Transformers
+
+Before transformers, there were RNNs and LSTMs. Understanding why they failed is the clearest way to understand why attention works. This part covers sequential models, their limitations, and the context vector bottleneck that motivated everything that came after.
+
+## Part C — The Transformer Revolution
+
+The "Attention Is All You Need" paper changed everything. This part builds up self-attention, multi-head attention, positional encoding, and the full transformer block from scratch — with intuition at every step.
+
+## Part D — Building GPT
+
+GPT is a decoder-only transformer trained to predict the next token. This part covers the architecture, the training loop, and inference — including the full implementation from scratch.
+
+## Part E — From GPT to ChatGPT
+
+How does a next-token predictor become a helpful assistant? Fine-tuning, instruction tuning, LoRA, RLHF, DPO, and the alignment techniques that shape modern chat models.
+
+## Part F — Beyond the Model
+
+Embeddings for search, vector databases, RAG, tool calling, and agent workflows — the layer of systems built on top of LLMs.
+
+## Part G — Modern LLM Systems
+
+KV cache, quantization, speculative decoding, continuous batching, mixture of experts, long-context models, multimodal models, reasoning models. The engineering behind serving LLMs at scale.

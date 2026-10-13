@@ -5,5 +5,229 @@ lastUpdatedDate: '2026-08-05'
 
 # 4.9 KV Cache Sharing
 
-This section covers the details of 4.9 KV Cache Sharing.
+Prefix sharing is when multiple requests reuse the same KV cache blocks for their common leading content. It's the intersection of memory efficiency and computational efficiency: you compute once, serve many. This section covers the mechanisms, use cases, and the state-of-the-art systems that implement it.
 
+## The Basic Idea
+
+If two requests start with identical content, their KV vectors for that content are identical. There's no reason to store two copies or compute it twice:
+
+```
+Request A: [System prompt (2000 tokens)] [User: "Write a haiku"]
+Request B: [System prompt (2000 tokens)] [User: "Explain recursion"]
+
+KV cache for first 2000 tokens:
+  Request A: compute and store
+  Request B: reuse Request A's cache → same physical GPU blocks
+
+Memory saved: 2000 tokens × ~128 KB = ~256 MB per duplicate
+Compute saved: 2000 tokens of prefill
+```
+
+For a system handling 1000 requests per minute, all sharing a 2000-token system prompt, that's 1000 × 2000 = 2M tokens of prefill avoided every minute.
+
+## Multi-Turn Conversation Sharing
+
+Each turn of a conversation can reuse the cache from all prior turns:
+
+```
+Turn 1: [System][User1]
+         → Compute KV for full sequence, cache it
+
+Turn 2: [System][User1][Asst1][User2]
+         → KV for [System][User1] already cached
+         → Compute only [Asst1][User2] — the new suffix
+
+Turn N: → Compute only the new turn
+         → All prior turns served from cache
+```
+
+This is automatically beneficial in multi-user chat applications where each user's conversation is a growing prefix. The KV cache for a 10-turn conversation is computed incrementally, not from scratch on each turn.
+
+## Use Cases Where Sharing Is Most Valuable
+
+### 1. Shared System Prompts
+
+The most common case. Every request to the same application uses the same system prompt:
+
+```python
+SYSTEM_PROMPT = """
+You are a customer service agent for Acme Corp.
+Product catalog: [500 tokens of product descriptions]
+Policies: [300 tokens of return policies]
+Tone: professional, concise, helpful.
+"""
+
+# All 1000 requests per minute share this prefix
+```
+
+### 2. Few-Shot Examples
+
+Applications that prepend identical in-context learning examples to every request:
+
+```python
+FEW_SHOT = """
+Example 1:
+Input: "Extract the company name from: 'Apple reported earnings...'"
+Output: {"company": "Apple"}
+
+Example 2:
+Input: "Extract the company name from: 'Google announced...'"
+Output: {"company": "Google"}
+
+[10 more examples...]
+"""
+# These 800 tokens appear in every extraction request
+```
+
+### 3. RAG with Repeated Documents
+
+If your RAG system retrieves the same popular documents repeatedly (common in knowledge base queries), those documents' KV cache can be shared:
+
+```python
+TOP_RETRIEVED_DOC = """
+[Product manual: 3000 tokens]
+"""
+# If this appears in 40% of requests, cache hit rate is high
+```
+
+### 4. Parallel Sampling
+
+When you generate multiple completions for the same prompt (e.g., for best-of-N selection):
+
+```python
+# Generate 5 variations of the same prompt
+responses = [
+    client.chat.completions.create(model="gpt-4o", messages=messages, temperature=0.8)
+    for _ in range(5)
+]
+# All 5 requests share the same prompt KV cache
+```
+
+## SGLang RadixAttention: Tree-Based Prefix Sharing
+
+The most sophisticated prefix sharing system is SGLang's **RadixAttention**, which uses a **radix tree** (trie) to match shared prefixes even when they partially overlap:
+
+```
+Radix tree after processing several requests:
+
+root
+├── "You are a helpful assistant."
+│   ├── " Answer in JSON." → cached
+│   │   ├── [User A's query] → cached
+│   │   └── [User B's query] → cached
+│   └── " Be concise." → cached
+│       └── [User C's query] → cached
+└── "You are a coding assistant."
+    └── [User D's query] → cached
+```
+
+When a new request arrives, RadixAttention finds the longest matching prefix in the tree and reuses its cache. Only the suffix not found in the tree requires new computation.
+
+```python
+# Example with SGLang
+import sglang as sgl
+
+@sgl.function
+def multi_choice_qa(s, question, choices):
+    s += sgl.system("You are an expert question answerer.")
+    s += sgl.user(question)
+    s += sgl.assistant(
+        sgl.select("answer", choices=choices)
+    )
+
+# Multiple calls with same system prompt share cache automatically
+results = sgl.run_batch(
+    multi_choice_qa,
+    [{"question": q, "choices": c} for q, c in questions]
+)
+```
+
+SGLang reports 1.5–3× throughput improvement from RadixAttention on workloads with common prefixes, compared to no prefix sharing.
+
+## vLLM's Prefix Caching
+
+vLLM implements prefix caching using its block system. Blocks with identical content get the same hash; when a new request's prefix matches cached blocks, those blocks are reused directly:
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-8B-Instruct \
+    --enable-prefix-caching   # enable prefix sharing
+```
+
+After enabling:
+```python
+# First request: cache miss — compute everything
+response1 = client.chat.completions.create(
+    model="...",
+    messages=[{"role": "system", "content": SYSTEM_PROMPT}, ...]
+)
+
+# Second request: cache hit on system prompt blocks
+response2 = client.chat.completions.create(
+    model="...",
+    messages=[{"role": "system", "content": SYSTEM_PROMPT}, ...]
+)
+# System prompt prefill is skipped — only user message is processed
+```
+
+## Design Patterns for Maximum Cache Sharing
+
+### Pattern 1: Fixed System Prompt, Variable User Turn
+
+```python
+# ✓ Maximizes sharing
+{"role": "system", "content": STABLE_SYSTEM_PROMPT},  # shared prefix
+{"role": "user",   "content": user_specific_query},   # unique suffix
+```
+
+### Pattern 2: Shared Few-Shot + Per-Request Input
+
+```python
+# ✓ High cache hit rate
+SHARED_PREFIX = SYSTEM + "\n\n" + FEW_SHOT_EXAMPLES  # shared across all
+PER_REQUEST = f"Now classify: {input_text}"           # unique suffix
+```
+
+### Pattern 3: RAG — Stable Docs First
+
+```python
+# ✓ Stable documents in prefix position
+CONTEXT = f"{SYSTEM}\n\nDocuments:\n{static_document_1}\n{static_document_2}"
+QUERY = f"\n\nQuestion: {user_question}"
+```
+
+### Anti-pattern: Dynamic Prefix
+
+```python
+# ✗ Kills cache hits
+content = f"Current time: {datetime.now()}\n{SYSTEM_PROMPT}\n{user_query}"
+# Any prefix change → full cache miss
+```
+
+## Quantifying the Business Impact
+
+For a production system serving 10,000 requests/hour with a 2000-token system prompt:
+
+```
+Without prefix sharing:
+  Prefill cost: 10,000 × 2,000 tokens/hr = 20M input tokens/hr
+  At $3/MTok: $60/hr
+
+With prefix sharing (90% cache hit rate):
+  Cache misses: 10,000 × 10% × 2,000 = 2M tokens/hr
+  Cache reads: 10,000 × 90% × 2,000 = 18M tokens/hr
+  At $0.30/MTok read rate: $5.40/hr for reads + $6/hr for misses
+  Total: ~$11.40/hr vs $60/hr = 81% cost reduction
+```
+
+Cache sharing is not just an optimization — at scale, it's the difference between sustainable and unsustainable infrastructure costs.
+
+## Summary
+
+- KV cache sharing: multiple requests reuse the same cached blocks for identical prefix content
+- Multi-turn conversations benefit automatically — each turn reuses all prior turns' cache
+- High-value use cases: shared system prompts, identical few-shot examples, repeated RAG documents, parallel sampling
+- SGLang RadixAttention: radix tree matches longest common prefixes, enabling partial sharing
+- vLLM prefix caching: enabled with `--enable-prefix-caching`, hash-based block matching
+- Design principle: stable content first (system prompt, examples), dynamic content last (user input)
+- At production scale, prefix sharing can reduce input token costs by 80%+ on prefix-heavy workloads

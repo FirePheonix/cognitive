@@ -5,5 +5,188 @@ lastUpdatedDate: '2026-08-05'
 
 # 9.1 Tool Calling Fundamentals
 
-This section covers the details of 9.1 Tool Calling Fundamentals.
+Tool calling is the mechanism that turns an LLM from a text generator into something that can actually *do things*. Without tools, a model can describe how to search the web. With tools, it can search the web.
 
+The model doesn't execute tools — you do. The model tells you which tool to call and with what arguments. You call it. You feed the result back. The model continues with that information.
+
+## The Three-Step Dance
+
+```
+1. You send: messages + tool schemas
+      ↓
+2. Model returns: a tool_call (not text)
+      ↓
+3. You: execute the tool, append the result, call the model again
+      ↓
+4. Model returns: text response (using the tool result)
+```
+
+This loop can repeat. A model can call multiple tools before generating a final response.
+
+## Minimal Implementation
+
+```python
+from openai import OpenAI
+import json
+
+client = OpenAI()
+
+# Define the tools the model can call
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the web for current information on a topic.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+# The tool registry — maps name to callable
+TOOLS = {
+    "search_web": lambda query: web_search(query),
+}
+
+messages = [
+    {"role": "user", "content": "What are the latest developments in AI reasoning?"}
+]
+
+# Step 1: Call with tools
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+    tools=tools,
+)
+
+msg = response.choices[0].message
+
+# Step 2: Check if the model wants to call a tool
+if msg.tool_calls:
+    messages.append(msg)  # Append the assistant message with tool_calls
+
+    for tc in msg.tool_calls:
+        # Step 3: Execute the tool
+        args = json.loads(tc.function.arguments)
+        result = TOOLS[tc.function.name](**args)
+
+        # Append the tool result
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "content": str(result),
+        })
+
+    # Step 4: Call the model again with the tool results
+    final_response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        tools=tools,
+    )
+    print(final_response.choices[0].message.content)
+else:
+    # Model decided not to use any tools
+    print(msg.content)
+```
+
+## Provider Syntax Comparison
+
+All major providers support the same conceptual pattern. The syntax differs:
+
+**OpenAI:**
+```python
+tools = [{"type": "function", "function": {"name": ..., "parameters": {...}}}]
+response = client.chat.completions.create(model=..., messages=messages, tools=tools)
+tool_calls = response.choices[0].message.tool_calls
+```
+
+**Anthropic:**
+```python
+tools = [{"name": ..., "description": ..., "input_schema": {...}}]
+response = client.messages.create(model=..., messages=messages, tools=tools)
+# tool_use blocks in response.content
+tool_calls = [b for b in response.content if b.type == "tool_use"]
+```
+
+**Gemini:**
+```python
+from google.genai import types
+
+tools = [types.Tool(function_declarations=[
+    types.FunctionDeclaration(name=..., parameters=types.Schema(...))
+])]
+response = client.models.generate_content(model=..., contents=..., config=types.GenerateContentConfig(tools=tools))
+# function_call parts in response.candidates[0].content.parts
+```
+
+The idea is identical across providers. An abstraction layer (LiteLLM, or your own adapter) can normalize these differences — see [Chapter 11: Model Routing](../chapter-11-model-routing/).
+
+## Forcing Tool Use
+
+By default, the model decides whether to call a tool. You can force it:
+
+```python
+# OpenAI — force a specific tool
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+    tools=tools,
+    tool_choice={"type": "function", "function": {"name": "search_web"}},
+)
+
+# OpenAI — force any tool (but let model choose which)
+tool_choice="required"
+```
+
+Forcing tool use is useful when you want structured output (force a tool call, use the arguments as your schema) or when you know the model should always use a tool for a given request.
+
+## The Agentic Loop
+
+Real agents don't call tools once — they loop:
+
+```python
+def run_agent(user_message: str, tools: list, max_turns: int = 10) -> str:
+    messages = [{"role": "user", "content": user_message}]
+
+    for turn in range(max_turns):
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            tools=tools,
+        )
+        msg = response.choices[0].message
+
+        if not msg.tool_calls:
+            return msg.content  # Model is done — return final response
+
+        # Execute all tool calls
+        messages.append(msg)
+        for tc in msg.tool_calls:
+            args = json.loads(tc.function.arguments)
+            result = execute_tool(tc.function.name, args)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": str(result),
+            })
+
+    return "Max turns reached without final response."
+```
+
+The `max_turns` guard prevents infinite loops — an important safety property covered in detail in [Chapter 14: Guardrails](../chapter-14-guardrails/).
+
+---
+
+## Open Protocols
+
+![The four open protocols](/part-03/chapter-09/open-protocols.jpeg)
+*Fig: The four open protocols: MCP (tool connectivity), A2A (agent-to-agent discovery), A2UI (user interface), and AP2 (payment authorization).*

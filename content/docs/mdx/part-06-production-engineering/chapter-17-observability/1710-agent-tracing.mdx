@@ -5,5 +5,170 @@ lastUpdatedDate: '2026-08-05'
 
 # 17.10 Agent Tracing
 
-This section covers the details of 17.10 Agent Tracing.
+Tracing infrastructure turns invisible agent behavior into inspectable records. LangSmith provides automatic tracing for LangGraph/LangChain agents. For custom agents, the `@traceable` decorator and manual span creation give you the same visibility.
 
+## LangSmith Automatic Tracing
+
+Set three environment variables and every LangGraph agent is automatically traced:
+
+```python
+import os
+
+# Enable tracing — set before importing langchain/langgraph
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = "your-langsmith-api-key"
+os.environ["LANGCHAIN_PROJECT"] = "atlas-code-review"
+
+# Now every LangGraph run creates a trace automatically
+from langgraph.graph import StateGraph
+
+graph = StateGraph(AgentState)
+graph.add_node("research", research_node)
+graph.add_node("analyze", analyze_node)
+# ... graph definition ...
+
+agent = graph.compile()
+
+# This run is automatically traced in LangSmith
+result = agent.invoke({"message": "Review this pull request..."})
+# → trace appears in LangSmith dashboard within seconds
+```
+
+The trace captures: every node execution, every LLM call within each node, inputs and outputs, latency, token counts, and the full state at each step.
+
+## Manual Tracing with `@traceable`
+
+For custom agents not built on LangChain, decorate key functions:
+
+```python
+from langsmith import traceable, Client
+
+client = Client()
+
+@traceable(name="research_step", run_type="chain")
+def research(query: str) -> str:
+    """
+    The @traceable decorator creates a span for this function call.
+    Input (query) and output are automatically captured.
+    """
+    results = web_skill.execute("web_search", {"query": query})
+    return results
+
+@traceable(name="analyze_results", run_type="chain")
+def analyze(results: str, question: str) -> str:
+    response = anthropic_client.messages.create(
+        model="claude-opus-4-5",
+        messages=[{"role": "user", "content": f"Question: {question}\n\nResults: {results}"}],
+    )
+    return response.content[0].text
+
+@traceable(name="full_research_agent", run_type="agent")
+def run_agent(user_question: str) -> str:
+    search_results = research(user_question)        # Creates child span
+    answer = analyze(search_results, user_question)  # Creates child span
+    return answer
+```
+
+The span hierarchy in LangSmith will show: `full_research_agent` → `research_step` → `analyze_results`.
+
+## What to Capture in Each Trace
+
+Every trace should record:
+
+| Field | Why It Matters |
+|-------|---------------|
+| **Input** | What was the user's request? |
+| **Output** | What did the agent return? |
+| **Tool calls made** | Which tools, in what order, with what args? |
+| **Tokens used** | Input + output per LLM call |
+| **Latency** | Total and per-step breakdown |
+| **Cost estimate** | Total cost for the run |
+| **Model used** | Which model at each step |
+| **Error** | Full error details if failed |
+| **Session/user ID** | For user-level debugging |
+
+```python
+@traceable(
+    name="agent_run",
+    run_type="agent",
+    metadata={
+        "agent_version": "2.1.0",
+        "feature": "code_review",
+    },
+)
+def traced_agent_run(
+    message: str,
+    user_id: str,
+    session_id: str,
+) -> AgentResult:
+    # LangSmith captures inputs and outputs automatically
+    # Add custom metadata via the run context
+    from langsmith import get_current_run_tree
+    run = get_current_run_tree()
+    if run:
+        run.extra["user_id"] = user_id
+        run.extra["session_id"] = session_id
+
+    result = agent.run(message)
+    return result
+```
+
+## Filtering and Searching Traces
+
+LangSmith's query interface lets you find specific traces:
+
+```python
+from langsmith import Client
+
+client = Client()
+
+# Find all failing runs in the last 24 hours
+failing_runs = client.list_runs(
+    project_name="atlas-code-review",
+    filter='eq(error, "true")',
+    start_time=datetime.utcnow() - timedelta(hours=24),
+)
+
+# Find slow runs (>10 seconds)
+slow_runs = client.list_runs(
+    project_name="atlas-code-review",
+    filter='gt(latency, 10)',
+)
+
+# Find runs for a specific user
+user_runs = client.list_runs(
+    project_name="atlas-code-review",
+    filter='eq(metadata.user_id, "user_123")',
+)
+```
+
+## Feedback Integration
+
+Capture user feedback and link it to traces:
+
+```python
+from langsmith import Client
+
+client = Client()
+
+def record_user_feedback(
+    run_id: str,
+    score: float,        # 0.0 - 1.0
+    comment: str | None = None,
+) -> None:
+    """Link explicit user feedback to the trace that produced the response."""
+    client.create_feedback(
+        run_id=run_id,
+        key="user_rating",
+        score=score,
+        comment=comment,
+    )
+```
+
+Feedback-linked traces make it easy to find the exact agent run that produced a response a user complained about.
+
+## Related Sections
+
+- [17.2 Traces](./172-traces) — the structure of what gets recorded
+- [17.3 Spans](./173-spans) — individual units within a trace
+- [17.1 Why Observability Matters](./171-why-observability-matters) — the case for investing in tracing infrastructure

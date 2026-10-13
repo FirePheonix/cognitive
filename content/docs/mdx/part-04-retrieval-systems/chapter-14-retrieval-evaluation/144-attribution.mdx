@@ -5,5 +5,228 @@ lastUpdatedDate: '2026-08-05'
 
 # 14.4 Attribution
 
-This section covers the details of 14.4 Attribution.
+Attribution is the next step beyond grounding. Grounding asks: "Is this answer derived from the retrieved documents?" Attribution asks: "Which specific document does each part of this answer come from?" Attribution powers citation systems — the inline source references that let users verify claims against original documents.
 
+## Grounding vs Attribution
+
+| Metric | Question answered | Output |
+|---|---|---|
+| Grounding | Did the model use the documents? | Yes/No + rate |
+| Attribution | Which document supports which claim? | Claim → Source mapping |
+
+Systems like Perplexity, Bing Chat, and Claude Projects display attributions because they allow users to verify answers and understand where information came from. This is increasingly expected for trust-sensitive applications.
+
+## The Attribution Pipeline
+
+```
+Answer generated
+    │
+    ▼
+Split into sentences / claims
+    │
+    ▼
+For each claim → match to retrieved chunk
+    │
+    ▼
+Assign source metadata (doc title, URL, page)
+    │
+    ▼
+Output answer with inline citations [1][2]
+```
+
+## Post-Hoc Attribution with an LLM
+
+The simplest approach: generate the answer, then use a second LLM call to attribute each sentence to a source:
+
+```python
+def attribute_answer(
+    question: str,
+    answer: str,
+    retrieved_docs: list[dict]  # each has 'id', 'title', 'content'
+) -> dict:
+    context = "\n\n".join(
+        f"[Source {i+1}: {doc['title']}]\n{doc['content']}"
+        for i, doc in enumerate(retrieved_docs)
+    )
+
+    attribution_prompt = f"""
+    You have generated an answer to a question, using retrieved documents.
+    For each sentence in the answer, identify which source(s) it came from.
+    
+    Question: {question}
+    
+    Retrieved sources:
+    {context}
+    
+    Answer:
+    {answer}
+    
+    Return JSON:
+    {{
+      "attributed_sentences": [
+        {{
+          "sentence": "...",
+          "source_ids": [1, 3],  // 1-indexed, matching the Source numbers above
+          "confidence": 0.9
+        }},
+        ...
+      ]
+    }}
+    
+    Rules:
+    - A sentence may be attributed to multiple sources
+    - If a sentence cannot be attributed to any source, set source_ids to []
+    - confidence reflects how certain you are about the attribution
+    """
+
+    result = json.loads(
+        llm.invoke(attribution_prompt).content
+    )
+
+    # Build the final output with inline citations
+    cited_answer = build_cited_answer(answer, result["attributed_sentences"], retrieved_docs)
+    return {"cited_answer": cited_answer, "attribution": result["attributed_sentences"]}
+
+
+def build_cited_answer(answer: str, attributions: list[dict], docs: list[dict]) -> str:
+    """Insert citation markers into the answer text."""
+    sentences = split_into_sentences(answer)
+    cited_parts = []
+
+    for sent, attr in zip(sentences, attributions):
+        citation_markers = "".join(f"[{sid}]" for sid in attr["source_ids"])
+        cited_parts.append(f"{sent}{citation_markers}")
+
+    return " ".join(cited_parts)
+```
+
+## Native Attribution with Claude
+
+Claude can be prompted to output inline citations using `<source>` tags:
+
+```python
+attribution_system_prompt = """
+You are a helpful assistant that provides answers with inline citations.
+
+When you use information from the provided documents, cite the source using 
+<source id="N"> tags inline, where N is the document number.
+
+Example: "The return window is 30 days <source id=\"1\"> and refunds are 
+processed within 5 business days <source id=\"2\">."
+"""
+
+def claude_with_attribution(question: str, docs: list[dict]) -> str:
+    context = "\n\n".join(
+        f"[Document {i+1}: {doc['title']}]\n{doc['content']}"
+        for i, doc in enumerate(docs)
+    )
+
+    messages = [
+        {"role": "user", "content": f"Documents:\n{context}\n\nQuestion: {question}"}
+    ]
+
+    response = anthropic_client.messages.create(
+        model="claude-3-5-sonnet-20241022",
+        system=attribution_system_prompt,
+        messages=messages,
+        max_tokens=1024
+    )
+
+    raw_answer = response.content[0].text
+
+    # Parse <source> tags and convert to structured citations
+    citations = extract_source_tags(raw_answer)
+    return {"answer": raw_answer, "citations": citations}
+```
+
+## Semantic Attribution
+
+For higher accuracy, use semantic similarity to match answer sentences to source sentences rather than relying on the LLM's memory:
+
+```python
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+embed_model = SentenceTransformer("BAAI/bge-large-en-v1.5")
+
+def semantic_attribution(
+    answer: str,
+    retrieved_docs: list[dict]
+) -> list[dict]:
+    """Match each answer sentence to its most likely source."""
+    answer_sentences = split_into_sentences(answer)
+
+    # Embed all source sentences
+    source_sentences = []
+    source_metadata = []
+    for doc in retrieved_docs:
+        for sent in split_into_sentences(doc["content"]):
+            source_sentences.append(sent)
+            source_metadata.append({"doc_id": doc["id"], "doc_title": doc["title"]})
+
+    source_embeddings = embed_model.encode(source_sentences)
+    answer_embeddings = embed_model.encode(answer_sentences)
+
+    attributions = []
+    for sent, emb in zip(answer_sentences, answer_embeddings):
+        # Find the most similar source sentence
+        similarities = np.dot(source_embeddings, emb)
+        best_idx = np.argmax(similarities)
+        best_score = similarities[best_idx]
+
+        attributions.append({
+            "sentence": sent,
+            "source": source_metadata[best_idx] if best_score > 0.75 else None,
+            "similarity": float(best_score)
+        })
+
+    return attributions
+```
+
+This approach is more reliable than LLM-based attribution for long documents where the LLM may confuse which document contained which fact.
+
+## Evaluating Attribution Quality
+
+Attribution quality has two dimensions:
+
+```python
+def evaluate_attribution(
+    attributed_sentences: list[dict],
+    human_labels: list[dict]  # ground truth source assignments
+) -> dict:
+    """
+    attribution_precision: of all citations made, what fraction are correct?
+    attribution_recall: of all sentences that should be cited, what fraction were?
+    """
+    true_positives = 0
+    false_positives = 0
+    false_negatives = 0
+
+    for predicted, actual in zip(attributed_sentences, human_labels):
+        predicted_sources = set(predicted["source_ids"])
+        actual_sources = set(actual["source_ids"])
+
+        tp = len(predicted_sources & actual_sources)
+        fp = len(predicted_sources - actual_sources)
+        fn = len(actual_sources - predicted_sources)
+
+        true_positives += tp
+        false_positives += fp
+        false_negatives += fn
+
+    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+
+    return {"attribution_precision": precision, "attribution_recall": recall}
+```
+
+## Common Attribution Failures
+
+| Failure | Cause | Fix |
+|---|---|---|
+| Off-by-one citation index | Bug in source numbering | Validate indices before attribution call |
+| Citing a tangentially related doc | LLM picks most similar, not most specific | Use semantic attribution with higher threshold |
+| No citation when source exists | LLM confident it "knows" the fact | Enforce citation for all factual claims |
+| Multiple sources cited when one is wrong | Co-citation of relevant and irrelevant | Attribution precision evaluation |
+
+Attribution accuracy is ultimately a trust issue. Users who follow a citation and find it doesn't support the claim will lose confidence in the entire system faster than any other failure mode.

@@ -5,5 +5,161 @@ lastUpdatedDate: '2026-08-05'
 
 # 19.2 Timeouts
 
-This section covers the details of 19.2 Timeouts.
+Without timeouts, one slow dependency can hang your entire worker process indefinitely. LLM APIs can become slow under load. External tools make network calls. Code execution can loop forever. Each layer of your system needs its own timeout.
 
+## The Three Timeout Levels
+
+| Level | What It Guards | Typical Value |
+|-------|---------------|--------------|
+| **HTTP request timeout** | Individual API call | 5–10s |
+| **Subprocess timeout** | Code execution | 30s |
+| **Total task timeout** | Entire agent run | Varies by task type |
+
+Each level is independent. A 5s HTTP timeout does not protect you from a code execution loop that runs for 10 minutes.
+
+## Level 1: HTTP Request Timeout
+
+Set on every API client — LLM calls, tool HTTP calls, everything:
+
+```python
+import httpx
+
+# Anthropic client with explicit timeout
+from anthropic import Anthropic
+
+client = Anthropic(
+    timeout=httpx.Timeout(
+        connect=5.0,    # Connection establishment: 5s
+        read=30.0,      # Waiting for response data: 30s
+        write=10.0,     # Sending request: 10s
+        pool=5.0,       # Getting a connection from the pool: 5s
+    )
+)
+
+# OpenAI client
+from openai import OpenAI
+
+client = OpenAI(
+    timeout=httpx.Timeout(30.0, connect=5.0),
+)
+```
+
+For streaming responses, the `read` timeout applies between chunks, not for the total stream duration. A 30s read timeout means "30s without receiving any data" — a slow but still streaming response won't time out.
+
+## Level 2: Subprocess Timeout
+
+For tools that execute shell commands:
+
+```python
+import subprocess
+
+def run_command(command: str, timeout: int = 30) -> CommandResult:
+    try:
+        result = subprocess.run(
+            command.split(),
+            capture_output=True,
+            text=True,
+            timeout=timeout,    # Kills the process after 30s
+        )
+        return CommandResult(
+            stdout=result.stdout,
+            stderr=result.stderr,
+            returncode=result.returncode,
+            success=result.returncode == 0,
+        )
+
+    except subprocess.TimeoutExpired:
+        return CommandResult(
+            stdout="",
+            stderr="",
+            returncode=-1,
+            success=False,
+            error=f"Command timed out after {timeout}s",
+        )
+```
+
+For code execution in E2B sandboxes:
+
+```python
+# E2B sandbox process with timeout
+result = sandbox.process.start_and_wait(
+    command,
+    timeout=30_000,  # milliseconds in E2B's API
+)
+```
+
+## Level 3: Total Task Timeout
+
+The circuit breaker of last resort. If an agent run exceeds the total budget, kill it and return a safe error:
+
+```python
+import asyncio
+from functools import wraps
+
+def with_timeout(seconds: int):
+    """Decorator to add a hard timeout to any async function."""
+    def decorator(fn):
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await asyncio.wait_for(fn(*args, **kwargs), timeout=seconds)
+            except asyncio.TimeoutError:
+                return AgentResult(
+                    success=False,
+                    message=(
+                        f"I wasn't able to complete this task within the time limit "
+                        f"({seconds}s). Please try a simpler request or try again later."
+                    ),
+                )
+        return wrapper
+    return decorator
+
+
+# Task-type-specific timeouts
+@with_timeout(seconds=30)
+async def quick_lookup_agent(query: str) -> AgentResult:
+    ...
+
+@with_timeout(seconds=120)
+async def research_agent(query: str) -> AgentResult:
+    ...
+
+@with_timeout(seconds=300)
+async def code_generation_agent(task: str) -> AgentResult:
+    ...
+```
+
+## Timeout Tuning
+
+Start conservative and tighten based on observed p99 latency:
+
+```python
+# After collecting latency data:
+# p50 = 1.2s, p95 = 4.8s, p99 = 8.3s, max = 45s (outliers)
+
+# Set timeout at 3× p99 to catch outliers without being too tight
+HTTP_TIMEOUT = 8.3 * 3  # ≈ 25s
+
+# For total task timeout, use a business-appropriate value
+# "Users won't wait more than 60s for a research task"
+RESEARCH_TASK_TIMEOUT = 60
+```
+
+## Timeout Error Messages
+
+Never surface raw timeout errors to users:
+
+```python
+TIMEOUT_MESSAGES = {
+    "quick_lookup": "I wasn't able to find that quickly. Please try again.",
+    "research":     "This research task is taking longer than expected. Try a more specific question.",
+    "code_gen":     "Code generation timed out. Try breaking the task into smaller steps.",
+    "default":      "This is taking longer than expected. Please try again.",
+}
+```
+
+## Related Sections
+
+- [19.1 Retries](./191-retries) — what happens after a timeout (retry the request)
+- [19.3 Circuit Breakers](./193-circuit-breakers) — stopping retries when a whole provider is degraded
+- [19.6 Graceful Degradation](./196-graceful-degradation) — what to return when a timeout is the final failure

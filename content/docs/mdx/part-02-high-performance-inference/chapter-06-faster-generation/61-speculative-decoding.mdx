@@ -5,5 +5,163 @@ lastUpdatedDate: '2026-08-05'
 
 # 6.1 Speculative Decoding
 
-This section covers the details of 6.1 Speculative Decoding.
+The serial nature of autoregressive generation is a hard constraint: you can't generate token N+1 until you have token N. Speculative decoding is a clever workaround — it doesn't eliminate the serial dependency, but it exploits the fact that **verification is parallelizable** even if generation isn't.
 
+## The Core Insight
+
+Generating one token with a large model takes T milliseconds (one full forward pass). Verifying whether N proposed tokens are correct also takes approximately T milliseconds — because verification is a single parallel forward pass over all N positions simultaneously.
+
+If you can propose N tokens cheaply (using a small model), then verify them all in one pass of the large model, you get approximately N tokens for the cost of 1 large-model forward pass.
+
+```
+Without speculative decoding:
+  Generate 1 token:  1 large model forward pass
+  Generate 4 tokens: 4 large model forward passes
+
+With speculative decoding (γ=4 draft tokens):
+  Propose 4 tokens:  4 small model forward passes (cheap)
+  Verify 4 tokens:   1 large model forward pass
+  Accept/reject:     some number accepted (typically 2–4 of 4)
+```
+
+Expected throughput: 2–4× faster, depending on draft acceptance rate.
+
+## How the Algorithm Works
+
+```
+Input: current generated sequence so far
+
+Step 1 — Draft:
+  Run the small (draft) model autoregressively for γ steps
+  Produce γ draft tokens: [d₁, d₂, d₃, d₄]
+  Record the draft model's probabilities: p_draft(dᵢ)
+
+Step 2 — Verify:
+  Run the large (target) model on the sequence + all γ draft tokens IN ONE PASS
+  Get target model's probability distributions at each position
+  Extract: p_target(d₁), p_target(d₂), p_target(d₃), p_target(d₄)
+
+Step 3 — Accept/Reject:
+  For each draft token dᵢ:
+    acceptance_prob = min(1, p_target(dᵢ) / p_draft(dᵢ))
+    if random() < acceptance_prob:
+        accept dᵢ → move to next
+    else:
+        reject dᵢ → sample a corrected token from target model, STOP
+  
+  After last accepted token: sample one more from target model
+
+Step 4 — Append all accepted tokens to the sequence, repeat
+```
+
+The key property: **this produces exactly the same distribution as pure large-model sampling**. The rejection sampling step ensures the output statistics match the target model precisely. No quality loss — just speed.
+
+## Why the Output Distribution Is Preserved
+
+The acceptance criterion `min(1, p_target(d) / p_draft(d))` comes from rejection sampling theory:
+
+- If the target model agrees with the draft (`p_target ≥ p_draft`): always accept
+- If the target model disagrees (`p_target < p_draft`): accept proportionally
+- The correction step (sampling from the residual distribution) ensures no tokens are systematically over- or under-represented
+
+After correction, the generated sequence distribution is identical to what you'd get with the large model alone. You can verify this mathematically — it's a well-established result in statistics.
+
+## Draft Acceptance Rate
+
+The speedup depends entirely on how often the target model accepts the draft model's proposals:
+
+```
+Acceptance rate α = average fraction of draft tokens accepted per verification
+
+Effective tokens per large-model step = γ × α + 1  (the +1 is the corrected token)
+
+Examples:
+  γ=5, α=0.8: ~5 tokens per large-model step (vs 1 normally) → 5× speedup
+  γ=5, α=0.5: ~3.5 tokens per large-model step → 3.5× speedup
+  γ=5, α=0.2: ~2 tokens per large-model step → 2× speedup
+```
+
+Higher acceptance rate → better speedup. The draft model's quality directly determines the speedup.
+
+## Requirements for Draft and Target Models
+
+For speculative decoding to work correctly:
+
+1. **Same tokenizer / vocabulary**: the draft token IDs must correspond to the same tokens as the target model
+2. **Same architectures not required**: they just need to share vocabulary
+3. **Draft must be significantly smaller**: typically 10–20× smaller so that γ draft steps are faster than 1 target step
+
+Common production pairs:
+
+| Target model | Draft model | Typical speedup |
+|---|---|---|
+| Llama-3-70B | Llama-3-8B | 2–3× |
+| Llama-3-8B | Llama-3.2-1B | 1.5–2.5× |
+| Claude Sonnet | Internal draft heuristic | ~2× |
+| GPT-4o | Internal speculative mechanism | ~2× (unconfirmed) |
+
+## Speculative Decoding with vLLM
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-70B-Instruct \
+    --speculative-model meta-llama/Meta-Llama-3-8B-Instruct \
+    --num-speculative-tokens 5 \   # γ = 5 draft tokens per step
+    --tensor-parallel-size 4        # 70B needs multiple GPUs
+```
+
+```python
+# Test it with the OpenAI-compatible API
+import openai
+
+client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="none")
+
+response = client.chat.completions.create(
+    model="meta-llama/Meta-Llama-3-70B-Instruct",
+    messages=[{"role": "user", "content": "Explain transformers in 3 paragraphs."}],
+    max_tokens=512,
+)
+
+# Speed is measured transparently — speculative decoding is enabled server-side
+```
+
+## When Speculative Decoding Helps Most
+
+Speculative decoding provides the largest speedup when:
+
+1. **Draft acceptance rate is high**: simple, repetitive, or predictable tasks (code generation, template filling, summarization)
+2. **Output is long**: more decode steps = more opportunity for speculation
+3. **Single-user or small batch**: at large batch sizes, the GPU is already well-utilized and speculation adds overhead
+
+It's less effective when:
+- Output is highly creative/random (draft model guesses wrong often)
+- Batch size is already large (verification overhead reduces gain)
+- The draft model shares a vocabulary but produces very different distributions
+
+## Memory Overhead
+
+Running both draft and target models simultaneously requires memory for both:
+
+```
+Example: 70B + 8B speculative decoding
+
+70B fp16 weights:  ~140 GB (2× A100 80GB)
+8B fp16 weights:   ~16 GB  (fits on same GPUs)
+KV cache (both):   ~same as before, draft cache is small
+
+Total: ~156 GB vs 140 GB for target alone
+Overhead: ~11%
+```
+
+The draft model's KV cache and weights add modest overhead. On the same hardware (if it fits), this overhead is worth it for 2–4× speedup.
+
+## Summary
+
+- Speculative decoding: a small draft model proposes γ tokens, the large target model verifies them in one parallel pass
+- Verification is parallel — N tokens can be verified in ~1 forward pass cost
+- Acceptance rate α determines speedup: ~(γ×α + 1) tokens per large-model step
+- Guaranteed no quality loss — the output distribution is provably identical to pure large-model sampling
+- Requirements: shared vocabulary, draft model 10–20× smaller
+- Common pairs: Llama-3-70B + Llama-3-8B, Llama-3-8B + Llama-3.2-1B
+- Typical speedup: 2–4× for common tasks (summarization, code, factual Q&A)
+- vLLM: `--speculative-model` and `--num-speculative-tokens` flags

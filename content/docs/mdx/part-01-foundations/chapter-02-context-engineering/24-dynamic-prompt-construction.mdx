@@ -5,5 +5,130 @@ lastUpdatedDate: '2026-08-05'
 
 # 2.4 Dynamic Prompt Construction
 
-This section covers the details of 2.4 Dynamic Prompt Construction.
+A static system prompt is fine for demos. In production, the context window needs to be built fresh on every request — pulling in the right user data, the right documents, the right memories, assembled in the right order.
 
+Dynamic prompt construction is the engineering discipline of treating prompts like code: assembled programmatically, not hardcoded as strings.
+
+---
+
+## The Problem with Hardcoded Prompts
+
+Imagine you hardcode this prompt:
+
+```python
+SYSTEM_PROMPT = """
+You are Atlas, an AI engineering assistant.
+The user is working on project X.
+Here are the relevant docs: [paste 50 pages of docs here]
+"""
+```
+
+This works fine until:
+- A different user logs in (wrong project context)
+- The docs are updated (stale information)
+- The context overflows the token limit
+- You need different behavior for different task types
+
+Hardcoded prompts scale to exactly one user, one project, one moment in time.
+
+---
+
+## The `build_system_prompt()` Pattern
+
+The solution is a function that assembles the prompt at request time from its component parts:
+
+```python
+def build_system_prompt(
+    user: UserProfile,
+    session: SessionState,
+    retrieved_docs: list[str],
+    memory: list[str],
+    task_type: str,
+) -> str:
+    identity = load_identity_block(task_type)
+    instructions = load_instruction_block(task_type)
+    
+    context_parts = []
+    if user:
+        context_parts.append(f"User: {user.name}, {user.role}")
+    if session.summary:
+        context_parts.append(f"Session summary: {session.summary}")
+    if retrieved_docs:
+        doc_block = "\n\n".join(retrieved_docs[:3])  # top 3 only
+        context_parts.append(f"Relevant documentation:\n{doc_block}")
+    if memory:
+        context_parts.append(f"Known preferences:\n" + "\n".join(memory))
+    
+    context_block = "\n".join(context_parts)
+    output_format = load_output_format(task_type)
+    
+    return f"{identity}\n\n{instructions}\n\n{context_block}\n\n{output_format}"
+```
+
+Every call to `build_system_prompt()` produces a prompt tailored to the exact state of that request. Nothing is stale. Nothing is hardcoded. The logic is testable.
+
+---
+
+## Context Injection: What Gets Pulled In
+
+Three main sources feed into the dynamic context:
+
+**User Profile**
+Account data, preferences, past behavior, skill level. Pulled from your user store at request time. Tells the model *who* it's talking to.
+
+**Session History**
+A compressed summary of the current conversation. Not the raw message list (that would overflow the context) but a distillation of what's been established so far.
+
+**Retrieved Documents**
+Chunks from your vector database, most relevant to the current query. The retrieval system runs first; its top results get injected here.
+
+The key constraint: **everything injected costs tokens**. You need a token budget manager that decides what gets included when you're close to the limit.
+
+```python
+def fit_to_budget(
+    components: list[tuple[str, str]],  # (label, content)
+    max_tokens: int,
+    tokenizer,
+) -> str:
+    result = []
+    used = 0
+    for label, content in components:
+        tokens = len(tokenizer.encode(content))
+        if used + tokens > max_tokens:
+            break
+        result.append(content)
+        used += tokens
+    return "\n\n".join(result)
+```
+
+---
+
+## The Chain-of-Density Pattern
+
+One practical technique for fitting more information into the context window is progressive summarization, implemented in `atlas-agents/ch02_prompt_architecture/online/chain_of_density_prompt.py`.
+
+The idea: instead of giving the model a raw document, you summarize it at increasing density levels, then pick the level that fits your token budget.
+
+**Pass 1 — Sparse summary** (high-level, short):
+> "The document describes the API authentication flow."
+
+**Pass 2 — Denser summary** (adds key entities):
+> "The document describes how the `/auth/token` endpoint validates JWT tokens, including expiry handling and refresh logic."
+
+**Pass 3 — Densest summary** (adds mechanisms):
+> "The `/auth/token` endpoint validates JWTs using RS256. Tokens expire after 15 minutes. Refresh tokens last 7 days and are stored in Redis with key `refresh:{user_id}`. Expired refresh tokens trigger re-authentication."
+
+You can tune density based on available tokens. A document that costs 2,000 tokens raw might cost 300 tokens at density level 3 — with 80% of the useful information preserved.
+
+---
+
+## Treating Prompts Like Code
+
+Dynamic prompt construction only pays off if you treat the prompt builder like production code:
+
+- **Unit test it**: assert that `build_system_prompt()` includes expected sections
+- **Log the assembled prompt**: capture what the model actually received for debugging
+- **Version the component blocks**: track changes to identity, instructions, and format blocks separately
+- **Validate token counts**: fail loudly if the assembled prompt exceeds the model's limit
+
+When a prompt-related bug shows up in production, the first question is always "what did the model actually receive?" If you're logging the assembled prompt, you can answer that question in seconds. If you're not, you're guessing.

@@ -5,5 +5,212 @@ lastUpdatedDate: '2026-08-05'
 
 # 11.8 Multi-Model Pipelines
 
-This section covers the details of 11.8 Multi-Model Pipelines.
+The most cost-effective production architecture isn't "one model for everything" — it's different models for different stages of the same pipeline. Each stage uses the cheapest model that reliably handles its specific task.
 
+## The Stage-Based Model Assignment
+
+From `atlas-agents` across multiple chapters:
+
+| Stage | Model | Why |
+|---|---|---|
+| Intent classification | Claude Haiku | Simple classification — Haiku is sufficient |
+| Safety guardrails | Claude Haiku | Fast, cheap — runs on every request |
+| Memory extraction | Claude Haiku | Pattern extraction — straightforward task |
+| Quick summarization | Gemini Flash | Fast, good at summarization |
+| Main agent response | Claude Sonnet | Core capability — needs reliable performance |
+| Complex reasoning | Claude Opus | Reserved for tasks that genuinely need it |
+
+## Memory Pipeline: Haiku for Extraction
+
+From `atlas-agents/ch11_memory/memory_agent.py` — Haiku extracts memories from each conversation turn. This happens after every turn, so cost matters:
+
+```python
+from anthropic import Anthropic
+from pydantic import BaseModel
+
+client = Anthropic()
+
+class MemoryExtraction(BaseModel):
+    memories: list[str]         # Extracted facts/preferences
+    should_remember: bool       # Is there anything worth storing?
+
+def extract_memories(conversation_turn: str) -> MemoryExtraction:
+    """
+    Extract memorable facts from a conversation turn.
+    Uses Haiku — runs after EVERY turn, so must be cheap.
+    """
+    response = client.messages.create(
+        model="claude-haiku-4-5",   # Fast, cheap — critical for per-turn use
+        max_tokens=256,
+        messages=[{
+            "role": "user",
+            "content": f"""Extract any facts, preferences, or context worth remembering from this conversation turn.
+If there's nothing worth storing, set should_remember to false.
+
+Turn: {conversation_turn}
+
+Respond in JSON: {{"should_remember": bool, "memories": ["fact 1", "fact 2", ...]}}"""
+        }]
+    )
+    import json
+    data = json.loads(response.content[0].text)
+    return MemoryExtraction(**data)
+```
+
+## Guardrails Pipeline: Haiku for Safety Checks
+
+Safety checks run before the main agent — they add to the perceived latency. Haiku at ~300ms is the right choice:
+
+```python
+def guardrail_pipeline(user_input: str) -> dict:
+    """
+    Three-layer guardrail, using Haiku for the LLM-based layers.
+    Layer 1: regex (~1ms)
+    Layer 2: Haiku safety check (~300ms)
+    Layer 3: Haiku PII check (~300ms) — run in parallel with layer 2
+    """
+    import asyncio
+
+    # Layer 1: Instant regex check
+    if check_regex_blocklist(user_input):
+        return {"safe": False, "reason": "blocked_pattern", "pii": False}
+
+    # Layers 2 & 3: Run in parallel (both use Haiku)
+    async def parallel_checks():
+        safety_task = asyncio.create_task(haiku_safety_check(user_input))
+        pii_task    = asyncio.create_task(haiku_pii_check(user_input))
+        return await asyncio.gather(safety_task, pii_task)
+
+    safety, pii = asyncio.run(parallel_checks())
+    return {"safe": safety["safe"], "reason": safety.get("reason"), "pii": pii["detected"]}
+```
+
+## Main Agent: Sonnet for the Core Response
+
+The main agent response uses Claude Sonnet — reliable, capable, cost-effective for production:
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic()
+
+def main_agent_response(
+    messages: list,
+    tools: list,
+    memories: list[str],
+) -> str:
+    """
+    Main agent response using Sonnet.
+    Incorporates memories extracted by Haiku.
+    """
+    system = "You are a helpful AI assistant."
+    if memories:
+        system += f"\n\nContext from previous conversations:\n" + "\n".join(f"- {m}" for m in memories)
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",  # Standard tier for main response
+        max_tokens=2048,
+        system=system,
+        messages=messages,
+        tools=tools,
+    )
+    return response.content[0].text
+```
+
+## The DSPy Compiled Pipeline
+
+From `atlas-agents/ch07_model_portability/online/dspy_agent_pipeline.py`:
+
+```python
+import dspy
+
+# Configure each model tier
+sonnet = dspy.LM("anthropic/claude-sonnet-4-6")
+haiku  = dspy.LM("anthropic/claude-haiku-4-5")
+
+class ResearchAnswer(dspy.Signature):
+    """Answer a research question with detailed analysis and citations."""
+    question: str = dspy.InputField()
+    answer:   str = dspy.OutputField(desc="Detailed answer with cited sources")
+    sources:  list[str] = dspy.OutputField(desc="Source citations")
+
+class FactCheck(dspy.Signature):
+    """Verify factual accuracy of the provided answer."""
+    answer:   str  = dspy.InputField()
+    verified: bool = dspy.OutputField(desc="True if claims are factually sound")
+    concerns: str  = dspy.OutputField(desc="Specific factual concerns, or 'none'")
+
+class ResearchPipeline(dspy.Module):
+    """
+    Two-stage pipeline:
+    - Sonnet: deep research with chain-of-thought
+    - Haiku:  fast fact verification
+    """
+    def __init__(self):
+        with dspy.context(lm=sonnet):
+            self.researcher = dspy.ChainOfThought(ResearchAnswer)
+
+        with dspy.context(lm=haiku):
+            self.fact_checker = dspy.Predict(FactCheck)
+
+    def forward(self, question: str) -> dspy.Prediction:
+        # Stage 1: Sonnet does thorough research
+        research = self.researcher(question=question)
+
+        # Stage 2: Haiku verifies the claims quickly
+        verification = self.fact_checker(answer=research.answer)
+
+        return dspy.Prediction(
+            answer=research.answer,
+            sources=research.sources,
+            verified=verification.verified,
+            concerns=verification.concerns,
+        )
+
+pipeline = ResearchPipeline()
+result = pipeline(question="What are the key differences between RAG and fine-tuning for LLMs?")
+```
+
+The pipeline uses two models, but the interface is a single function call. DSPy handles the stage orchestration and can optimize prompts for each model independently.
+
+## Handoff Summarization: Flash for Brevity
+
+When an agent hands off context to another agent or stores conversation state, a quick summarization step prevents context accumulation:
+
+```python
+from google import genai
+from google.genai import types
+
+gemini_client = genai.Client()
+
+def summarize_for_handoff(conversation_history: list[dict]) -> str:
+    """
+    Summarize conversation history before a handoff.
+    Uses Gemini Flash — fast, good at summarization, cheap.
+    """
+    history_text = "\n".join(
+        f"{m['role'].upper()}: {m['content']}"
+        for m in conversation_history
+    )
+
+    response = gemini_client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=f"Summarize the key context from this conversation in 3-5 bullet points:\n\n{history_text}",
+        config=types.GenerateContentConfig(max_output_tokens=256),
+    )
+    return response.text
+```
+
+## Cost Comparison
+
+For a pipeline handling 1,000 requests/day:
+
+| Single-model approach | Multi-model approach |
+|---|---|
+| All Sonnet: $3.00/day | Haiku guardrails: $0.30/day |
+| | Haiku memory: $0.20/day |
+| | Flash summarization: $0.15/day |
+| | Sonnet main response: $2.10/day |
+| **Total: $3.00/day** | **Total: $2.75/day + better architecture** |
+
+The cost savings are modest at 1K req/day. At 1M req/day, the difference is $750 vs $2,750 per day. Multi-model pipelines also improve latency by running fast guardrails in parallel with the main request preparation.

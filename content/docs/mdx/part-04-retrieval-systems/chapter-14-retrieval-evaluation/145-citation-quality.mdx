@@ -5,5 +5,210 @@ lastUpdatedDate: '2026-08-05'
 
 # 14.5 Citation Quality
 
-This section covers the details of 14.5 Citation Quality.
+A citation is only valuable if the cited source actually supports the claim being made. A system that generates confident-sounding citations to irrelevant documents is arguably worse than a system with no citations at all — it creates false trust.
 
+Citation quality measures two things: are the citations accurate (precision), and are all claims that should be cited actually cited (recall)?
+
+## Why Citation Quality Is Distinct from Attribution
+
+Attribution (section 14.4) measures *whether* a source was assigned to a claim. Citation quality measures *whether that assignment was correct*. The distinction:
+
+- **Attribution:** "Sentence 2 is attributed to Document 3." ← did the system make an assignment?
+- **Citation quality:** "Does Document 3 actually support the claim in Sentence 2?" ← is the assignment correct?
+
+You can have perfect attribution coverage (every sentence has a citation) while having terrible citation quality (most citations are wrong).
+
+## Citation Precision
+
+**Citation precision** = fraction of citations that are accurate (the cited source actually supports the claim).
+
+```python
+def evaluate_citation_precision(
+    answer_with_citations: list[dict],  # [{"sentence": "...", "cited_doc_id": "doc_3"}]
+    document_store: dict,               # doc_id → content
+    llm
+) -> float:
+    """
+    For each cited claim, verify the cited document actually supports it.
+    """
+    scores = []
+
+    for item in answer_with_citations:
+        if not item.get("cited_doc_id"):
+            continue  # skip uncited sentences
+
+        sentence = item["sentence"]
+        cited_doc = document_store.get(item["cited_doc_id"], "")
+
+        verification_prompt = f"""
+        Claim: "{sentence}"
+        
+        Cited source: "{cited_doc[:500]}"
+        
+        Does the cited source directly support or contain evidence for this specific claim?
+        
+        Answer YES only if the source explicitly supports this specific claim.
+        Answer NO if the source:
+        - Mentions the topic but doesn't support this specific claim
+        - Is related but doesn't contain the specific information claimed
+        - Contradicts the claim
+        
+        Answer: YES or NO only.
+        """
+
+        answer = llm.invoke(verification_prompt).content.strip()
+        scores.append(1 if answer == "YES" else 0)
+
+    return sum(scores) / len(scores) if scores else 0.0
+```
+
+## Citation Recall
+
+**Citation recall** = fraction of claims that *should* have citations and *do* have citations.
+
+```python
+def evaluate_citation_recall(
+    answer_sentences: list[str],
+    citations: dict[str, str],  # sentence → cited_doc_id
+    retrieved_docs: list[dict],
+    llm
+) -> float:
+    """
+    For each factual claim in the answer, check if it should be cited
+    and if it actually is cited.
+    """
+    should_cite_count = 0
+    actually_cited_count = 0
+
+    for sentence in answer_sentences:
+        # Determine if this sentence makes a factual claim that requires citation
+        needs_citation_prompt = f"""
+        Does this sentence make a specific factual claim that requires a source citation?
+        
+        Sentence: "{sentence}"
+        
+        Answer YES for: specific numbers, dates, proper nouns, policies, 
+                        technical specifications, statistics
+        Answer NO for: general knowledge, hedged statements, questions, transitions
+        
+        Answer YES or NO only.
+        """
+        needs_citation = llm.invoke(needs_citation_prompt).content.strip() == "YES"
+
+        if needs_citation:
+            should_cite_count += 1
+            if sentence in citations and citations[sentence]:
+                actually_cited_count += 1
+
+    if should_cite_count == 0:
+        return 1.0  # no factual claims → perfect recall by definition
+
+    return actually_cited_count / should_cite_count
+```
+
+## Real-World Failure Modes
+
+### 1. The Topic-but-Not-the-Claim Failure
+
+The most common citation error: citing a document that *mentions the topic* but doesn't *support the specific claim*.
+
+**Claim:** "The refund window is 30 days."
+**Cited document excerpt:** "Our refund policy is designed to be customer-friendly and flexible."
+
+The document is about refunds but doesn't say 30 days. This citation misleads users into thinking the claim is verified when it isn't.
+
+### 2. The Off-By-One Index Bug
+
+A common engineering bug: the citation index is off by one because the document list was 0-indexed in storage but 1-indexed in the prompt.
+
+```python
+# Bug: document 0 in list is cited as [1], document 1 as [2], etc.
+# But the prompt shows them as [1], [2]...
+# If the LLM says cite [1], you need documents[0], not documents[1]
+
+# Correct: use 0-indexed in code, 1-indexed in prompt, convert back
+def get_cited_doc(citation_index: int, documents: list) -> dict:
+    """citation_index is 1-based as shown to the LLM."""
+    zero_based = citation_index - 1
+    if 0 <= zero_based < len(documents):
+        return documents[zero_based]
+    raise ValueError(f"Citation index {citation_index} out of range (have {len(documents)} docs)")
+```
+
+### 3. Citing When No Retrieval Was Done
+
+When retrieval fails silently or the system falls back to generation without retrieval, the model may still output citation markers — but they point to nothing. Always validate that the cited document ID exists in the retrieved set.
+
+```python
+def validate_citations(answer_citations: list[dict], retrieved_doc_ids: set[str]) -> list[dict]:
+    """Strip any citations that reference documents not in the retrieved set."""
+    validated = []
+    for item in answer_citations:
+        if item.get("cited_doc_id") and item["cited_doc_id"] not in retrieved_doc_ids:
+            # Citation references a document that wasn't retrieved — strip it
+            item = {**item, "cited_doc_id": None, "citation_warning": "referenced doc not in retrieved set"}
+        validated.append(item)
+    return validated
+```
+
+### 4. Hallucinated Document Titles
+
+When the system asks the LLM to generate answer + citations in one pass, the LLM may invent plausible-sounding document titles:
+
+**Output:** "According to the *Employee Benefits Guide 2024* [1]..."
+**Reality:** No document with that title was retrieved. The LLM fabricated both the title and the citation.
+
+**Defense:** Never let the LLM generate source metadata. Inject source titles into the prompt and require the LLM to reference only indices:
+
+```python
+# Good: LLM uses indices, you look up metadata
+system_prompt = """
+When citing sources, use only the numbered format [1], [2], etc.
+Only cite sources that are explicitly provided in the documents list.
+Never invent or paraphrase document titles.
+"""
+```
+
+## A Complete Citation Quality Dashboard
+
+```python
+def citation_quality_report(test_cases: list[dict]) -> dict:
+    precision_scores = []
+    recall_scores = []
+
+    for case in test_cases:
+        precision = evaluate_citation_precision(
+            case["attributed_sentences"],
+            case["document_store"],
+            llm
+        )
+        recall = evaluate_citation_recall(
+            case["sentences"],
+            case["citations"],
+            case["retrieved_docs"],
+            llm
+        )
+        precision_scores.append(precision)
+        recall_scores.append(recall)
+
+    avg_precision = sum(precision_scores) / len(precision_scores)
+    avg_recall = sum(recall_scores) / len(recall_scores)
+    f1 = 2 * avg_precision * avg_recall / (avg_precision + avg_recall)
+
+    return {
+        "citation_precision": avg_precision,
+        "citation_recall": avg_recall,
+        "citation_f1": f1,
+        "samples_evaluated": len(test_cases)
+    }
+```
+
+Target benchmarks for a production citation system:
+
+| Metric | Minimum acceptable | Target |
+|---|---|---|
+| Citation precision | 0.80 | 0.92+ |
+| Citation recall | 0.70 | 0.85+ |
+| Citation F1 | 0.75 | 0.88+ |
+
+Below minimum thresholds, the citation system actively misleads users and should be disabled until fixed.

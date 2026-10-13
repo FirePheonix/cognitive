@@ -5,5 +5,214 @@ lastUpdatedDate: '2026-08-05'
 
 # 11.1 Router Architectures
 
-This section covers the details of 11.1 Router Architectures.
+A router sits in front of your model pool and decides which model handles each request. The decision can be as simple as a token-count check or as sophisticated as a learned classifier. The goal is always the same: match request complexity to model capability while minimizing cost and latency.
 
+## Three Router Types
+
+### 1. Rule-Based Router
+
+Hardcoded rules that map request characteristics to models. No ML, no inference overhead.
+
+```python
+def rule_based_route(request: str, context_length: int) -> str:
+    """Returns the model identifier to use for this request."""
+
+    # Context length routing
+    if context_length > 100_000:
+        return "gemini-1.5-pro"   # Long context specialist
+
+    # Task type routing (keyword-based)
+    request_lower = request.lower()
+    if any(kw in request_lower for kw in ["classify", "categorize", "is this", "yes or no"]):
+        return "claude-haiku-4-5"  # Simple classification
+
+    if any(kw in request_lower for kw in ["write code", "debug", "implement", "function"]):
+        return "claude-sonnet-4-6"  # Code tasks
+
+    if any(kw in request_lower for kw in ["reason through", "step by step", "prove", "analyze"]):
+        return "claude-opus-4-5"   # Complex reasoning
+
+    # Default
+    return "gpt-4o"
+```
+
+Rule-based routing is fast (~0ms overhead), transparent, and easy to debug. Its weakness: rigid rules miss nuance and require manual maintenance as your task distribution changes.
+
+### 2. Classification-Based Router
+
+A small model classifies each request and routes based on the predicted complexity tier:
+
+```python
+from enum import Enum
+
+class ComplexityTier(Enum):
+    SIMPLE = "simple"       # Classification, extraction, yes/no
+    STANDARD = "standard"   # Summarization, drafting, QA
+    COMPLEX = "complex"     # Multi-step reasoning, code generation
+    FRONTIER = "frontier"   # Architecture decisions, novel problems
+
+TIER_TO_MODEL = {
+    ComplexityTier.SIMPLE:   "claude-haiku-4-5",
+    ComplexityTier.STANDARD: "gpt-4o",
+    ComplexityTier.COMPLEX:  "claude-sonnet-4-6",
+    ComplexityTier.FRONTIER: "claude-opus-4-5",
+}
+
+def classify_complexity(request: str, classifier_client) -> ComplexityTier:
+    """Use a cheap model to classify request complexity."""
+    response = classifier_client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=20,
+        messages=[{
+            "role": "user",
+            "content": f"""Classify this request complexity. 
+Reply with exactly one word: simple, standard, complex, or frontier.
+
+Request: {request}"""
+        }]
+    )
+    tier_str = response.content[0].text.strip().lower()
+    try:
+        return ComplexityTier(tier_str)
+    except ValueError:
+        return ComplexityTier.STANDARD  # Default on parse failure
+
+
+def classification_route(request: str, classifier_client) -> str:
+    tier = classify_complexity(request, classifier_client)
+    return TIER_TO_MODEL[tier]
+```
+
+Classification-based routing costs ~$0.001 per call (Haiku) but provides much better routing decisions than static rules. The classifier call adds ~300ms of latency — run it in parallel with request preprocessing.
+
+### 3. Embedding-Based Router
+
+Compute cosine similarity between the request embedding and example embeddings for each route:
+
+```python
+import numpy as np
+from openai import OpenAI
+
+client = OpenAI()
+
+# Pre-computed embeddings for each route
+ROUTE_EXAMPLES = {
+    "haiku": [
+        "Is this email spam?",
+        "Classify the sentiment of this review.",
+        "Extract the date from this text.",
+    ],
+    "sonnet": [
+        "Write a Python function to parse CSV files.",
+        "Summarize this 5-page document.",
+        "Draft a professional email response.",
+    ],
+    "opus": [
+        "Design a distributed system architecture for high availability.",
+        "Analyze the tradeoffs between these three approaches.",
+        "Debug this complex race condition in concurrent code.",
+    ]
+}
+
+def embed(text: str) -> np.ndarray:
+    response = client.embeddings.create(model="text-embedding-3-small", input=text)
+    return np.array(response.data[0].embedding)
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+# Build route centroids (do this at startup, not per-request)
+ROUTE_CENTROIDS = {
+    route: np.mean([embed(ex) for ex in examples], axis=0)
+    for route, examples in ROUTE_EXAMPLES.items()
+}
+
+def embedding_route(request: str) -> str:
+    request_embedding = embed(request)
+    similarities = {
+        route: cosine_similarity(request_embedding, centroid)
+        for route, centroid in ROUTE_CENTROIDS.items()
+    }
+    return max(similarities, key=similarities.get)
+```
+
+Embedding-based routing is the most semantically accurate approach but adds ~200ms for the embedding API call. Best used when you have well-defined route categories with clear semantic boundaries.
+
+## The Circuit-Breaker Router
+
+The circuit-breaker pattern from `atlas-agents/ch07_model_portability/online/model_router.py:137` combines priority ordering with automatic failure detection:
+
+```python
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+
+@dataclass
+class ProviderState:
+    failures: int = 0
+    last_failure: datetime | None = None
+    cooldown_seconds: int = 120
+
+    def is_on_cooldown(self) -> bool:
+        if self.failures < 3:
+            return False
+        if self.last_failure is None:
+            return False
+        return datetime.now() - self.last_failure < timedelta(seconds=self.cooldown_seconds)
+
+    def mark_failed(self):
+        self.failures += 1
+        self.last_failure = datetime.now()
+
+    def mark_succeeded(self):
+        self.failures = 0
+        self.last_failure = None
+
+
+class ModelRouter:
+    def __init__(self, priority_order: list[str]):
+        """
+        priority_order: list of model identifiers in preference order.
+        e.g. ["gpt-4o", "claude-sonnet-4-6", "gemini-flash-2.0", "ollama/llama3:8b"]
+        """
+        self.priority_order = priority_order
+        self.states = {model: ProviderState() for model in priority_order}
+
+    def route(self, messages: list, **kwargs) -> str:
+        for model in self.priority_order:
+            if self.states[model].is_on_cooldown():
+                continue
+
+            try:
+                result = call_model(model, messages, **kwargs)
+                self.states[model].mark_succeeded()
+                return result
+            except Exception:
+                self.states[model].mark_failed()
+                continue
+
+        raise RuntimeError("All providers are on cooldown or failed.")
+
+    def health_report(self) -> dict:
+        return {
+            model: {
+                "on_cooldown": state.is_on_cooldown(),
+                "failures": state.failures,
+            }
+            for model, state in self.states.items()
+        }
+```
+
+Reference: `atlas-agents/ch07_model_portability/online/model_router.py:137`
+
+The `health_report()` method exposes circuit state — useful for monitoring dashboards and alerting.
+
+## Choosing a Router Architecture
+
+| Router type | Latency | Accuracy | Maintenance |
+|---|---|---|---|
+| Rule-based | ~0ms | Low–Medium | High (manual rules) |
+| Classification-based | ~300ms | Medium–High | Low |
+| Embedding-based | ~200ms | High | Medium |
+| Circuit-breaker | ~0ms overhead | N/A (availability) | Low |
+
+In practice, use rule-based for obvious cases (token count), classification-based for general routing, and circuit-breaker for availability. These three work together, not as alternatives.

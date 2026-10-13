@@ -5,5 +5,196 @@ lastUpdatedDate: '2026-08-05'
 
 # 11.4 Quality-Based Routing
 
-This section covers the details of 11.4 Quality-Based Routing.
+Route based on task complexity score. Instead of routing by cost (and hoping quality holds), measure task complexity first, then select the model tier that reliably handles that complexity level.
 
+## Task Complexity Scoring
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class ComplexityScore:
+    score: float          # 0.0 (trivial) to 1.0 (maximal)
+    factors: dict         # What drove the score
+
+def score_complexity(request: str) -> ComplexityScore:
+    """
+    Heuristic complexity scoring — no LLM call needed for this.
+    """
+    factors = {}
+    score = 0.0
+
+    # Factor 1: Length (longer = more context to handle)
+    word_count = len(request.split())
+    length_score = min(word_count / 500, 0.3)  # Max 0.3 from length
+    factors["length"] = length_score
+    score += length_score
+
+    # Factor 2: Structural complexity signals
+    complexity_keywords = [
+        "compare", "analyze", "evaluate", "tradeoffs", "design",
+        "architect", "optimize", "debug", "step by step", "explain why",
+        "however", "on the other hand", "considering all factors",
+    ]
+    keyword_score = min(
+        sum(0.05 for kw in complexity_keywords if kw in request.lower()),
+        0.3  # Max 0.3 from keywords
+    )
+    factors["keywords"] = keyword_score
+    score += keyword_score
+
+    # Factor 3: Code presence
+    if "```" in request or "def " in request or "class " in request:
+        factors["has_code"] = 0.2
+        score += 0.2
+
+    # Factor 4: Multi-part questions
+    question_count = request.count("?")
+    if question_count > 2:
+        factors["multi_question"] = 0.2
+        score += 0.2
+
+    return ComplexityScore(score=min(score, 1.0), factors=factors)
+
+
+def complexity_to_model(score: float) -> str:
+    if score < 0.25:
+        return "claude-haiku-4-5"
+    elif score < 0.5:
+        return "gpt-4o"
+    elif score < 0.75:
+        return "claude-sonnet-4-6"
+    else:
+        return "claude-opus-4-5"
+```
+
+## DSPy: Declarative Routing
+
+DSPy's approach is different: define what each model tier should do, let the optimizer find the right prompts. From `atlas-agents/ch07_model_portability/online/dspy_agent_pipeline.py:142`:
+
+```python
+import dspy
+
+# Configure model tiers
+sonnet = dspy.LM("anthropic/claude-sonnet-4-6")
+haiku  = dspy.LM("anthropic/claude-haiku-4-5")
+
+# Define signatures — what goes in, what comes out
+class ResearchAnswer(dspy.Signature):
+    """Answer a research question with detailed analysis."""
+    question: str = dspy.InputField()
+    answer:   str = dspy.OutputField(desc="Detailed, well-reasoned answer")
+
+class FactCheck(dspy.Signature):
+    """Verify the factual claims in an answer."""
+    answer:    str  = dspy.InputField()
+    is_valid:  bool = dspy.OutputField(desc="True if factually sound")
+    concerns:  str  = dspy.OutputField(desc="Any factual concerns, or 'none'")
+
+# Build the pipeline — different models for different stages
+with dspy.context(lm=sonnet):
+    researcher = dspy.ChainOfThought(ResearchAnswer)  # Complex → Sonnet
+
+with dspy.context(lm=haiku):
+    fact_checker = dspy.Predict(FactCheck)            # Simple check → Haiku
+
+class ResearchPipeline(dspy.Module):
+    def __init__(self):
+        self.researcher   = researcher
+        self.fact_checker = fact_checker
+
+    def forward(self, question: str):
+        # Stage 1: Sonnet does the research
+        research = self.researcher(question=question)
+
+        # Stage 2: Haiku checks the facts
+        check = self.fact_checker(answer=research.answer)
+
+        return dspy.Prediction(
+            answer=research.answer,
+            is_valid=check.is_valid,
+            concerns=check.concerns,
+        )
+```
+
+DSPy can optimize the prompts for each model tier independently — the Haiku prompt doesn't need to be the same as the Sonnet prompt to accomplish its stage of the pipeline.
+
+## What Breaks with Smaller Models
+
+Understanding degradation patterns helps you set routing thresholds correctly:
+
+### 1. Structured Output Degrades First
+
+```python
+# Schema compliance rate by model (example benchmarks)
+SCHEMA_COMPLIANCE = {
+    "claude-haiku-4-5":    0.82,   # Fails on complex nested schemas
+    "gpt-4o":              0.97,
+    "claude-sonnet-4-6":   0.96,
+}
+
+# For structured output tasks, use quality floor of 0.95
+# → Haiku doesn't qualify; use gpt-4o or Sonnet
+```
+
+### 2. Multi-Step Reasoning Compounds Errors
+
+```python
+# Single-step accuracy vs multi-step (each step at ~80% accuracy)
+# n steps: 0.80^n
+
+STEP_COUNT_TO_EXPECTED_ACCURACY = {
+    1: 0.80,
+    2: 0.64,   # 0.80 * 0.80
+    3: 0.51,   # 0.80^3
+    5: 0.33,   # 0.80^5
+}
+```
+
+For chain-of-thought tasks, count the number of reasoning steps. Route to a higher tier when step count > 2.
+
+### 3. Tool Calling Varies by Training
+
+Test each model's tool-calling reliability with your specific tools:
+
+```python
+def benchmark_tool_calling(model: str, tool_schema: dict, test_prompts: list) -> float:
+    """Returns the fraction of prompts that result in a correct tool call."""
+    correct = 0
+    for prompt, expected_args in test_prompts:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                tools=[tool_schema],
+                tool_choice="required",
+            )
+            actual_args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
+            if args_match(actual_args, expected_args):
+                correct += 1
+        except Exception:
+            pass
+    return correct / len(test_prompts)
+```
+
+## The Quality-Based Routing Decision
+
+```python
+def quality_route(request: str, task_type: str) -> str:
+    """Route based on task complexity and known model capabilities."""
+
+    complexity = score_complexity(request)
+
+    # Override complexity score with task-type knowledge
+    if task_type == "structured_output" and complexity.score < 0.5:
+        # Even "simple" structured output needs a capable model
+        complexity = ComplexityScore(score=max(complexity.score, 0.5), factors=complexity.factors)
+
+    if task_type == "tool_calling":
+        # Small models unreliable for tool calling — floor at Standard tier
+        complexity = ComplexityScore(score=max(complexity.score, 0.5), factors=complexity.factors)
+
+    return complexity_to_model(complexity.score)
+```
+
+Use the benchmark results from `atlas-agents/ch07_model_portability/benchmark.py` to set the score thresholds for each task type.

@@ -5,5 +5,111 @@ lastUpdatedDate: '2026-08-05'
 
 # 16.2 Online Evaluation
 
-This section covers the details of 16.2 Online Evaluation.
+Online evaluation samples **real production traffic** and evaluates it. Unlike offline eval, you're not testing against a fixed benchmark — you're testing against the actual distribution of what your users ask.
 
+This catches failure modes that your golden dataset never anticipated.
+
+## The Core Difference
+
+| | Offline Eval | Online Eval |
+|---|---|---|
+| Input source | Fixed golden dataset | Sampled production traffic |
+| Coverage | Known — you designed the cases | Unknown — users surprise you |
+| Reproducibility | Fully reproducible | Probabilistic (sampling) |
+| Speed | Fast (small dataset) | Continuous (always running) |
+| Latency impact | None (pre-deployment) | Minimal (async evaluation) |
+
+## Sampling Strategy
+
+Evaluate **1–5% of production traffic** automatically. Evaluating everything is too expensive. Not evaluating is flying blind.
+
+```python
+import random
+
+def should_evaluate(session_id: str, rate: float = 0.02) -> bool:
+    """Deterministic sampling — same session always gets same decision."""
+    return int(hashlib.md5(session_id.encode()).hexdigest(), 16) % 100 < (rate * 100)
+
+async def handle_request(user_input: str, session_id: str):
+    response = await agent.run(user_input)
+
+    if should_evaluate(session_id):
+        # Async — don't block the user response
+        asyncio.create_task(evaluate_production_sample(
+            input=anonymize(user_input),   # Remove PII before evaluation
+            output=response,
+            session_id=session_id,
+        ))
+
+    return response
+```
+
+**Always remove PII before evaluating.** The anonymized input goes to the LLM judge. The original stays in your secure log store.
+
+## The Evaluation Pass
+
+```python
+async def evaluate_production_sample(input: str, output: str, session_id: str):
+    result = await llm_judge(
+        question=input,
+        agent_answer=output,
+        reference_facts=[],  # No golden reference — judge on general quality
+    )
+
+    await store_online_eval_result(OnlineEvalResult(
+        session_id=session_id,
+        judge_score=result["score"],
+        hallucinated=result["hallucinated"],
+        timestamp=datetime.utcnow(),
+    ))
+
+    if result["score"] <= 2 or result["hallucinated"]:
+        await flag_for_human_review(session_id, reason="low_judge_score")
+```
+
+Low-scoring responses get flagged for human review. This creates a continuous feedback loop: production surfacing real failures → human validation → new golden dataset cases → improved eval suite.
+
+## LangSmith Integration
+
+LangSmith traces every production call automatically. Online evaluation becomes an additional pass over existing traces:
+
+```python
+from langsmith import Client
+
+ls_client = Client()
+
+def run_online_eval_pass(project: str, sample_rate: float = 0.02):
+    # Fetch recent traces
+    runs = ls_client.list_runs(
+        project_name=project,
+        start_time=datetime.utcnow() - timedelta(hours=1),
+        limit=1000,
+    )
+
+    sampled = [r for r in runs if should_evaluate(r.id, sample_rate)]
+
+    for run in sampled:
+        judge_result = llm_judge(
+            question=run.inputs.get("input", ""),
+            agent_answer=run.outputs.get("output", ""),
+            reference_facts=[],
+        )
+        ls_client.create_feedback(
+            run_id=run.id,
+            key="llm_judge_score",
+            score=judge_result["score"] / 5.0,
+        )
+```
+
+## Monitoring Online Eval Metrics
+
+Track these metrics on a daily rolling window:
+
+| Metric | Alert threshold |
+|---|---|
+| Average judge score | < 3.0 (was ≥ 3.5 last week) |
+| Hallucination rate | > 10% |
+| Low-score rate (≤ 2) | > 15% |
+| Flagged-for-review rate | > 20% |
+
+A spike in any metric means something changed — a new user pattern, a model degradation, or a prompt regression. Investigate immediately.

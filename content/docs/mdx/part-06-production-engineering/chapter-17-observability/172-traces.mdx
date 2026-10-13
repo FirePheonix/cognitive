@@ -5,5 +5,124 @@ lastUpdatedDate: '2026-08-05'
 
 # 17.2 Traces
 
-This section covers the details of 17.2 Traces.
+A trace is the complete record of one agent run — from the moment the user's message arrives to the moment the final response is returned, including every LLM call and every tool execution in between.
 
+Traces answer the question: **"What did the agent actually do?"**
+
+## Trace Structure
+
+A trace is a tree of spans. The root span is the entire request. Each LLM call and tool execution is a child span:
+
+```
+Trace: session_abc123  (2,885ms total)
+│
+├── Span: agent_run  (2,885ms)
+│   ├── Span: llm_call  (142ms)  ← "decide which tool to use"
+│   │   ├── input: user message
+│   │   ├── output: tool_call{search_web}
+│   │   └── tokens: 1,204
+│   │
+│   ├── Span: tool_execution  (891ms)  ← "search_web"
+│   │   ├── input: {query: "..."}
+│   │   └── output: [5 results]
+│   │
+│   ├── Span: llm_call  (203ms)  ← "process results, decide next step"
+│   │   ├── input: [search results]
+│   │   ├── output: tool_call{fetch_url}
+│   │   └── tokens: 3,891
+│   │
+│   ├── Span: tool_execution  (1,204ms)  ← "fetch_url"
+│   │   └── ...
+│   │
+│   └── Span: llm_call  (445ms)  ← "generate final response"
+│       ├── input: [all context]
+│       ├── output: "Here is a summary..."
+│       └── tokens: 6,102
+```
+
+## What a Trace Captures
+
+Each span in the trace should capture:
+
+| Field | Description |
+|-------|-------------|
+| `span_id` | Unique identifier for this span |
+| `parent_id` | Parent span (null for root) |
+| `name` | Human-readable name (`llm_call`, `search_web`, etc.) |
+| `start_time` | ISO 8601 timestamp |
+| `end_time` | ISO 8601 timestamp |
+| `duration_ms` | `end_time - start_time` |
+| `input` | Sanitized input (no credentials, no raw PII) |
+| `output` | Sanitized output |
+| `model` | Model used (if LLM call) |
+| `tokens` | `{input: N, output: N, total: N}` |
+| `status` | `success` \| `error` |
+| `error` | Error message if status is `error` |
+
+## Trace Storage in the Eval Harness
+
+The `EvalCase` trajectory at `atlas-agents/ch18_evaluation/eval_harness.py:330` captures all steps for evaluation:
+
+```python
+@dataclass
+class TrajectoryStep:
+    step: int
+    tool: str
+    input: dict
+    output: str
+    success: bool
+    latency_ms: float
+
+@dataclass
+class EvalCase:
+    case_id: str
+    input: str
+    expected_output: str
+    trajectory: list[TrajectoryStep]   # All steps recorded
+    final_output: str
+    total_tokens: int
+    total_latency_ms: float
+    passed: bool
+```
+
+The trajectory is what makes eval cases reproducible — you can inspect exactly what the agent did on a failing case.
+
+## Sampling Strategy
+
+For high-volume applications, storing 100% of traces is expensive. Common strategies:
+
+| Strategy | Description | Use When |
+|----------|-------------|----------|
+| **100% sampling** | Store every trace | Low volume, critical applications |
+| **Error sampling** | Always store errors, sample successes | High volume production |
+| **Tail sampling** | Store slow/anomalous traces | Performance investigation |
+| **User-triggered** | Store when user reports issue | Cost-sensitive production |
+
+```python
+def should_sample(trace: Trace) -> bool:
+    # Always capture errors
+    if trace.has_error:
+        return True
+    # Always capture slow traces
+    if trace.duration_ms > 5000:
+        return True
+    # Sample 10% of normal traces
+    return random.random() < 0.10
+```
+
+## Trace Retention
+
+| Data Type | Recommended Retention |
+|-----------|----------------------|
+| Error traces | 90 days |
+| Slow traces (>5s) | 30 days |
+| Normal traces | 7 days |
+| Aggregated metrics | 1 year |
+
+Raw traces are large. Compress and aggregate after the short-term retention window.
+
+## Related Sections
+
+- [17.3 Spans](./173-spans) — the individual units of work within a trace
+- [17.10 Agent Tracing](./1710-agent-tracing) — LangSmith for automatic tracing
+- [17.1 Why Observability Matters](./171-why-observability-matters) — the case for tracing

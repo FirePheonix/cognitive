@@ -5,5 +5,172 @@ lastUpdatedDate: '2026-08-05'
 
 # 9.3 Tool Contracts
 
-This section covers the details of 9.3 Tool Contracts.
+A tool contract is the set of rules that make a tool safe and reliable to call from an agent. Without contracts, tools become sources of hard-to-debug failures, security vulnerabilities, and silent data corruption.
 
+There are three rules. All three apply to every tool.
+
+## Rule 1: The Atomic Principle
+
+One tool, one thing, done reliably.
+
+```python
+# Bad — too many responsibilities
+def research_and_summarize(topic: str) -> str:
+    results = search_web(topic)
+    summary = llm_summarize(results)
+    saved_path = save_to_file(summary)
+    return f"Saved summary to {saved_path}"
+
+# Good — separate, atomic tools
+def search_web(query: str) -> str: ...
+def summarize_text(text: str) -> str: ...
+def save_file(path: str, content: str) -> str: ...
+```
+
+Atomic tools are:
+- Easier to test in isolation
+- Safe to retry (failed search doesn't re-save a file)
+- Easier for the model to compose correctly
+- Debuggable when something goes wrong
+
+The model can sequence atomic tools. It cannot un-sequence a combined tool that did half its work before failing.
+
+## Rule 2: Result Architecture
+
+Never return a raw string when failure is possible. Return a structured result:
+
+```python
+from dataclasses import dataclass
+from enum import Enum
+
+class ResultStatus(Enum):
+    SUCCESS = "success"
+    ERROR = "error"
+    PARTIAL = "partial"  # Got something but not everything
+
+@dataclass
+class SkillResult:
+    status: ResultStatus
+    content: str           # The actual result or error message
+    metadata: dict = None  # Optional extra info (execution_time, source, etc.)
+
+    def __str__(self) -> str:
+        if self.status == ResultStatus.ERROR:
+            return f"Error: {self.content}"
+        return self.content
+```
+
+Tools return `SkillResult`. The agent loop checks `status` before using `content`:
+
+```python
+result = registry.execute("read_file", {"path": "data.csv"})
+if result.status == ResultStatus.ERROR:
+    # Tell the model the tool failed, let it decide what to do
+    tool_result_message = f"Error: {result.content}"
+else:
+    tool_result_message = result.content
+```
+
+The model handles errors better when you give it a clear `Error: ...` string than when you raise an exception that causes your agent loop to crash.
+
+## Rule 3: Deterministic Safety
+
+Validate every argument as if it came from an adversarial source — because in an agent system, it effectively did. The model's output is not trusted.
+
+### Path Traversal Prevention
+
+```python
+from pathlib import Path
+
+class FileSkill(Skill):
+    def __init__(self, base_dir: str):
+        self.base_dir = Path(base_dir).resolve()
+
+    def _read(self, path: str) -> str:
+        # Resolve the full path and verify it stays inside base_dir
+        full_path = (self.base_dir / path).resolve()
+
+        if not full_path.is_relative_to(self.base_dir):
+            return "Error: Cannot read files outside the base directory."
+
+        if not full_path.exists():
+            return f"Error: File not found: {path}"
+
+        if not full_path.is_file():
+            return f"Error: Path is not a file: {path}"
+
+        try:
+            return full_path.read_text(encoding="utf-8")
+        except PermissionError:
+            return f"Error: Permission denied: {path}"
+        except Exception as e:
+            return f"Error: Could not read file: {e}"
+```
+
+Reference: `atlas-agents/ch03_tools_and_skills/atlas_v03.py`
+
+The key line: `(self.base_dir / path).resolve()` followed by `is_relative_to(self.base_dir)`. The model might pass `../../etc/passwd` as the path. `.resolve()` normalizes it to an absolute path, and `is_relative_to()` verifies it's within the sandbox.
+
+### Shell Injection Prevention
+
+```python
+import shlex
+import subprocess
+
+class ShellSkill(Skill):
+    ALLOWED_COMMANDS = {"ls", "cat", "grep", "find", "echo"}
+
+    def execute_command(self, command: str, args: list[str]) -> str:
+        # Whitelist approach — only allow specific commands
+        if command not in self.ALLOWED_COMMANDS:
+            return f"Error: Command '{command}' is not allowed."
+
+        # Use list form of subprocess — no shell interpretation
+        try:
+            result = subprocess.run(
+                [command] + args,  # NOT shell=True
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return result.stdout or result.stderr
+        except subprocess.TimeoutExpired:
+            return "Error: Command timed out."
+```
+
+Never use `shell=True` with model-generated arguments. Never use `f"bash -c '{command}'"`. Model-generated shell strings will eventually contain injection attempts.
+
+### SQL Injection Prevention
+
+```python
+import sqlite3
+
+class DatabaseSkill(Skill):
+    def query(self, table: str, filter_col: str, filter_val: str) -> str:
+        # Validate table name against whitelist (can't parameterize table names)
+        allowed_tables = {"users", "products", "orders"}
+        if table not in allowed_tables:
+            return f"Error: Table '{table}' is not accessible."
+
+        # Use parameterized queries for all values
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.execute(
+            f"SELECT * FROM {table} WHERE {filter_col} = ?",  # ? is parameterized
+            (filter_val,)  # Value goes here, never interpolated into the string
+        )
+        return str(cursor.fetchall())
+```
+
+## The Safety Checklist
+
+For every tool, verify:
+
+- [ ] Path inputs: resolved and sandboxed
+- [ ] Command inputs: whitelisted, no `shell=True`
+- [ ] SQL inputs: parameterized queries only
+- [ ] URL inputs: scheme check (only `http`/`https`), no SSRF vectors
+- [ ] File write: check available disk space, validate path
+- [ ] External API calls: timeout set, credentials not logged
+- [ ] Return value: `Error: ...` string on failure, never an exception bubbling up
+
+These aren't theoretical concerns. Agents in production with broad tool access are a target for prompt injection, where malicious content in a tool's *result* tries to hijack subsequent tool calls. Defensive validation on input AND treating tool results with appropriate skepticism are both necessary.

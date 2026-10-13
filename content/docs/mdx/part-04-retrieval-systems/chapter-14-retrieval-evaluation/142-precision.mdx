@@ -5,5 +5,200 @@ lastUpdatedDate: '2026-08-05'
 
 # 14.2 Precision
 
-This section covers the details of 14.2 Precision.
+Where recall measures coverage, precision measures noise. A high-precision retriever returns only the documents that are actually relevant — it doesn't pollute the LLM's context window with irrelevant material.
 
+## Definition: Precision@K
+
+**Precision@K** = (number of relevant documents in top-K results) / K
+
+If you return 5 results and 3 of them are relevant to the query:
+
+```
+Precision@5 = 3 / 5 = 0.60 (60%)
+```
+
+The denominator is always K — the number of results you returned. Precision asks: **of what you returned, how much of it was actually useful?**
+
+## Why Precision Matters
+
+Context windows are finite and expensive. Every irrelevant chunk you inject:
+
+1. **Costs tokens** — you're paying for content that doesn't help.
+2. **Dilutes signal** — relevant information has to compete with noise for the model's attention.
+3. **Increases hallucination risk** — contradictory or off-topic content can confuse the model.
+4. **Reduces answer quality** — empirically, adding irrelevant context degrades LLM performance even when the relevant context is also present.
+
+## Measuring Precision@K
+
+```python
+def precision_at_k(
+    retriever,
+    golden_dataset: list[dict],
+    k: int
+) -> float:
+    precision_scores = []
+
+    for item in golden_dataset:
+        query = item["query"]
+        relevant_ids = set(item["relevant_doc_ids"])
+
+        retrieved_docs = retriever.retrieve(query, k=k)
+        retrieved_ids = [doc.metadata["id"] for doc in retrieved_docs]
+
+        # How many of the K returned docs are relevant?
+        relevant_found = sum(1 for doc_id in retrieved_ids if doc_id in relevant_ids)
+        precision = relevant_found / k
+        precision_scores.append(precision)
+
+    return sum(precision_scores) / len(precision_scores)
+
+# Evaluate precision at each K
+for k in [1, 3, 5, 10]:
+    score = precision_at_k(retriever, golden_dataset, k=k)
+    print(f"Precision@{k}: {score:.3f}")
+
+# Precision@1:  0.712
+# Precision@3:  0.643
+# Precision@5:  0.541
+# Precision@10: 0.387
+```
+
+Note that precision typically decreases as K increases — the more you retrieve, the harder it is for all of it to be relevant.
+
+## The Precision-Recall Tradeoff
+
+Precision and recall pull in opposite directions. Increasing K improves recall (you find more relevant docs) but hurts precision (you also return more irrelevant docs).
+
+```
+         High recall
+              ▲
+              │         ╭──── K=20
+              │     ╭───╯
+              │ ╭───╯ K=10
+              │╭╯ K=5
+              ╰╯ K=1
+              ─────────────────► High precision
+```
+
+The optimal K for a given system depends on:
+- **Context window budget:** how much can you afford to inject?
+- **Model noise tolerance:** how well does your LLM handle irrelevant context?
+- **Query distribution:** are your queries precise or broad?
+
+## Finding the Optimal K
+
+```python
+def find_optimal_k(retriever, golden_dataset: list[dict], f_beta: float = 1.0) -> int:
+    """
+    Find K that maximizes F-beta score.
+    f_beta=1 weights precision and recall equally.
+    f_beta=0.5 weights precision higher (less noise tolerance).
+    f_beta=2 weights recall higher (can't miss anything).
+    """
+    best_k = 1
+    best_score = 0
+
+    for k in range(1, 21):
+        p = precision_at_k(retriever, golden_dataset, k)
+        r = recall_at_k(retriever, golden_dataset, k)
+
+        if p + r == 0:
+            continue
+
+        # F-beta score
+        f_score = (1 + f_beta**2) * (p * r) / ((f_beta**2 * p) + r)
+
+        if f_score > best_score:
+            best_score = f_score
+            best_k = k
+
+    return best_k
+```
+
+## Mean Average Precision (MAP)
+
+MAP accounts for the *ordering* of results, not just how many relevant docs appear in the top K:
+
+```python
+def average_precision(retrieved_ids: list[str], relevant_ids: set[str]) -> float:
+    """Average precision considers rank position of relevant documents."""
+    hits = 0
+    sum_precisions = 0
+
+    for rank, doc_id in enumerate(retrieved_ids, start=1):
+        if doc_id in relevant_ids:
+            hits += 1
+            sum_precisions += hits / rank
+
+    if not relevant_ids:
+        return 0
+
+    return sum_precisions / len(relevant_ids)
+
+def mean_average_precision(retriever, golden_dataset: list[dict], k: int = 10) -> float:
+    aps = []
+    for item in golden_dataset:
+        retrieved = retriever.retrieve(item["query"], k=k)
+        retrieved_ids = [doc.metadata["id"] for doc in retrieved]
+        relevant_ids = set(item["relevant_doc_ids"])
+        aps.append(average_precision(retrieved_ids, relevant_ids))
+    return sum(aps) / len(aps)
+```
+
+MAP rewards retrievers that place relevant documents *higher* in the ranking — not just that they appear somewhere in top K.
+
+## Improving Precision
+
+Reranking is the most effective precision improvement technique — it reorders the retrieved set, pushing relevant documents up and irrelevant ones down.
+
+| Technique | Typical precision improvement |
+|---|---|
+| Cross-encoder reranking | +15–30% |
+| Reduce K (retrieve fewer) | Reduces noise directly |
+| Metadata filtering | High improvement for structured queries |
+| Better chunking | +5–10% |
+| Query-document similarity threshold | Filters low-confidence results |
+
+```python
+def retrieval_with_threshold(query: str, min_score: float = 0.75, k: int = 10) -> list[str]:
+    """Apply a minimum similarity threshold to filter low-confidence results."""
+    results = vector_store.similarity_search_with_score(query, k=k)
+    
+    # Filter out results below the threshold
+    filtered = [
+        doc.page_content
+        for doc, score in results
+        if score >= min_score
+    ]
+    
+    return filtered
+```
+
+Note: similarity score thresholds are embedding-model-specific. Calibrate them against your golden dataset.
+
+## Precision in Production Monitoring
+
+Track precision in production using implicit signals when golden labels are unavailable:
+
+- **Click-through rate** on cited sources (if your system shows citations)
+- **Thumbs down / negative feedback** rate correlated with low-precision retrievals
+- **LLM's own assessment**: occasionally ask the model to rate how relevant the retrieved context was
+
+```python
+def production_precision_proxy(query: str, retrieved_docs: list[str], answer: str) -> float:
+    """Use LLM to assess what fraction of retrieved docs contributed to the answer."""
+    assessment_prompt = f"""
+    Query: {query}
+    Answer generated: {answer}
+    
+    Retrieved documents:
+    {chr(10).join(f'[{i+1}] {doc[:300]}...' for i, doc in enumerate(retrieved_docs))}
+    
+    For each document, did it contribute to the answer?
+    Return JSON: {{"scores": [1, 0, 1, 0, 0]}} (1=contributed, 0=irrelevant)
+    """
+    scores = json.loads(llm.invoke(assessment_prompt).content)["scores"]
+    return sum(scores) / len(scores)
+```
+
+Precision and recall together paint the full picture of retrieval health. Optimize both — they require different interventions.

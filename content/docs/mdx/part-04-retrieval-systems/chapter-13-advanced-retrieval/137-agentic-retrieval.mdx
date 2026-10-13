@@ -5,5 +5,229 @@ lastUpdatedDate: '2026-08-05'
 
 # 13.7 Agentic Retrieval
 
-This section covers the details of 13.7 Agentic Retrieval.
+Traditional RAG is a fixed pipeline: one query goes in, one retrieval pass happens, the result goes to the LLM. Agentic retrieval replaces this with a reasoning loop: the agent decides *when* to retrieve, *what* to retrieve, and *whether to try again* if the initial results are insufficient.
 
+## The Difference in Practice
+
+**Traditional RAG:**
+```
+User query → Embed query → ANN search → Top-K chunks → LLM → Answer
+```
+
+**Agentic RAG:**
+```
+User query → Agent thinks
+           → Decides to retrieve
+           → Evaluates retrieved results
+           → Decides if answer is sufficient
+           → If not: refines query, retrieves again
+           → Eventually synthesizes answer
+```
+
+The agent treats retrieval as a *tool* rather than a fixed pipeline step.
+
+## LlamaIndex ReActAgent with QueryEngineTool
+
+```python
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
+from llama_index.core.tools import QueryEngineTool, ToolMetadata
+from llama_index.core.agent import ReActAgent
+from llama_index.llms.openai import OpenAI
+
+# Build the index
+documents = SimpleDirectoryReader("./knowledge_base").load_data()
+index = VectorStoreIndex.from_documents(documents)
+query_engine = index.as_query_engine(similarity_top_k=5)
+
+# Wrap as a tool the agent can call
+knowledge_tool = QueryEngineTool(
+    query_engine=query_engine,
+    metadata=ToolMetadata(
+        name="knowledge_search",
+        description=(
+            "Search the knowledge base for information. "
+            "Use this when you need to find facts, policies, or documentation. "
+            "Input should be a specific search query."
+        )
+    )
+)
+
+# Create the agentic retrieval agent
+llm = OpenAI(model="gpt-4o", temperature=0)
+agent = ReActAgent.from_tools(
+    [knowledge_tool],
+    llm=llm,
+    max_iterations=6,
+    verbose=True
+)
+
+response = agent.chat("What are the refund conditions for enterprise customers?")
+```
+
+The agent's internal trace:
+
+```
+Thought: I need to search for refund conditions for enterprise customers.
+Action: knowledge_search
+Action Input: {"input": "enterprise customer refund conditions"}
+Observation: [Retrieved chunks about general return policy, no enterprise specifics]
+
+Thought: The results mention general refunds but not enterprise-specific conditions.
+         I should search specifically for enterprise agreements.
+Action: knowledge_search
+Action Input: {"input": "enterprise agreement terms contract refund SLA"}
+Observation: [Retrieved enterprise contract terms with refund clauses]
+
+Thought: Now I have the enterprise-specific refund conditions. I can answer.
+Answer: Enterprise customers are eligible for refunds within 30 days...
+```
+
+## The Retrieve-and-Refine Pattern
+
+The most common agentic retrieval pattern: retrieve, assess quality, refine if insufficient.
+
+```python
+import json
+from openai import OpenAI
+
+client = OpenAI()
+
+def agentic_retrieve(question: str, max_rounds: int = 4) -> str:
+    context_gathered = []
+    search_history = []
+
+    for round_num in range(max_rounds):
+        # Determine next query
+        if round_num == 0:
+            search_query = question
+        else:
+            planning_prompt = f"""
+            Original question: {question}
+            
+            Searches already performed: {json.dumps(search_history)}
+            
+            Context gathered so far:
+            {chr(10).join(context_gathered)}
+            
+            Is the original question fully answerable with the context above?
+            If yes, respond: {{"done": true, "answer": "..."}}
+            If no, respond: {{"done": false, "next_query": "..."}}
+            """
+            decision = json.loads(
+                client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": planning_prompt}]
+                ).choices[0].message.content
+            )
+            
+            if decision["done"]:
+                return decision["answer"]
+            
+            search_query = decision["next_query"]
+
+        # Execute retrieval
+        docs = vector_store.similarity_search(search_query, k=5)
+        context_gathered.extend([d.page_content for d in docs])
+        search_history.append(search_query)
+
+    # Final synthesis with all gathered context
+    return synthesize_final_answer(question, context_gathered)
+```
+
+## RAG-Fusion: Multi-Query Retrieval
+
+RAG-Fusion (Rackauckas, 2023) generates multiple reformulations of the query, retrieves for each, then merges the results using Reciprocal Rank Fusion (RRF).
+
+```python
+def rag_fusion(query: str, num_reformulations: int = 4) -> list[str]:
+    # Step 1: Generate query reformulations
+    reformulation_prompt = f"""
+    Generate {num_reformulations} different versions of this search query.
+    Each version should approach the topic from a different angle.
+    Return as a JSON list of strings.
+    
+    Original query: {query}
+    """
+    reformulations = json.loads(llm.invoke(reformulation_prompt).content)
+    reformulations.append(query)  # include original
+
+    # Step 2: Retrieve for each reformulation
+    all_results: dict[str, list[float]] = {}  # doc_id → list of ranks
+    
+    for q in reformulations:
+        results = vector_store.similarity_search_with_score(q, k=10)
+        for rank, (doc, score) in enumerate(results):
+            doc_id = doc.metadata.get("id", doc.page_content[:50])
+            if doc_id not in all_results:
+                all_results[doc_id] = {"doc": doc, "rrf_score": 0}
+            # Reciprocal Rank Fusion: 1 / (k + rank)
+            all_results[doc_id]["rrf_score"] += 1 / (60 + rank)
+
+    # Step 3: Sort by RRF score and return top documents
+    ranked = sorted(
+        all_results.values(),
+        key=lambda x: x["rrf_score"],
+        reverse=True
+    )
+
+    return [item["doc"].page_content for item in ranked[:5]]
+```
+
+RAG-Fusion is particularly effective for queries where the phrasing matters — it ensures that documents relevant to *any reasonable interpretation* of the query get surfaced.
+
+## Self-Reflective Retrieval
+
+The agent can also evaluate its own retrieval quality and decide whether to accept or retry:
+
+```python
+def self_reflective_retrieve(query: str) -> tuple[list[str], float]:
+    docs = retriever.retrieve(query)
+
+    # Ask the model to assess retrieval quality
+    quality_check = f"""
+    Query: {query}
+    
+    Retrieved documents:
+    {chr(10).join(f'[{i+1}] {d}' for i, d in enumerate(docs))}
+    
+    Rate the retrieval quality 0.0–1.0:
+    - 1.0: Retrieved documents directly answer the query
+    - 0.5: Retrieved documents are somewhat related but incomplete
+    - 0.0: Retrieved documents are unrelated
+    
+    Respond with JSON: {{"score": 0.8, "reason": "..."}}
+    """
+    
+    assessment = json.loads(llm.invoke(quality_check).content)
+    confidence = assessment["score"]
+
+    if confidence < 0.6:
+        # Low quality — try a reformulated query
+        reformulated = reformulate_query(query, docs, assessment["reason"])
+        docs, _ = self_reflective_retrieve(reformulated)  # one retry
+
+    return docs, confidence
+```
+
+## Latency vs Quality Tradeoff
+
+| Retrieval pattern | Avg latency | Answer quality |
+|---|---|---|
+| Single-shot RAG | 150ms | Baseline |
+| Agentic (2 rounds avg) | 400ms | +15–25% |
+| RAG-Fusion (4 queries) | 500ms | +10–20% |
+| Self-reflective (1 retry) | 300–600ms | +10–30% |
+
+Agentic retrieval consistently improves answer quality at the cost of higher latency. The right choice depends on your quality requirements and latency budget.
+
+## When to Use Agentic Retrieval
+
+Use agentic retrieval when:
+- Complex questions that likely require multiple retrieval steps
+- High-stakes answers where quality matters more than speed
+- Domains where the vocabulary gap between user queries and document language is high
+
+Stick with single-shot RAG when:
+- Simple factual lookup questions
+- Latency SLO is tight (< 200ms)
+- High query volume makes per-query reasoning expensive

@@ -2,6 +2,7 @@ import Link from 'next/link';
 import Image from 'next/image';
 import { marked } from 'marked';
 import { createHighlighter } from 'shiki';
+import katex from 'katex';
 import {
   Calendar,
   Check,
@@ -19,6 +20,7 @@ import { docPages, getDocBySlug, type DocPage } from '@/content/docs/docs-server
 import { DocsDesktopToc, DocsMobileToc } from '@/components/docs/toc';
 import { cn } from '@/lib/cn';
 import { MermaidInitializer } from '@/components/mermaid-initializer';
+import { PlotlyInitializer } from '@/components/plotly-initializer';
 import { NotebookBlock } from '@/components/notebook-renderer';
 import { DocAudioPlayer } from '@/components/doc-audio-player';
 
@@ -142,6 +144,7 @@ export default async function DocsPage({ params }: { params: Promise<{ slug?: st
               </span>
             ))}
             <MermaidInitializer html={segments.join('')} />
+            <PlotlyInitializer html={segments.join('')} />
           </div>
 
           <div className="mt-12 border-t pt-6">
@@ -288,6 +291,24 @@ async function renderMarkdown(markdown: string): Promise<{
     if (token.lang === 'mermaid') {
       return `<div class="mermaid">${token.text}</div>`;
     }
+    // Display math block: ```math ... ```
+    if (token.lang === 'math') {
+      try {
+        const html = katex.renderToString(token.text.trim(), {
+          displayMode: true,
+          throwOnError: false,
+          output: 'html',
+        });
+        return `<div class="math-display">${html}</div>`;
+      } catch {
+        return `<pre><code>${token.text}</code></pre>`;
+      }
+    }
+    // Interactive chart block: ```plotly { "recipe": "..." } or raw Plotly JSON
+    if (token.lang === 'plotly') {
+      const escaped = token.text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      return `<div class="plotly-chart not-prose"><script type="application/json">${token.text}</script></div>`;
+    }
     if (token.lang === 'notebook') {
       try {
         const data = JSON.parse(token.text);
@@ -328,7 +349,27 @@ async function renderMarkdown(markdown: string): Promise<{
     return `<div class="shiki-wrapper">${highlighted}</div>`;
   };
 
-  const html = await marked.parse(markdown, { renderer });
+  // Pre-process inline math: $...$ → rendered KaTeX span
+  // Also handles $$...$$ display math written inline (not in code blocks)
+  const processedMarkdown = markdown
+    // $$...$$ display math (inline style, not in code blocks)
+    .replace(/\$\$([^$]+?)\$\$/g, (_match, tex) => {
+      try {
+        return katex.renderToString(tex.trim(), { displayMode: true, throwOnError: false, output: 'html' });
+      } catch {
+        return `$$${tex}$$`;
+      }
+    })
+    // $...$ inline math
+    .replace(/\$([^$\n]+?)\$/g, (_match, tex) => {
+      try {
+        return katex.renderToString(tex.trim(), { displayMode: false, throwOnError: false, output: 'html' });
+      } catch {
+        return `$${tex}$`;
+      }
+    });
+
+  const html = await marked.parse(processedMarkdown, { renderer });
   // Split on sentinel comments → alternating html / notebook slots
   const segments = html.split(/<!--NOTEBOOK:\d+-->/);
   return { segments, notebooks };

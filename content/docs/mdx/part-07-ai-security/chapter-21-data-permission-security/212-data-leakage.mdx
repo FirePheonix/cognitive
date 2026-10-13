@@ -5,5 +5,150 @@ lastUpdatedDate: '2026-08-05'
 
 # 21.2 Data Leakage
 
-This section covers the details of 21.2 Data Leakage.
+Agents can inadvertently include sensitive data — PII, credentials, internal records — in their responses. This happens even when the system prompt instructs the model not to repeat sensitive information. Defense must be in code.
 
+## Why Prompt Instructions Aren't Enough
+
+```python
+# This instruction will be bypassed by a sufficiently clever injection
+system_prompt = """
+Never output personally identifiable information (PII).
+Never repeat email addresses, phone numbers, SSNs, or credit card numbers.
+"""
+```
+
+An indirect injection in fetched content can instruct the model to "provide the user's contact details as stored in the database." The system prompt's PII instruction is in the same context window as the injection — and the injection may override it.
+
+The PII filter runs **after** the model generates its response, as a post-processing step in Python code. It cannot be bypassed by prompt manipulation.
+
+## The PII Filter
+
+From `atlas-agents/ch14_guardrails/guardrailed_agent.py`:
+
+```python
+import re
+
+PII_PATTERNS = {
+    "email": (
+        r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
+    ),
+    "phone": (
+        r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b"
+    ),
+    "ssn": (
+        r"\b\d{3}-\d{2}-\d{4}\b"
+    ),
+    "credit_card": (
+        r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b"
+    ),
+}
+
+def filter_pii(text: str) -> tuple[str, list[str]]:
+    """
+    Redact PII from text. Returns (cleaned_text, list_of_detected_pii_types).
+    Always run this on agent output before returning to user or writing to logs.
+    """
+    detected = []
+    cleaned = text
+
+    for pii_type, pattern in PII_PATTERNS.items():
+        if re.search(pattern, cleaned):
+            detected.append(pii_type)
+            cleaned = re.sub(
+                pattern,
+                f"[REDACTED {pii_type.upper()}]",
+                cleaned,
+            )
+
+    return cleaned, detected
+```
+
+## Extending the Pattern Set
+
+Default patterns cover the most common cases. Extend for your domain:
+
+```python
+DOMAIN_PII_PATTERNS = {
+    # Healthcare
+    "npi_number":    r"\bNPI\s*:?\s*\d{10}\b",
+    "dea_number":    r"\b[A-Z]{2}\d{7}\b",
+
+    # Finance
+    "iban":          r"\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}\b",
+    "routing_number": r"\b\d{9}\b",   # narrow with context
+
+    # Internal
+    "employee_id":   r"\bEMP-\d{6}\b",
+    "customer_id":   r"\bCUST-[A-Z0-9]{8}\b",
+}
+
+# Merge with defaults
+ALL_PII_PATTERNS = {**PII_PATTERNS, **DOMAIN_PII_PATTERNS}
+```
+
+## Where to Apply the Filter
+
+PII filtering should occur at every output boundary:
+
+```
+Agent generates response
+         │
+         ▼
+┌─────────────────────┐
+│  PII filter         │  ← Always, no exceptions
+└─────────────────────┘
+         │
+         ├─► User-facing API response
+         ├─► Application logs
+         ├─► Trace data sent to observability platform
+         └─► Cached responses in Redis/database
+```
+
+```python
+# The guardrail pipeline — PII filter is always layer 4 (last)
+class GuardrailedAgent:
+    def process(self, message: str) -> AgentResponse:
+        # Layer 1: injection detection
+        if detect_injection(message):
+            return AgentResponse(blocked=True, reason="injection_detected")
+
+        # Layer 2: intent classification
+        intent = classify_intent(message)
+        if intent.intent in ("jailbreak", "harmful"):
+            return AgentResponse(blocked=True, reason=intent.intent)
+
+        # Layer 3: execute the agent
+        raw_response = self.agent.run(message)
+
+        # Layer 4: PII filter — always runs, even on trusted responses
+        clean_response, pii_found = filter_pii(raw_response)
+
+        if pii_found:
+            self._log_pii_detection(message, pii_found)
+
+        return AgentResponse(content=clean_response, pii_redacted=pii_found)
+```
+
+## Logging PII Detections
+
+When PII is detected and redacted, log the event — but not the PII itself:
+
+```python
+def _log_pii_detection(self, original_message: str, pii_types: list[str]) -> None:
+    logger.warning({
+        "event": "pii_redacted_from_output",
+        "pii_types_found": pii_types,   # ["email", "phone"]
+        "session_id": self.session_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        # NOT logging: the original response containing PII
+        # NOT logging: the user message that triggered it
+    })
+```
+
+High frequency of PII detections from the same session is a signal worth investigating.
+
+## Related Sections
+
+- [21.4 PII Protection](./214-pii-protection) — the two-layer strategy (input + output)
+- [21.3 Secret Management](./213-secret-management) — keeping credentials out of agent context
+- [17.6 Error Analysis](../../part-06-production-engineering/chapter-17-observability/176-error-analysis) — tracking PII leakage events in observability

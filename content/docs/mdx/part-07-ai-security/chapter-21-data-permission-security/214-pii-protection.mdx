@@ -5,5 +5,149 @@ lastUpdatedDate: '2026-08-05'
 
 # 21.4 PII Protection
 
-This section covers the details of 21.4 PII Protection.
+PII protection requires two separate layers: input filtering (deciding whether to process PII the user provides) and output filtering (ensuring PII never appears in responses or logs). Both layers must be active — neither alone is sufficient.
 
+## The Two Layers
+
+```
+User message contains PII
+         │
+         ▼
+┌─────────────────────────────┐
+│  Layer 1: INPUT PII filter  │  ← Should this agent process this data?
+└─────────────────────────────┘
+         │
+    ┌────┴────┐
+   yes       no
+    │         └─► Request clarification or decline
+    ▼
+Agent processes request
+         │
+         ▼
+Agent generates response
+         │
+         ▼
+┌─────────────────────────────┐
+│  Layer 2: OUTPUT PII filter │  ← Always runs — redacts before returning
+└─────────────────────────────┘
+         │
+         ▼
+   Safe response → user / logs / cache
+```
+
+## Layer 1: Input PII Detection
+
+Detect PII in the user's message and make a routing decision:
+
+```python
+def handle_input_pii(message: str, agent_type: str) -> InputPIIDecision:
+    """
+    Decide how to handle PII in user input based on agent context.
+    Returns a decision: process, anonymize, or request_clarification.
+    """
+    detected_pii = detect_pii_types(message)
+
+    if not detected_pii:
+        return InputPIIDecision(action="process", message=message)
+
+    if agent_type == "healthcare":
+        # Healthcare agents are expected to process PII — log for compliance
+        audit_log_pii_input(message, detected_pii)
+        return InputPIIDecision(action="process", message=message)
+
+    if agent_type == "general_assistant":
+        # General agents shouldn't need raw PII — anonymize before processing
+        anonymized = anonymize_pii(message)
+        return InputPIIDecision(
+            action="anonymized",
+            message=anonymized,
+            warning="PII detected and anonymized before processing.",
+        )
+
+    return InputPIIDecision(action="process", message=message)
+```
+
+## Layer 2: Output PII Filter
+
+Layer 2 is unconditional — it runs on **every** response, regardless of what the model was instructed to do. From `atlas-agents/ch14_guardrails/guardrailed_agent.py`:
+
+```python
+PII_PATTERNS = {
+    "email":       r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+    "phone":       r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b",
+    "ssn":         r"\b\d{3}-\d{2}-\d{4}\b",
+    "credit_card": r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b",
+}
+
+def filter_pii(text: str) -> tuple[str, list[str]]:
+    detected = []
+    cleaned = text
+    for pii_type, pattern in PII_PATTERNS.items():
+        if re.search(pattern, cleaned):
+            detected.append(pii_type)
+            cleaned = re.sub(
+                pattern,
+                f"[REDACTED {pii_type.upper()}]",
+                cleaned,
+            )
+    return cleaned, detected
+```
+
+The output filter is layer 4 in the full guardrail pipeline — it is always the last step, running after the model has generated its response:
+
+```python
+# From the complete 4-layer guardrail pipeline
+class GuardrailedAgent:
+    def run(self, user_message: str) -> str:
+        # Layer 1: injection detection
+        # Layer 2: intent classification
+        # Layer 3: agent execution
+        raw_output = self._execute_agent(user_message)
+        # Layer 4: PII filter — always last, always runs
+        clean_output, pii_found = filter_pii(raw_output)
+        return clean_output
+```
+
+> **Why always last?** Because earlier layers (including the agent's own system prompt) can be bypassed by injections. The output filter in Python code cannot.
+
+## Defense in Depth
+
+Even if all these things happen simultaneously:
+
+1. The system prompt instruction to "never output PII" is bypassed via injection
+2. The input PII filter misses a novel data format
+3. The agent retrieves a database record containing PII
+
+...the output filter catches the PII before it reaches the user or logs.
+
+```
+Attack bypasses prompt-level instructions
+              │
+              ▼
+   Agent outputs raw PII in response
+              │
+              ▼
+    Output filter redacts it
+              │
+              ▼
+   "[REDACTED EMAIL]" reaches the user
+   PII never exposed
+```
+
+## GDPR / CCPA Compliance Considerations
+
+For regulated environments, PII handling requires:
+
+| Requirement | Implementation |
+|-------------|---------------|
+| Data minimization | Input filter — don't process PII you don't need |
+| Purpose limitation | Role-based tool access — PII tools only for authorized agents |
+| Audit trail | Log PII detection events (not the PII itself) |
+| Right to erasure | Don't cache responses containing PII |
+| Breach notification | Alert on unexpected PII detection spikes |
+
+## Related Sections
+
+- [21.2 Data Leakage](./212-data-leakage) — the PII filter implementation in detail
+- [21.3 Secret Management](./213-secret-management) — credentials are a special class of sensitive data
+- [21.5 Secure Tool Execution](./215-secure-tool-execution) — ensuring tools don't log PII in their audit trails

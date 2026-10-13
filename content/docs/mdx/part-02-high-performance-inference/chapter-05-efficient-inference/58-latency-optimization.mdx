@@ -5,5 +5,217 @@ lastUpdatedDate: '2026-08-05'
 
 # 5.8 Latency Optimization
 
-This section covers the details of 5.8 Latency Optimization.
+Throughput and latency are related but optimized differently. Throughput asks "how much can we process?"; latency asks "how fast does one user get their answer?". This section focuses on latency — specifically TTFT and total generation time.
 
+## The Two Latency Metrics That Matter
+
+**TTFT (Time to First Token)**: the time from sending a request to receiving the first token. This is what makes a system feel "fast" or "slow" to users. A 5-second total generation that starts streaming in 100ms feels responsive.
+
+**Total latency (TPOT × output_length)**: how long until the full response arrives. TPOT = time-per-output-token.
+
+```
+Total latency ≈ TTFT + (TPOT × num_output_tokens)
+
+Example:
+  TTFT:  300ms
+  TPOT:  20ms/token
+  Output: 200 tokens
+  Total: 300ms + (20ms × 200) = 4,300ms
+```
+
+These require different optimizations.
+
+## Optimizing TTFT
+
+TTFT = time spent waiting in queue + prefill time.
+
+### 1. Shorten the Prompt
+
+Prefill time scales linearly with prompt length. Cutting 1000 tokens from your prompt saves:
+
+```
+~1,000 tokens × (prefill_time / tokens) = 100–500ms on typical hardware
+```
+
+Techniques:
+- Remove verbose examples — fewer, higher-quality shots
+- Compress system prompts — remove redundant instructions
+- Truncate conversation history — summarize old turns rather than sending them verbatim
+- Use retrieval to fetch only relevant context, not entire documents
+
+### 2. Prompt Caching
+
+If your prompt has a stable prefix (system prompt, examples), prompt caching skips the prefill for that portion entirely — TTFT for the cached part drops to near zero:
+
+```python
+response = client.messages.create(
+    model="claude-opus-4-5",
+    system=[{
+        "type": "text",
+        "text": LARGE_SYSTEM_PROMPT,
+        "cache_control": {"type": "ephemeral"}  # cached after first call
+    }],
+    messages=[{"role": "user", "content": user_message}]
+)
+
+# First call:  TTFT includes full 2000-token prefill
+# Subsequent: TTFT = just user message prefill (20–50 tokens)
+# TTFT reduction: 80–95%
+```
+
+### 3. Prefill Parallelism (Disaggregated Prefill)
+
+For very long prompts (10K+ tokens), run the prefill on dedicated "prefill nodes" that stream the KV cache to "decode nodes":
+
+```
+Prefill node (compute-optimized):
+  Run full prefill for the prompt
+  Stream KV cache to decode node
+  
+Decode node (memory-bandwidth-optimized):
+  Receive KV cache
+  Start decode immediately
+```
+
+This separates the prefill bottleneck from the decode bottleneck. Used at large providers (Google, DeepMind) for production serving.
+
+### 4. Scheduler Priority for Latency-Sensitive Requests
+
+Set higher priority for interactive requests to reduce queue wait time:
+
+```python
+# Mark as high-priority, short expected output
+params = SamplingParams(
+    max_tokens=256,
+    priority=10,    # higher than default batch jobs
+)
+```
+
+### 5. Reduce Queue Depth
+
+Scale horizontally (more replicas) to keep queue depth near zero. TTFT spikes primarily come from waiting in the queue, not from the actual prefill time.
+
+## Optimizing TPOT (Decode Speed)
+
+TPOT = time per output token = time per decode step. Decode is memory-bandwidth bound.
+
+### 1. Use a Smaller Model
+
+A 7B model generates tokens ~10× faster than a 70B model at the same batch size:
+
+```
+7B  (fp16, A100): ~150 tokens/second at batch=1
+70B (fp16, 2×A100): ~15 tokens/second at batch=1
+```
+
+If quality is acceptable, the smaller model is always faster.
+
+### 2. Quantize Weights
+
+Fewer bytes per weight = fewer bytes to read per decode step = faster generation:
+
+```
+fp16 weights → read 14 GB per step for 7B model
+int4 weights → read 3.5 GB per step for 7B model
+Speedup at batch=1: ~3.5×
+```
+
+```bash
+# Use a quantized model
+python -m vllm.entrypoints.openai.api_server \
+    --model TheBloke/Llama-2-7B-AWQ \
+    --quantization awq
+```
+
+### 3. Speculative Decoding
+
+Use a small draft model to propose multiple tokens speculatively, verify with the large model in parallel (see Chapter 6.1). Typical speedup: 2–4×.
+
+```python
+# vLLM speculative decoding
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-70B-Instruct \
+    --speculative-model meta-llama/Meta-Llama-3-8B-Instruct \
+    --num-speculative-tokens 5
+```
+
+### 4. GQA Models
+
+Models with Grouped-Query Attention have smaller KV caches → less data to read per decode step:
+
+```
+Full MHA (32 KV heads): read 32 × head_dim × layers per step
+GQA (8 KV heads):       read  8 × head_dim × layers per step
+                        4× less KV data to read → faster attention
+```
+
+### 5. Better Hardware
+
+Memory bandwidth is the primary hardware determinant:
+
+```
+A10G  (600 GB/s):  ~80 tokens/second (7B, batch=1)
+A100  (2000 GB/s): ~150 tokens/second
+H100  (3350 GB/s): ~230 tokens/second
+H200  (4800 GB/s): ~340 tokens/second
+```
+
+## The Streaming Solution to Perceived Latency
+
+Even without hardware or model changes, streaming dramatically improves perceived latency:
+
+```
+No streaming:
+  User stares at blank screen for 4.3 seconds
+  Then sees the full response appear instantly
+  Perceived: slow
+
+Streaming:
+  User sees first word in 300ms
+  Content appears incrementally for 4 seconds
+  Perceived: fast and responsive
+```
+
+Users consistently rate streaming experiences as faster, even when the total generation time is identical. For all user-facing applications, streaming should be the default.
+
+## Latency Budget Analysis
+
+Before optimizing, measure where time is actually spent:
+
+```python
+import time
+
+start = time.time()
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+    stream=True,
+)
+
+first_token_time = None
+for chunk in response:
+    if first_token_time is None and chunk.choices[0].delta.content:
+        first_token_time = time.time()
+    last_token_time = time.time()
+
+total_time = last_token_time - start
+ttft = first_token_time - start
+decode_time = last_token_time - first_token_time
+
+print(f"TTFT: {ttft*1000:.0f}ms")
+print(f"Decode time: {decode_time*1000:.0f}ms")
+print(f"Tokens generated: ~{response.usage.completion_tokens}")
+print(f"TPOT: {decode_time/response.usage.completion_tokens*1000:.1f}ms/token")
+```
+
+If TTFT is the bottleneck: optimize prompt caching and prompt length.  
+If TPOT is the bottleneck: optimize model size, quantization, or hardware.
+
+## Summary
+
+- Two latency metrics: TTFT (time to first token) and TPOT (time per output token)
+- TTFT is dominated by queuing time + prefill; optimize with caching, shorter prompts, or prefill parallelism
+- TPOT is memory-bandwidth bound; optimize with quantization, smaller models, speculative decoding, or better hardware
+- Streaming: doesn't reduce total latency but dramatically improves perceived responsiveness — always use for user-facing endpoints
+- Profile before optimizing: measure actual TTFT and TPOT to know which bottleneck to attack
+- H100 delivers ~1.5× TPOT improvement over A100 purely from memory bandwidth

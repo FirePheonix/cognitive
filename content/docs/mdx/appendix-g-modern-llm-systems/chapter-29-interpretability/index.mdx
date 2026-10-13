@@ -1,0 +1,357 @@
+---
+title: 29. Interpretability — Understanding What's Inside the Model
+lastUpdatedDate: '2026-08-11'
+---
+
+# 29. Interpretability — Understanding What's Inside the Model
+
+A model that answers correctly 95% of the time is genuinely useful. But that number alone doesn't tell you everything you need to know. Can you predict when it will fail? Can you tell whether it's reasoning about the problem or pattern-matching against training data? Does it "know" a fact, or does it merely reproduce text that looks like it knows?
+
+Interpretability is the field that tries to answer these questions — to understand not just what a model outputs, but why. It's the difference between trusting a black box because it works on your test set and trusting a system because you understand the mechanism.
+
+---
+
+## The Three Levels of Explanation
+
+Interpretability research works at three levels of granularity, each asking a different kind of question:
+
+```text
+Level 1 — Feature/Neuron
+  Question: What does this individual unit respond to?
+  Example: "Neuron 4,271 in layer 12 fires strongly when it sees
+            the word 'Paris' following a question about capitals."
+  Tool: maximum activation examples, activation histograms
+
+Level 2 — Representation
+  Question: What information is encoded in these hidden states?
+  Example: "The layer-8 residual stream contains enough information
+            to predict part-of-speech with 94% accuracy."
+  Tool: probing classifiers, linear representation analysis
+
+Level 3 — Circuit/Mechanistic
+  Question: What sequence of operations actually produces this output?
+  Example: "Heads 3.7 and 5.1 collaborate to copy the subject of
+            the sentence to the output position, regardless of
+            intervening tokens."
+  Tool: ablation studies, activation patching, causal tracing
+```
+
+These levels are not independent — a full mechanistic explanation requires understanding features, how they're combined into representations, and how circuits route information. In practice, most interpretability work focuses on one level at a time.
+
+---
+
+## Section 1 — Probing
+
+The simplest and most widespread interpretability technique is **probing**: train a small classifier on top of frozen hidden states and see if it can predict some property of interest.
+
+The setup:
+
+$$\hat{y} = \text{softmax}(Wh + b)$$
+
+- $h$ is a frozen hidden state vector from the model
+- $W$ and $b$ are the probe's parameters (the only thing being trained)
+- $\hat{y}$ is the predicted label for a property like "part-of-speech", "named entity type", or "sentence sentiment"
+
+If the probe achieves high accuracy, it means the information is linearly decodable from the representation — the model "has" that information at that layer.
+
+```text
+Example: probing for syntactic information in BERT
+
+  Layer  →  Part-of-Speech Probe Accuracy
+  ────────────────────────────────────────
+   0  (embedding)       62%   ← barely better than chance
+   4  (mid-network)     91%   ← syntax begins to crystallize
+   8  (deeper)          96%   ← strong syntactic encoding
+  12  (final)           94%   ← slightly lower (focus shifts to semantics)
+
+Interpretation: BERT builds up syntactic structure in early-to-mid layers,
+then moves toward higher-level semantic representations in later layers.
+```
+
+### The Critical Warning: Present ≠ Causally Used
+
+Probing is useful, but it comes with a trap. If a probe achieves 95% accuracy, all you know is that the information is **present** in the representation. You don't know whether the model actually **uses** it when making predictions.
+
+```text
+Analogy: imagine probing a person's long-term memory for a fact.
+If they can recall it, the information is "present."
+But when that person is actually solving a problem, they might
+not consult that fact at all — they might use a heuristic instead.
+
+"Present" means: the information was encoded.
+"Causally used" means: removing that information would change the output.
+
+These are not the same thing.
+```
+
+To move from correlation to causation, you need interventions — which brings us to later sections.
+
+---
+
+## Section 2 — Concept Activation Vectors (CAVs)
+
+Probing checks for predefined categories. Concept Activation Vectors extend this to arbitrary human-defined concepts.
+
+The idea: define a concept with positive and negative examples. Train a linear classifier to separate them in activation space. The decision boundary's normal vector is the **concept direction** $v_C$:
+
+$$s_C(h) = v_C^\top h$$
+
+This scalar score tells you how strongly the concept $C$ is present in activation $h$.
+
+```text
+Example concept: "Is this token numeric?"
+
+Positive examples: "42", "3.14", "seven", "billion", "2026"
+Negative examples: "cat", "however", "Paris", "quickly", "the"
+
+Train a linear SVM on the activations at some layer.
+The direction v_C points "toward numerics" in activation space.
+
+For any new token, compute s_C(h) = v_C · h.
+High score → the model's representation is "numerically flavored."
+```
+
+### Steering with CAVs
+
+The real test of whether a CAV captures something causally meaningful is whether you can **steer** the model by modifying activations along $v_C$:
+
+$$h' = h + \alpha \cdot v_C$$
+
+If adding $\alpha v_C$ to the hidden state causes the model to generate more "numeric-feeling" text, the direction is causally involved — not just correlated with the concept. This transforms interpretability from observation to control.
+
+---
+
+## Section 3 — Attention Is Not Explanation
+
+One of the most common mistakes in early NLP interpretability work was treating attention weights as explanations.
+
+$$A_{ij} = \text{attention weight from position } i \text{ to position } j$$
+
+The intuition seems reasonable: if token $i$ attends strongly to token $j$, then token $j$ "caused" token $i$'s representation. Therefore, high attention weight = important input for the prediction.
+
+This is **wrong** for several reasons:
+
+```text
+Problem 1 — Attention weights tell you what was mixed, not what mattered.
+  Attention computes a weighted average of value vectors.
+  Even if token j gets high attention weight, if its value vector
+  is similar to all other value vectors, the output barely changes.
+
+Problem 2 — Multiple attention patterns can produce the same output.
+  You can often rearrange attention weights significantly without
+  changing downstream representations or final predictions.
+  This means attention is not a unique explanation.
+
+Problem 3 — Raw attention ≠ gradient-weighted attention.
+  Gradient-based importance (how much does the output change
+  if I perturb this input?) often disagrees strongly with
+  raw attention weights.
+  
+Experiment that proved the point (Jain & Wallace, 2019):
+  They showed you can adversarially modify attention weights
+  to look completely different while producing identical predictions.
+  If attention were explanation, this shouldn't be possible.
+```
+
+### What You Need for Causal Explanation
+
+To establish that a component causally determines an output, you need interventions:
+
+**Ablation**: set a component to zero (zero out an attention head's output), observe whether predictions change.
+
+**Activation patching**: run two inputs through the model. At a specific position and layer, replace activations from one run with activations from the other. If the output changes to match the "donor" run, that position/layer is causally involved.
+
+**Causal tracing** (as in ROME/mend mechanistic work): systematically patch each position and layer, building a map of which locations "carry" which information.
+
+```text
+Causal tracing example:
+  
+  Run A: "The Eiffel Tower is in [MASK]" → model outputs "Paris"
+  Run B: "The Eiffel Tower is in [MASK]" with corrupted subject
+         → model outputs something wrong
+  
+  For each (layer, position) pair:
+    - Take corrupted Run B activations
+    - Patch in the clean Run A activations at position (layer L, pos P)
+    - See if the correct answer "Paris" is restored
+  
+  If patching layer 8, position "Tower" restores "Paris",
+  then that is where the factual association is stored.
+```
+
+---
+
+## Section 4 — Mechanistic Interpretability
+
+Mechanistic interpretability takes the hardest stance: we want to find the actual algorithm the model uses, expressed as a circuit of attention heads and MLP layers. Not just "which components are involved" but "what computation are they implementing?"
+
+This is painstaking work. It requires reverse-engineering a neural network the way a hardware engineer reverse-engineers a chip.
+
+### What's Been Found in Small Transformers
+
+Research on smaller, carefully analyzable transformers has uncovered specific circuits:
+
+**Induction heads**: a pair of attention heads that together implement in-context learning. Head A copies earlier token representations to the current position. Head B, seeing that pattern, attends to the token that came after the previous occurrence of the current token — implementing "if you saw [A][B] before and you're at [A] now, predict [B]."
+
+$$\text{Layer 0, Head H1}: \text{attends to previous occurrence of current token}$$
+$$\text{Layer 1, Head H2}: \text{attends one step after that previous occurrence}$$
+
+This is a primitive that enables few-shot learning: if you show the model examples in the prompt, induction heads can extract and apply the pattern.
+
+**Copying circuits**: attention heads that copy a specific token from earlier in context to the output position. Important for tasks like coreference resolution.
+
+**Factual association circuits**: in larger models, specific MLP layers have been identified as "storing" factual associations. The MLP in transformer layers acts somewhat like a key-value memory:
+
+$$\text{MLP}(h) \approx \sum_i v_i \cdot \text{relu}(k_i^\top h)$$
+
+where $k_i$ is a "key" (matching a fact) and $v_i$ is the "value" (the fact itself). Early mechanistic work (e.g., the ROME paper) localized "Paris is the capital of France" to specific MLP layers and showed you could edit this fact surgically.
+
+---
+
+## Section 5 — The Superposition Problem
+
+Here's a puzzle. A transformer with $d$-dimensional hidden states has $d$ orthogonal directions in activation space. A 4096-dimensional model can store at most 4096 independent, non-interfering features. But LLMs seem to encode orders of magnitude more concepts than this. How?
+
+**The linear representation hypothesis**: concepts are stored as linear directions in activation space. This is an approximation, but a useful one — linear probes work well, linear steering works, many concepts can be identified as directions.
+
+**Superposition**: the model stores more features than there are orthogonal dimensions by encoding them as *nearly*-orthogonal (non-orthogonal) directions. Features are sparse — at any given time, only a few are active, so interference between features is manageable.
+
+```text
+Intuition: 3D space can hold 3 orthogonal vectors.
+But if you're willing to tolerate a little interference,
+you can fit ~10 nearly-orthogonal vectors in the same 3D space.
+As long as the "active set" at any moment is small (sparse),
+the cross-talk between features stays low.
+
+A neuron participating in multiple sparse features is called
+"polysemantic" — it responds to seemingly unrelated concepts
+because it's participating in several superimposed features.
+```
+
+This has deep consequences: **you cannot understand a neuron by looking at it in isolation.** A neuron that lights up for both "legal documents" and "DNA sequences" isn't confused — it's superposed. The concepts it participates in only become clear when you look at what other neurons are simultaneously active.
+
+---
+
+## Section 6 — Sparse Autoencoders
+
+If superposition is the problem, sparse autoencoders (SAEs) are the current best attempt at a solution. The idea: learn to decompose dense, superposed activations into a sparse set of interpretable feature directions.
+
+$$h \approx \hat{h} = \sum_{i=1}^{F} f_i \cdot e_i$$
+
+where:
+- $h$ is the original dense activation vector (dimension $d$)
+- $F \gg d$ is the number of learned features (much more than $d$)
+- $f_i \geq 0$ is the activation of feature $i$ (sparse: most are zero)
+- $e_i$ is the direction vector for feature $i$
+
+The SAE is trained with a reconstruction loss plus a sparsity penalty:
+
+$$\mathcal{L} = \underbrace{\|h - \hat{h}\|^2}_{\text{reconstruct well}} + \underbrace{\lambda \sum_i f_i}_{\text{stay sparse}}$$
+
+The sparsity pressure forces the SAE to find a decomposition where most features are off most of the time — mimicking the assumed structure of superposition.
+
+```text
+What SAEs have found in GPT-4 (Anthropic's work, 2024):
+
+  Researchers trained SAEs on residual stream activations
+  and found thousands of interpretable features:
+  
+  - A "DNA / genetics" feature (fires on sequences like ATCG, genes, CRISPR)
+  - Features for specific celebrities (activating on their names and images)
+  - Music theory features (fires on chord names, key signatures, music theory text)
+  - Emotional valence features (positive/negative sentiment directions)
+  - Syntax features (active on specific grammatical constructions)
+  - Safety-relevant features (activating on harmful content patterns)
+  
+  Many of these features are "monosemantic" after SAE decomposition —
+  even though the underlying neurons they involve were polysemantic.
+  
+  This is the most promising current approach to understanding
+  what's inside large models.
+```
+
+SAEs are not perfect. The decomposition is not unique. Some features resist human interpretation. But they represent a genuine step toward mapping the "feature space" of a trained model.
+
+---
+
+## Section 7 — Faithfulness vs Comprehensibility
+
+There's a fundamental tension at the heart of all explanation methods:
+
+$$\text{faithfulness} \leftrightarrow \text{human comprehensibility}$$
+
+The most **faithful** explanation of why a model produced a given output is the full computation: the exact sequence of matrix multiplications, attention patterns, and nonlinearities that transformed the input into the output. This is technically complete, but a billion-parameter computation graph is incomprehensible to any human.
+
+The most **comprehensible** explanation is a sentence: "the model focused on the subject and the verb." This is easy to understand but is almost certainly an oversimplification — it drops enormous amounts of information about what the model actually computed.
+
+```text
+The faithfulness-comprehensibility tradeoff:
+
+  Full computation graph
+    ├── Perfectly faithful
+    └── Zero human comprehensibility
+  
+  "It attended to the subject noun"
+    ├── Maybe 30% faithful (huge simplification)
+    └── High human comprehensibility
+  
+  Circuit-level explanation (e.g., heads 3.7 and 5.1 implement copying)
+    ├── ~70% faithful (abstracts over low-level details, captures the key algorithm)
+    └── Medium comprehensibility (requires some technical knowledge)
+```
+
+Good interpretability research acknowledges this tradeoff explicitly. The right level of explanation depends on the application:
+- **Safety auditing** needs high faithfulness (you need to know exactly what's happening)
+- **User-facing explanations** need high comprehensibility (users need to act on them)
+- **Scientific understanding** needs faithfulness at the right level of abstraction
+
+---
+
+## Section 8 — Why Interpretability Matters for Engineers
+
+Interpretability isn't only for academics studying models in the lab. For engineers building and deploying AI systems, understanding model internals has direct practical consequences.
+
+**Hallucination diagnosis.** If you can identify which circuits or feature directions are involved when a model confabulates, you can design targeted interventions — better prompts, targeted fine-tuning, or detection heuristics.
+
+**Bias detection and correction.** Research has found that gender stereotypes, racial associations, and cultural assumptions are often encoded as linear directions in activation space. Knowing this lets you:
+- Test for bias by probing for stereotyped directions
+- Potentially correct bias by steering against those directions
+- At minimum, characterize the model's failure modes before deployment
+
+**Safety work.** Identifying "safety-relevant" attention heads or feature directions makes safety fine-tuning more surgical. Instead of hoping RLHF erases harmful behaviors, you can check whether the relevant representations were actually modified.
+
+**Failure prediction.** If you understand that a model fails on a task because it lacks a specific circuit (e.g., it can't compose two-hop reasoning because the relevant attention pattern isn't present), you can predict failure modes before they appear in production.
+
+**Debugging.** When a model behaves unexpectedly on a new input distribution, interpretability tools can tell you whether the issue is in input encoding, mid-network processing, or output head behavior — narrowing the debugging search space.
+
+```text
+Practical interpretability workflow for engineers:
+
+  1. Identify a failure mode (e.g., "model hallucinates on medical questions")
+  
+  2. Collect a contrastive dataset:
+     - inputs where the model is correct
+     - inputs where the model hallucinates
+  
+  3. Apply probing: is there a direction in activation space that
+     separates the two cases? That's a hallucination predictor.
+  
+  4. Apply causal tracing: which positions/layers contribute most
+     to the hallucination?
+  
+  5. Use that to design a targeted intervention: train a probe as
+     a classifier to flag hallucinations at inference time, or add
+     targeted training data for those circuit patterns.
+```
+
+---
+
+## Closing
+
+The field of interpretability is still young. Most rigorous circuit-level work has been done on small, purpose-built transformers. Scaling those methods to 100-billion-parameter models is an active and unsolved challenge. SAEs are promising but imperfect. Probing is fast but can mislead.
+
+But the core insight is already clear: **building AI systems you can trust requires understanding what they are actually doing, not just what they output.**
+
+A model that you can probe, trace, and steer is a model you can reason about. And AI engineering, like all engineering, ultimately depends on being able to reason about your systems — to predict how they fail, to understand why they succeed, and to make informed decisions about when to trust them.
+
+The tools for doing this are getting better, quickly. Mechanistic interpretability, sparse autoencoders, and causal tracing are becoming standard parts of the safety and reliability engineering toolkit. The engineers who understand these methods will be better positioned to build AI systems that are not just capable, but genuinely trustworthy.

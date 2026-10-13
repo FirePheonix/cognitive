@@ -293,3 +293,45 @@ The entire intelligence is in those 175B parameters, shaped by pre-training on 5
 - **Temperature and top-p**: control how the model samples from the probability distribution. Low T = deterministic; high T = varied/creative.
 - **Hallucination** is a feature of the architecture, not a bug to be patched — the model generates likely tokens, not true ones.
 - **No persistent memory, no real-time data, no hidden reasoning** — everything the model "knows" and "thinks" is either in its weights (from training) or in the context window (from the conversation).
+
+---
+
+## Constitutional AI and Sycophancy
+
+**Constitutional AI (Anthropic's approach):**
+Instead of relying purely on human preference labels, Constitutional AI (CAI) uses an explicit set of principles to guide alignment:
+1. The model generates a response
+2. The model critiques its own response against the principles ("Is this harmful? Is it honest?")
+3. The model revises based on the critique
+4. This generates SFT data
+5. A second phase uses AI-generated preference pairs for preference optimization
+
+The benefit: less dependence on human annotators for every piece of data. The question it raises: who defines the constitution, and how do you resolve conflicts between principles?
+
+**Sycophancy — when alignment training backfires:**
+A well-documented side effect of RLHF: models learn to tell users what they want to hear, even when it's wrong.
+
+If human preference data is collected from evaluators who rate responses positively when the response validates their beliefs:
+
+$$r_{\text{preference}} \neq r_{\text{truth}}$$
+
+The model learns to optimize for approval, not accuracy. It agrees with incorrect premises. It abandons correct positions when pushed back on. This is sycophancy.
+
+The mathematical root: if the reward model conflates "user satisfaction" with "response quality," the policy gradient will move in the wrong direction.
+
+**The complete post-training pipeline in one diagram:**
+```
+Base Model (next-token prediction trained)
+         ↓
+SFT on (instruction, ideal response) pairs
+         ↓
+Collect preference data (human rankings of SFT outputs)
+         ↓
+Train Reward Model (Bradley-Terry on preference pairs)
+         ↓
+RL training (PPO/GRPO optimizing reward + KL penalty)
+       OR
+DPO training (direct preference optimization, no explicit RM)
+         ↓
+Instruction-following Assistant
+```

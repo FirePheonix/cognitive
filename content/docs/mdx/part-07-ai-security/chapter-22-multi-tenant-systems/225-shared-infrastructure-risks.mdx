@@ -5,5 +5,188 @@ lastUpdatedDate: '2026-08-05'
 
 # 22.5 Shared Infrastructure Risks
 
-This section covers the details of 22.5 Shared Infrastructure Risks.
+Even with correct data and context isolation, sharing compute infrastructure between tenants introduces a class of side-channel and resource-competition risks. These are harder to detect than data leakage — they don't produce wrong answers, they produce latency patterns, resource exhaustion, or theoretical information leakage through timing.
 
+## Risk 1: Timing Attacks
+
+In a shared infrastructure, one tenant can potentially infer information about other tenants by observing response latency patterns:
+
+- Long responses → that tenant is making a complex query
+- Periodic bursts of requests → batch processing (possibly data export or training)
+- Latency spikes correlated with competitor's query patterns → infer when they're doing intensive work
+
+**Severity:** Low for most applications. High for competitive intelligence or regulated environments.
+
+**Mitigation:**
+
+```python
+import asyncio
+import random
+import time
+
+async def add_timing_jitter(response: str, jitter_ms_range: tuple = (10, 50)) -> str:
+    """
+    Add random jitter to response timing to prevent timing analysis.
+    Only appropriate for non-latency-sensitive applications.
+    """
+    jitter_seconds = random.uniform(
+        jitter_ms_range[0] / 1000,
+        jitter_ms_range[1] / 1000
+    )
+    await asyncio.sleep(jitter_seconds)
+    return response
+```
+
+More practically: **per-tenant rate limiting** prevents one tenant from making inferences about another's traffic patterns by volume.
+
+## Risk 2: Side-Channel KV Cache Attacks
+
+This is a theoretical (not yet demonstrated in practice) but architecturally interesting risk: if multiple tenants share GPU memory for a single model instance, and the KV cache is not properly cleared between tenant requests, a sophisticated attacker could potentially read stale KV cache state from a previous tenant's request.
+
+**Current reality:** Major cloud providers (Anthropic, OpenAI) handle this at the infrastructure level. For self-hosted models, this is worth considering.
+
+**Mitigation for self-hosted models:**
+
+```python
+# When using vLLM or similar serving frameworks with a multi-tenant workload:
+# Configure separate GPU workers per high-security tenant
+# rather than relying on KV cache isolation within a shared instance
+
+# vLLM example: use separate engine instances
+from vllm import AsyncLLMEngine
+
+# High-security tenants get their own engine (and GPU memory isolation)
+enterprise_engine = AsyncLLMEngine.from_engine_args(
+    EngineArgs(
+        model="meta-llama/Llama-3-8B-Instruct",
+        gpu_memory_utilization=0.8,
+        max_num_seqs=16  # limited concurrency for isolation
+    )
+)
+
+# Standard tenants share an engine
+standard_engine = AsyncLLMEngine.from_engine_args(
+    EngineArgs(
+        model="meta-llama/Llama-3-8B-Instruct",
+        gpu_memory_utilization=0.9,
+        max_num_seqs=256
+    )
+)
+```
+
+## Risk 3: Denial of Service (Resource Exhaustion)
+
+A single tenant with a high-volume or computationally expensive query pattern degrades service for all other tenants. This is the most practically common shared infrastructure risk.
+
+Common patterns:
+- Tenant submits queries that trigger 5-hop agentic retrieval (10× the compute of a simple query)
+- Tenant submits extremely large documents for embedding
+- Tenant runs a large batch job during peak hours
+
+**Mitigation: Per-Tenant Rate Limiting and Quotas**
+
+```python
+import time
+from collections import defaultdict
+
+class TenantRateLimiter:
+    def __init__(self, requests_per_minute: int = 60, tokens_per_minute: int = 100_000):
+        self.rpm_limit = requests_per_minute
+        self.tpm_limit = tokens_per_minute
+        self.request_counts = defaultdict(list)
+        self.token_counts = defaultdict(list)
+
+    def check_rate_limit(self, tenant_id: str, estimated_tokens: int) -> tuple[bool, str]:
+        now = time.time()
+        window_start = now - 60  # 1-minute window
+
+        # Clean old entries
+        self.request_counts[tenant_id] = [
+            t for t in self.request_counts[tenant_id] if t > window_start
+        ]
+
+        # Check request rate
+        if len(self.request_counts[tenant_id]) >= self.rpm_limit:
+            return False, f"Rate limit exceeded: {self.rpm_limit} requests/minute"
+
+        # Check token budget
+        recent_tokens = sum(
+            count for ts, count in self.token_counts[tenant_id]
+            if ts > window_start
+        )
+        if recent_tokens + estimated_tokens > self.tpm_limit:
+            return False, f"Token budget exceeded: {self.tpm_limit} tokens/minute"
+
+        # Record this request
+        self.request_counts[tenant_id].append(now)
+        self.token_counts[tenant_id].append((now, estimated_tokens))
+
+        return True, "ok"
+
+
+# Per-tenant quotas based on subscription tier
+TENANT_QUOTAS = {
+    "free": {"rpm": 10, "tpm": 20_000},
+    "starter": {"rpm": 60, "tpm": 100_000},
+    "professional": {"rpm": 300, "tpm": 500_000},
+    "enterprise": {"rpm": 1000, "tpm": 2_000_000},
+}
+```
+
+## Risk 4: Queue Starvation
+
+A high-priority tenant's requests are delayed because the queue is saturated by a low-priority tenant's batch job.
+
+**Mitigation: Priority Queues**
+
+```python
+import asyncio
+from heapq import heappush, heappop
+
+class PriorityRequestQueue:
+    """
+    Processes requests in priority order.
+    Enterprise tenants get higher priority than free-tier tenants.
+    """
+
+    TIER_PRIORITIES = {
+        "enterprise": 0,      # highest priority
+        "professional": 1,
+        "starter": 2,
+        "free": 3            # lowest priority
+    }
+
+    def __init__(self):
+        self.queue = []
+        self.counter = 0  # tiebreaker for same-priority requests
+
+    async def enqueue(self, tenant_id: str, tier: str, request: dict) -> asyncio.Future:
+        future = asyncio.get_event_loop().create_future()
+        priority = self.TIER_PRIORITIES.get(tier, 3)
+        heappush(self.queue, (priority, self.counter, tenant_id, request, future))
+        self.counter += 1
+        return future
+
+    async def process_next(self) -> None:
+        if not self.queue:
+            return
+
+        priority, _, tenant_id, request, future = heappop(self.queue)
+        try:
+            result = await execute_request(tenant_id, request)
+            future.set_result(result)
+        except Exception as e:
+            future.set_exception(e)
+```
+
+## Summary: Risk vs Mitigation Matrix
+
+| Risk | Likelihood | Impact | Primary mitigation |
+|---|---|---|---|
+| Timing attacks | Low | Low-Medium | Per-tenant rate limiting |
+| KV cache side channel | Very low | High | Separate GPU instances (high-security) |
+| Denial of service | High | High | Per-tenant quotas, priority queues |
+| Queue starvation | Medium | Medium | Priority queues by tier |
+| Resource cost attribution | N/A | Business | Per-tenant cost tracking |
+
+Track per-tenant resource consumption for both billing accuracy and security analysis. Unusual spikes in a single tenant's resource usage are often the first signal of abuse or a DoS attempt.

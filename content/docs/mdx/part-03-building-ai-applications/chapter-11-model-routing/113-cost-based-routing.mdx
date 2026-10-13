@@ -5,5 +5,214 @@ lastUpdatedDate: '2026-08-05'
 
 # 11.3 Cost-Based Routing
 
-This section covers the details of 11.3 Cost-Based Routing.
+Route based on cost per query with a quality floor. The goal: find the cheapest model that meets your accuracy requirements for each task type, then use it consistently until your benchmarks say otherwise.
 
+## LiteLLM as the Abstraction Layer
+
+LiteLLM provides a unified interface to 100+ models. Switching between providers is a model string change:
+
+```python
+import litellm
+
+# All three use identical syntax — just change the model string
+response_openai    = litellm.completion(model="gpt-4o",                      messages=[...])
+response_anthropic = litellm.completion(model="anthropic/claude-sonnet-4-6", messages=[...])
+response_gemini    = litellm.completion(model="gemini/gemini-2.0-flash",     messages=[...])
+response_local     = litellm.completion(model="ollama/llama3:8b",            messages=[...])  # free
+```
+
+LiteLLM also tracks cost automatically:
+
+```python
+import litellm
+
+response = litellm.completion(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "Hello"}]
+)
+
+# Cost information available in the response
+cost = litellm.completion_cost(completion_response=response)
+print(f"Cost: ${cost:.6f}")
+```
+
+## Building a Cost-Tracking Router
+
+```python
+import litellm
+import json
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+@dataclass
+class ModelMetrics:
+    total_calls: int = 0
+    total_cost: float = 0.0
+    total_successes: int = 0
+
+    @property
+    def success_rate(self) -> float:
+        if self.total_calls == 0:
+            return 0.0
+        return self.total_successes / self.total_calls
+
+    @property
+    def average_cost(self) -> float:
+        if self.total_calls == 0:
+            return 0.0
+        return self.total_cost / self.total_calls
+
+
+class CostBasedRouter:
+    def __init__(self, task_model_map: dict[str, list[str]]):
+        """
+        task_model_map: maps task type → ordered list of models (cheapest first).
+        e.g. {"classification": ["claude-haiku-4-5", "gpt-4o", "claude-sonnet-4-6"]}
+        """
+        self.task_model_map = task_model_map
+        self.metrics: dict[str, dict[str, ModelMetrics]] = defaultdict(
+            lambda: defaultdict(ModelMetrics)
+        )
+        self.quality_floor = 0.90  # Minimum acceptable success rate
+
+    def complete(self, task_type: str, messages: list, **kwargs) -> str:
+        candidates = self.task_model_map.get(task_type, ["gpt-4o"])
+
+        for model in candidates:
+            task_metrics = self.metrics[task_type][model]
+
+            # Skip if this model is below quality floor (after warmup period)
+            if task_metrics.total_calls > 50 and task_metrics.success_rate < self.quality_floor:
+                continue
+
+            try:
+                response = litellm.completion(model=model, messages=messages, **kwargs)
+                cost = litellm.completion_cost(completion_response=response)
+
+                task_metrics.total_calls += 1
+                task_metrics.total_cost += cost
+                task_metrics.total_successes += 1
+
+                return response.choices[0].message.content
+
+            except Exception as e:
+                task_metrics.total_calls += 1
+                # Don't count as success
+                continue
+
+        raise RuntimeError(f"All models failed for task type: {task_type}")
+
+    def cost_report(self) -> dict:
+        report = {}
+        for task, models in self.metrics.items():
+            report[task] = {
+                model: {
+                    "calls": m.total_calls,
+                    "avg_cost": f"${m.average_cost:.6f}",
+                    "success_rate": f"{m.success_rate:.1%}",
+                    "total_cost": f"${m.total_cost:.4f}",
+                }
+                for model, m in models.items()
+            }
+        return report
+```
+
+## The Routing Table
+
+Build your routing table from empirical data, not assumptions. Based on benchmark results from `atlas-agents/ch07_model_portability/benchmark.py:218`:
+
+```python
+# Example routing table — fill with your actual benchmark results
+TASK_MODEL_MAP = {
+    # Cheap, fast tasks
+    "intent_classification":    ["claude-haiku-4-5", "gemini/gemini-2.0-flash"],
+    "sentiment_analysis":       ["claude-haiku-4-5", "gemini/gemini-2.0-flash"],
+    "simple_extraction":        ["claude-haiku-4-5", "gemini/gemini-2.0-flash"],
+    "routing_decision":         ["claude-haiku-4-5"],
+
+    # Standard production tasks
+    "qa_from_context":          ["gpt-4o",           "anthropic/claude-sonnet-4-6"],
+    "document_summarization":   ["anthropic/claude-sonnet-4-6", "gpt-4o"],
+    "code_generation":          ["gpt-4o",           "anthropic/claude-sonnet-4-6"],
+    "structured_output":        ["gpt-4o",           "anthropic/claude-sonnet-4-6"],
+
+    # High-complexity tasks
+    "code_review":              ["anthropic/claude-opus-4-5", "gpt-4o"],
+    "architecture_design":      ["anthropic/claude-opus-4-5"],
+    "complex_reasoning":        ["anthropic/claude-opus-4-5", "gpt-4o"],
+}
+
+router = CostBasedRouter(TASK_MODEL_MAP)
+```
+
+## The Benchmark Script
+
+Reference: `atlas-agents/ch07_model_portability/benchmark.py:218` — tests GPT-4o, Gemini Flash, Claude Sonnet, and Llama 3 8B across three task types, reporting cost vs accuracy.
+
+The benchmark structure:
+
+```python
+BENCHMARK_TASKS = [
+    {
+        "name": "intent_classification",
+        "prompt": "Classify the intent: '{input}'. Reply with one word.",
+        "inputs": [...],     # Test cases
+        "expected": [...],   # Expected outputs
+        "scorer": exact_match,
+    },
+    {
+        "name": "code_generation",
+        "prompt": "Write a Python function that {input}",
+        "inputs": [...],
+        "expected": [...],
+        "scorer": run_tests,  # Execute the generated code
+    },
+]
+
+MODELS_TO_TEST = [
+    "gpt-4o",
+    "gemini/gemini-2.0-flash",
+    "anthropic/claude-sonnet-4-6",
+    "ollama/llama3:8b",
+]
+
+def run_benchmark():
+    results = {}
+    for task in BENCHMARK_TASKS:
+        results[task["name"]] = {}
+        for model in MODELS_TO_TEST:
+            accuracy, avg_cost = evaluate_model(model, task)
+            results[task["name"]][model] = {
+                "accuracy": accuracy,
+                "avg_cost_per_call": avg_cost,
+                "cost_at_1m_calls": avg_cost * 1_000_000,
+            }
+    return results
+```
+
+## Cost Estimation
+
+Before running at scale, estimate monthly cost:
+
+```python
+def estimate_monthly_cost(
+    requests_per_day: int,
+    task_distribution: dict[str, float],  # task_type → fraction of requests
+    routing_table: dict[str, list[str]],
+    model_costs: dict[str, float],        # model → cost per call
+) -> float:
+    monthly_requests = requests_per_day * 30
+    total_cost = 0.0
+
+    for task_type, fraction in task_distribution.items():
+        task_requests = monthly_requests * fraction
+        model = routing_table.get(task_type, ["gpt-4o"])[0]  # Primary model
+        cost_per_call = model_costs.get(model, 0.003)
+        task_cost = task_requests * cost_per_call
+        total_cost += task_cost
+        print(f"{task_type}: {task_requests:.0f} calls × ${cost_per_call:.4f} = ${task_cost:.2f}/month")
+
+    return total_cost
+```
+
+Run this before committing to a routing strategy. The numbers will tell you where to focus optimization effort.

@@ -5,5 +5,139 @@ lastUpdatedDate: '2026-08-05'
 
 # 10.4 Tool Loops
 
-This section covers the details of 10.4 Tool Loops.
+## The Engine of Every Agent
 
+All agent behavior — regardless of the framework, the model, or the pattern — ultimately runs through the same mechanical cycle:
+
+```
+Call LLM → Detect tool request → Execute tool → Feed result back → Repeat
+```
+
+This "call-execute-observe" cycle is the engine of every agent. Understanding it at the lowest level means you can debug any agent, in any framework, when something goes wrong.
+
+## The Minimal Tool Loop
+
+Here's the complete implementation — no framework, no abstraction:
+
+```python
+while True:
+    response = client.chat.completions.create(
+        model="gpt-4o", messages=messages, tools=tools
+    )
+    msg = response.choices[0].message
+    messages.append(msg)
+
+    if msg.tool_calls:
+        for tc in msg.tool_calls:
+            args = json.loads(tc.function.arguments)
+            result = get_weather(**args)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result
+            })
+    else:
+        print(msg.content)
+        break  # Final answer — no tool calls means we're done
+```
+
+Every framework you'll encounter (LangGraph, CrewAI, the OpenAI Agents SDK) is a higher-level version of this loop. The underlying mechanics are identical.
+
+### What the Loop Does Step by Step
+
+1. **Send messages to the LLM** — includes conversation history, system prompt, and available tool definitions
+2. **Check the response** — did the LLM request a tool call, or produce a final answer?
+3. **If tool calls exist** — parse the arguments, execute the function, append the result with `role: "tool"`
+4. **If no tool calls** — print the content and break. The agent is done.
+5. **Loop** — go back to step 1 with the updated message history
+
+The message list is the agent's memory within a session. Every tool result gets appended so the LLM sees the full history of what it asked for and what it got back.
+
+## Why `tool_call_id` Matters
+
+Each tool call has a unique ID. When you return the result, you must include that same ID:
+
+```python
+messages.append({
+    "role": "tool",
+    "tool_call_id": tc.id,   # Must match the ID from the request
+    "content": result
+})
+```
+
+If you call three tools in one turn, you must return three results — one for each ID. The LLM uses these IDs to match results to requests. Missing or mismatched IDs cause errors or confuse the model.
+
+## Parallel Tool Execution
+
+When the LLM requests multiple tools in a single response, you can run them concurrently. This is implemented in `atlas-agents/ch03_tools_and_skills/atlas_v03.py`:
+
+```python
+import concurrent.futures
+
+if msg.tool_calls:
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = {
+            executor.submit(execute_tool, tc): tc
+            for tc in msg.tool_calls
+        }
+        for future in concurrent.futures.as_completed(futures):
+            tc = futures[future]
+            result = future.result()
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result
+            })
+```
+
+If the LLM asks to search three databases simultaneously, parallel execution means waiting for the slowest one — not the sum of all three. On I/O-bound tools (HTTP calls, database queries), this can cut latency dramatically.
+
+**When parallel execution is safe:** Tools with no side effects or independent side effects. Searching three databases: safe. Transferring money then checking the balance: not safe — order matters.
+
+## Always Set MAX_ITERATIONS
+
+```python
+MAX_ITERATIONS = 6  # sensible default for most tasks
+
+for iteration in range(MAX_ITERATIONS):
+    # ... the loop body
+    pass
+
+# If we get here, the agent didn't finish
+return "Agent reached maximum iterations without a final answer."
+```
+
+An uncapped `while True` loop is a direct line to runaway API bills. A single stuck agent — maybe the tool it needs keeps returning an error — will happily call the LLM 1,000 times if nothing stops it.
+
+`MAX_ITERATIONS = 6` is a reasonable starting point for most tasks. Increase it for complex multi-step research. Lower it for simple lookups. See [10.7 Loop Budgets](/docs/part-03-building-ai-applications/chapter-10-agent-engineering/107-loop-budgets) for cost-based limits.
+
+## Tool Result Size
+
+Large tool results cause problems. If a tool returns 50,000 tokens of raw text, the entire context window fills up fast.
+
+Common strategies:
+
+| Strategy | How it works |
+|---|---|
+| **Truncate** | Return the first N characters and note that more is available |
+| **Summarize** | Run a cheap model pass to compress the result before feeding it back |
+| **Paginate** | Give the agent a `get_page(n)` tool instead of returning everything at once |
+| **Extract** | Return only the fields the agent is likely to need |
+
+The goal: every tool result should add signal, not noise. A 500-character targeted answer beats a 10,000-character data dump.
+
+## Debugging Tool Loops
+
+When an agent behaves unexpectedly, the message list tells you everything. Print it:
+
+```python
+import json
+for msg in messages:
+    role = msg.get("role", "unknown") if isinstance(msg, dict) else msg.role
+    print(f"[{role}]", json.dumps(msg, indent=2, default=str)[:500])
+```
+
+Look for:
+- Tool calls that returned errors (the agent may have retried silently)
+- Unexpected argument values (the LLM hallucinated a parameter)
+- Loops where the same tool is called with the same arguments repeatedly (the agent is stuck)

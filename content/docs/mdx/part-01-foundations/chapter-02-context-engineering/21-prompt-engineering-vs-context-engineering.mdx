@@ -5,5 +5,113 @@ lastUpdatedDate: '2026-08-05'
 
 # 2.1 Prompt Engineering vs Context Engineering
 
-This section covers the details of 2.1 Prompt Engineering vs Context Engineering.
+There's a moment in every AI developer's journey when they realize that rewriting the system prompt for the fourteenth time isn't going to fix the problem. The model keeps hallucinating, keeps giving generic answers, keeps missing the point. The prompt looks great. The output doesn't.
 
+That's the moment you graduate from prompt engineering to context engineering.
+
+---
+
+## What Prompt Engineering Actually Is
+
+Prompt engineering is the practice of crafting the *instructions* you give the model. Things like:
+
+- Telling the model to respond in a specific tone or format
+- Giving it a persona ("You are a senior Python engineer...")
+- Adding few-shot examples to guide its output style
+- Structuring requests with chain-of-thought hints ("Think step by step...")
+
+These techniques genuinely work. A well-written system prompt can dramatically change how a model behaves. But here's the ceiling you run into: **prompt engineering only controls the instructions. It doesn't control the information.**
+
+If you tell the model "answer accurately about our product catalog" but never actually give it the product catalog, no amount of prompt artistry will fix the hallucinations.
+
+---
+
+## What Context Engineering Is
+
+Context engineering is the discipline of deciding **everything that goes into the context window** — not just the system prompt, but the entire payload the model receives.
+
+The context window contains:
+
+| Layer | What Goes Here |
+|-------|---------------|
+| System prompt | Identity, role, behavioral instructions |
+| Retrieved documents | Relevant chunks from vector DB or search |
+| Tool results | Outputs from APIs, code execution, database queries |
+| Conversation history | Prior turns in the current session |
+| Injected user data | Profile, preferences, account state |
+| Memory | Facts extracted from past sessions |
+| Output constraints | Format requirements, length limits, schema |
+
+A prompt engineer asks: *"How should I word this instruction?"*
+
+A context engineer asks: *"What does the model need to know right now to answer this correctly?"*
+
+---
+
+## The Four-Layer Prompt Architecture
+
+The book organizes the context window into four layers, assembled in this order:
+
+**Layer 1 — Identity**
+Who the agent is. Its name, role, capabilities, and hard limits. This sets the frame for everything else.
+
+```
+You are Atlas, an AI software engineering assistant. You help
+developers write, review, and debug code. You do not execute
+commands outside the provided tool set. You do not access
+external networks unless explicitly authorized.
+```
+
+**Layer 2 — Instructions**
+The operational manual. The workflow the agent follows, how it handles errors, when it escalates, what it does when stuck.
+
+```
+When asked to implement a feature:
+1. Read the relevant existing files first
+2. Write tests before implementation
+3. Run the test suite after each change
+4. Report failures with the exact error message
+```
+
+**Layer 3 — Context Injection**
+Dynamic data assembled at request time: the user's profile, session history, retrieved documents, tool results, memory recalls.
+
+```
+User profile: senior backend engineer, prefers Go and Python
+Current session: fixing authentication bug in user-service
+Relevant files retrieved: auth/middleware.py, auth/tokens.py
+```
+
+**Layer 4 — Output Constraints**
+The exact format required. JSON schema, markdown structure, length limits, required fields.
+
+```
+Respond in JSON with keys: "analysis", "proposed_fix", "confidence" (0-1).
+Maximum response length: 500 tokens.
+```
+
+---
+
+## Why the Distinction Matters
+
+Think of prompt engineering as writing a great job posting. It describes what you want and sets expectations. Context engineering is everything else: giving the employee the right files, the right access, the relevant background documents, and enough context about the current task.
+
+You wouldn't hire a brilliant accountant and then give them no financial records to work with. The brilliance of the model doesn't matter if the context is empty.
+
+> **The core insight:** Most quality problems in production AI systems are information problems, not instruction problems. Before rewriting your prompt, ask: "Does the model have everything it needs?"
+
+---
+
+## The Practical Shift
+
+In 2022, the best AI developers were prompt engineers. By 2025, the best AI developers are context engineers. The craft has moved up the stack — from carefully worded instructions to carefully constructed information pipelines.
+
+Concretely, this means:
+
+- **Less time** tweaking adjectives in system prompts
+- **More time** improving retrieval quality (what docs get pulled)
+- **More time** designing memory systems (what persists across sessions)
+- **More time** structuring tool outputs (what the model sees after an API call)
+- **More time** managing token budgets (what gets cut when context is full)
+
+The model is the same. What changes is the quality of the information it receives.

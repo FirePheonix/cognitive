@@ -5,5 +5,139 @@ lastUpdatedDate: '2026-08-05'
 
 # 20.5 Tool Injection
 
-This section covers the details of 20.5 Tool Injection.
+Tool injection is injecting malicious arguments into tool calls. Instead of attacking the model's instructions, the attacker crafts inputs that, when the model passes them to a tool, cause the tool to do something unintended.
 
+## Attack Patterns
+
+### Path Traversal
+
+```python
+# Attacker-controlled input to a file reading tool
+read_file("../../etc/passwd")
+read_file("../../../home/ubuntu/.ssh/id_rsa")
+read_file("..\\..\\Windows\\System32\\SAM")   # Windows
+```
+
+The model may faithfully relay these paths to your `read_file` implementation without questioning them.
+
+### Shell Injection
+
+```python
+# The model constructs a shell command from user input
+run_command(f"ls {user_provided_directory}")
+
+# Attacker provides:
+user_provided_directory = "; rm -rf /"
+# Resulting command: ls ; rm -rf /
+```
+
+### SQL Injection via Tool
+
+```python
+# Model builds a query from user input
+query_database(f"SELECT * FROM users WHERE name = '{user_input}'")
+
+# Attacker provides:
+user_input = "'; DROP TABLE users; --"
+```
+
+### Argument Smuggling
+
+```python
+# Model calls a tool with what appears to be a normal argument
+send_email(
+    to="user@example.com",
+    subject="Your report",
+    body="Here is your summary.\n\nBCC: attacker@evil.com"  # injected via body
+)
+```
+
+## The Zero-Trust Tool Registry
+
+The defense is to **never trust tool arguments**, regardless of source. Enforce constraints in the tool implementation itself — not in the system prompt. From `atlas-agents/ch14_guardrails/online/tool_permission_enforcer.py:216`:
+
+```python
+from pathlib import Path
+
+def validate_sandbox_path(rel_path: str, base_dir: Path) -> Path:
+    """
+    Resolve the path and verify it remains within the sandbox.
+    Raises PermissionError if the path escapes the base directory.
+    """
+    target = (base_dir / rel_path).resolve()
+    base_resolved = base_dir.resolve()
+
+    if not target.is_relative_to(base_resolved):
+        raise PermissionError(
+            f"Security violation: '{rel_path}' escapes the sandbox "
+            f"(resolved to '{target}', base is '{base_resolved}')."
+        )
+    return target
+
+
+# Usage in every file operation tool
+def read_file(path: str, sandbox: Path = AGENT_SANDBOX) -> str:
+    safe_path = validate_sandbox_path(path, sandbox)
+    return safe_path.read_text()
+```
+
+### Allowlist Shell Commands
+
+For tools that execute shell commands, never use a blocklist. Blocklists always miss something. Use an allowlist:
+
+```python
+# Allowlist — only these commands can be executed
+ALLOWED_COMMANDS = {"pytest", "ruff", "python", "git"}
+
+def run_command(command: str) -> str:
+    executable = command.split()[0]
+
+    if executable not in ALLOWED_COMMANDS:
+        raise PermissionError(
+            f"Command '{executable}' is not in the allowed list: {ALLOWED_COMMANDS}"
+        )
+
+    result = subprocess.run(
+        command.split(),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return result.stdout
+```
+
+### Parameterized Queries for Database Tools
+
+```python
+# BAD: string interpolation enables SQL injection
+def query_database_unsafe(user_filter: str) -> list:
+    cursor.execute(f"SELECT * FROM records WHERE name = '{user_filter}'")
+
+# GOOD: parameterized query — injection is structurally impossible
+def query_database(user_filter: str) -> list:
+    cursor.execute("SELECT * FROM records WHERE name = ?", (user_filter,))
+    return cursor.fetchall()
+```
+
+## Defense Summary
+
+| Attack | Defense |
+|--------|---------|
+| Path traversal | `Path.resolve()` + `is_relative_to()` check on every file operation |
+| Shell injection | Allowlist of permitted executables, never pass to shell directly |
+| SQL injection | Parameterized queries, never string interpolation |
+| Argument smuggling | Validate and sanitize all tool arguments before use |
+
+## The Core Principle
+
+> **Shift security enforcement from prompts to code.**
+
+A system prompt that says "never traverse paths outside the sandbox" will be bypassed by a sufficiently clever injection. Python's `Path.resolve()` will not. The harness always wins over the model's instructions.
+
+All tool implementations should assume their arguments are adversarial. Validate at the tool boundary, not at the prompt boundary.
+
+## Related Sections
+
+- [21.5 Secure Tool Execution](../chapter-21-data-permission-security/215-secure-tool-execution) — the full harness-level enforcement pipeline
+- [21.6 Sandboxing](../chapter-21-data-permission-security/216-sandboxing) — isolating code execution at the OS level
+- [21.1 Permission Boundaries](../chapter-21-data-permission-security/211-permission-boundaries) — role-based access control for tools

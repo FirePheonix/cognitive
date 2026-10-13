@@ -5,5 +5,179 @@ lastUpdatedDate: '2026-08-05'
 
 # 5.7 Throughput Optimization
 
-This section covers the details of 5.7 Throughput Optimization.
+Throughput — tokens generated per second across all concurrent requests — is the primary metric for batch processing and high-volume serving. This section covers the levers you can pull to maximize it.
 
+## Defining Throughput
+
+Two throughput metrics matter differently:
+
+- **Request throughput**: requests completed per second
+- **Token throughput**: total tokens generated per second (across all sequences)
+
+For most capacity planning, **token throughput** is the right metric — it tells you how much total output the system can generate.
+
+```
+Example:
+  100 concurrent requests, each generating 200 tokens in 5 seconds
+  Token throughput = 100 × 200 / 5 = 4,000 tokens/second
+```
+
+## The Fundamental Throughput Equation
+
+```
+Token throughput ≈ (batch_size × GPU_memory_bandwidth) / bytes_per_forward_pass
+```
+
+For decode:
+- Each decode step reads model weights from HBM (~14 GB for 7B fp16)
+- A batch of N sequences reads the same weights N times... but GPU can do it in one pass
+- Effective throughput per second: `(GPU_BW / bytes_per_step) × batch_size`
+
+For an A100 80GB:
+```
+GPU memory bandwidth: 2,000 GB/s
+Bytes per decode step (7B fp16): ~14 GB
+Single-sequence throughput: 2,000 / 14 ≈ 143 steps/second ≈ 143 tokens/second
+Batch of 32: same 14 GB read, 32 tokens generated → 32 × 143 = ~4,576 tokens/second
+```
+
+This is why batch size is the primary lever for throughput. Diminishing returns appear when the GPU becomes compute-saturated (usually at very large batches).
+
+## Lever 1: Batch Size
+
+Larger batches amortize weight reads across more sequences:
+
+| Batch size | Estimated throughput (7B A100) | GPU utilization |
+|---|---|---|
+| 1 | ~150 tok/s | ~5% |
+| 8 | ~1,100 tok/s | ~35% |
+| 32 | ~3,500 tok/s | ~70% |
+| 64 | ~5,500 tok/s | ~80% |
+| 128 | ~7,000 tok/s | ~85% |
+
+The numbers plateau because at large batches, the GPU starts becoming compute-bound (the matrix multiplications saturate CUDA cores, not just memory bandwidth).
+
+```bash
+# Set max batch size in vLLM
+python -m vllm.entrypoints.openai.api_server \
+    --max-num-seqs 128 \           # up to 128 concurrent sequences
+    --max-num-batched-tokens 32768  # up to 32K tokens per forward pass
+```
+
+## Lever 2: Continuous Batching
+
+As covered in Chapter 5.2, continuous batching keeps the batch full by immediately replacing completed sequences. Without it, even a configured batch of 128 might spend 50%+ of time at effective batch size 1–10 as sequences complete unevenly.
+
+The throughput multiplier from continuous batching: **3–10×** compared to static batching on mixed-length workloads.
+
+## Lever 3: KV Cache Efficiency
+
+More KV cache capacity → more concurrent sequences → higher batch size → better throughput.
+
+Three ways to increase effective KV cache capacity:
+
+**A. Quantize the KV cache**
+```bash
+--kv-cache-dtype fp8    # half the memory, negligible quality loss
+```
+
+**B. Use models with GQA**
+Llama-3 (8 KV heads) uses 4× less KV cache than a model with full 32 KV heads:
+```
+Llama-3-8B (GQA): ~0.125 MB per token
+Equivalent MHA model: ~0.5 MB per token
+At same cache budget: 4× more concurrent sequences
+```
+
+**C. Limit per-request context**
+```bash
+--max-model-len 4096    # cap context to 4K instead of 8K
+                        # doubles the number of cacheable sequences
+```
+
+## Lever 4: Model Parallelism
+
+For larger models that don't fit on one GPU or where throughput demands exceed one GPU's capacity:
+
+**Tensor Parallelism** — split each layer across multiple GPUs:
+```bash
+--tensor-parallel-size 2    # split model across 2 GPUs
+                             # roughly 1.8× throughput (some communication overhead)
+```
+
+**Pipeline Parallelism** — assign different layers to different GPUs:
+```
+GPU 0: layers 0–15
+GPU 1: layers 16–31
+```
+Better for very large models; adds pipeline latency.
+
+**Data Parallelism** — run multiple copies of the model:
+```bash
+# Run 2 separate model instances, load balance across them
+# 2× throughput, 2× GPU cost
+```
+
+Data parallelism is the simplest way to scale throughput linearly with GPU count.
+
+## Lever 5: Quantization
+
+Quantized models have smaller weights → fewer bytes to read per decode step → higher throughput:
+
+| Precision | Weight bytes (7B) | Throughput multiplier |
+|---|---|---|
+| fp16 | 14 GB | 1× |
+| int8 | 7 GB | ~1.8× |
+| int4 | 3.5 GB | ~3× |
+
+In practice, gains are smaller than the theoretical maximum due to dequantization overhead and memory bandwidth saturation for large batches. But for small batches (memory-bandwidth dominated), the gains are close to theoretical.
+
+```bash
+# vLLM with AWQ quantization
+python -m vllm.entrypoints.openai.api_server \
+    --model TheBloke/Llama-2-7B-AWQ \
+    --quantization awq
+```
+
+## Lever 6: Hardware
+
+At some point, software optimization isn't enough. Hardware options:
+
+| Hardware | Memory BW | VRAM | Relative LLM throughput |
+|---|---|---|---|
+| RTX 4090 | 1,008 GB/s | 24 GB | 1× (consumer baseline) |
+| A10G | 600 GB/s | 24 GB | 0.7× (lower BW, cloud-friendly) |
+| A100 40GB | 1,555 GB/s | 40 GB | 1.8× |
+| A100 80GB | 2,000 GB/s | 80 GB | 2.1× |
+| H100 SXM | 3,350 GB/s | 80 GB | 3.5× |
+| H200 | 4,800 GB/s | 141 GB | 5× |
+
+Memory bandwidth is the primary differentiator for LLM decode throughput. H100 SXM vs A100 is a 1.7× bandwidth advantage → ~1.7× decode throughput advantage.
+
+## The Throughput vs Latency Tradeoff
+
+Maximizing throughput usually means accepting higher per-request latency:
+
+```
+Low latency config:
+  batch_size=4, max_tokens=256
+  → TTFT: fast, tokens/req: ~600/s, but total throughput: 2,400 tok/s
+
+High throughput config:
+  batch_size=128, max_tokens=2048
+  → TTFT: slower (more queuing), tokens/req: ~600/s, total throughput: ~20,000 tok/s
+```
+
+For background jobs: maximize throughput.  
+For user-facing APIs: balance both — set SLA targets (e.g., TTFT < 500ms, throughput > 50 tok/s per user) and tune batch size to meet both.
+
+## Summary
+
+- Token throughput = batch_size × (GPU_bandwidth / bytes_per_weight_read)
+- Primary levers: batch size, continuous batching, KV cache efficiency, quantization, hardware
+- Continuous batching: the highest-leverage software optimization — keeps batch full constantly
+- KV cache quantization (fp8): halves cache memory → doubles concurrent sequences → 2× throughput
+- GQA models (Llama-3): 4× less KV cache → 4× more concurrent sequences at same memory
+- int4 quantization of weights: ~3× throughput improvement in memory-bound regime
+- Hardware: H100 SXM delivers ~3.5× the LLM decode throughput of RTX 4090, primarily due to memory bandwidth
+- Throughput and latency trade off against each other — tune batch size to meet both SLAs

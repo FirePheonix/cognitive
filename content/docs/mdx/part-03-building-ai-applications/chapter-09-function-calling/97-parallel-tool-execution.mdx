@@ -5,5 +5,203 @@ lastUpdatedDate: '2026-08-05'
 
 # 9.7 Parallel Tool Execution
 
-This section covers the details of 9.7 Parallel Tool Execution.
+Modern LLMs can request multiple tools in a single response. When a model returns three tool calls, the default instinct is to execute them in a loop — sequentially. Don't. Independent tool calls can and should run in parallel.
 
+## The Latency Math
+
+```
+Sequential: 3 calls × 500ms each = 1,500ms total
+
+Parallel:   max(500ms, 500ms, 500ms) = ~600ms total
+            (includes ~100ms overhead for thread/process management)
+```
+
+At scale, this difference compounds. A 10-tool research agent that executes sequentially takes 5 seconds per turn. Parallelized, it takes ~1.2 seconds.
+
+## The Pattern: Fan-Out / Fan-In
+
+Based on `atlas-agents/ch05_state_graphs/online/parallel_fanout.py:90`:
+
+```
+                    ┌─ search_news ─────┐
+request ──(fan-out)─┤─ search_scholar ──├──(fan-in)──► summarize
+                    └─ search_web ──────┘
+```
+
+Three search nodes run in parallel. Results are collected and merged before the summarization step.
+
+## Implementation with `ThreadPoolExecutor`
+
+```python
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+
+def execute_tool_calls_parallel(
+    tool_calls: list,
+    registry,
+    max_workers: int = 10,
+) -> list[dict]:
+    """
+    Execute multiple tool calls in parallel.
+    Returns list of tool result messages in the same order as tool_calls.
+    """
+    results = {}
+
+    def run_one(tc):
+        args = json.loads(tc.function.arguments)
+        result = registry.execute(tc.function.name, args)
+        return tc.id, result
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(run_one, tc): tc for tc in tool_calls}
+
+        for future in as_completed(futures):
+            tc_id, result = future.result()
+            results[tc_id] = result
+
+    # Return in original order
+    return [
+        {
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "content": results[tc.id],
+        }
+        for tc in tool_calls
+    ]
+
+
+# In your agent loop:
+def run_agent_step(messages: list, tools: list) -> list:
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        tools=tools,
+    )
+    msg = response.choices[0].message
+
+    if not msg.tool_calls:
+        return [{"role": "assistant", "content": msg.content}]
+
+    messages.append(msg)
+
+    # Execute all tool calls in parallel
+    tool_results = execute_tool_calls_parallel(msg.tool_calls, registry)
+    messages.extend(tool_results)
+
+    return messages
+```
+
+## Async Implementation
+
+For I/O-bound tools (HTTP calls, database queries), `asyncio` is more efficient than threads:
+
+```python
+import asyncio
+import json
+
+async def execute_tool_async(tc, registry) -> dict:
+    """Execute a single tool call asynchronously."""
+    args = json.loads(tc.function.arguments)
+
+    # If the tool has an async version, use it
+    if hasattr(registry, "execute_async"):
+        result = await registry.execute_async(tc.function.name, args)
+    else:
+        # Run sync tool in executor to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, registry.execute, tc.function.name, args)
+
+    return {
+        "role": "tool",
+        "tool_call_id": tc.id,
+        "content": result,
+    }
+
+
+async def execute_tool_calls_async(tool_calls: list, registry) -> list[dict]:
+    """Execute all tool calls concurrently."""
+    tasks = [execute_tool_async(tc, registry) for tc in tool_calls]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    tool_messages = []
+    for tc, result in zip(tool_calls, results):
+        if isinstance(result, Exception):
+            tool_messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": f"Error: Tool execution failed: {result}",
+            })
+        else:
+            tool_messages.append(result)
+
+    return tool_messages
+```
+
+## Dependency Constraints
+
+Not all tool calls are independent. Sometimes the output of one tool is needed as input to another. The model can express these dependencies by making sequential requests:
+
+```
+Turn 1: model calls search_web("latest Claude models")
+Turn 2: (after seeing search results) model calls get_pricing("claude-sonnet-4-6")
+```
+
+If the model requests tools A and B in the same turn, they are independent by definition — it doesn't have A's output yet when requesting B. Parallel execution is always safe for same-turn tool calls.
+
+## Error Handling in Parallel Execution
+
+When one parallel tool fails, continue with the others:
+
+```python
+def execute_parallel_safe(tool_calls, registry):
+    results = []
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(safe_execute, tc, registry): tc for tc in tool_calls}
+
+        for future in as_completed(futures):
+            tc = futures[future]
+            try:
+                tc_id, result = future.result(timeout=30)
+            except TimeoutError:
+                result = "Error: Tool execution timed out"
+                tc_id = tc.id
+            except Exception as e:
+                result = f"Error: Unexpected failure: {e}"
+                tc_id = tc.id
+
+            results.append({
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": result,
+            })
+
+    return results
+```
+
+The model will handle partial failures gracefully — it can see which tools succeeded and which failed, and adjust its next steps accordingly.
+
+## Benchmarking Parallel vs. Sequential
+
+```python
+import time
+
+def benchmark(tool_calls, registry):
+    # Sequential
+    start = time.time()
+    for tc in tool_calls:
+        args = json.loads(tc.function.arguments)
+        registry.execute(tc.function.name, args)
+    sequential_time = time.time() - start
+
+    # Parallel
+    start = time.time()
+    execute_tool_calls_parallel(tool_calls, registry)
+    parallel_time = time.time() - start
+
+    print(f"Sequential: {sequential_time:.2f}s")
+    print(f"Parallel:   {parallel_time:.2f}s")
+    print(f"Speedup:    {sequential_time / parallel_time:.1f}x")
+```
+
+Run this with your actual tools to measure the real speedup. For fast in-memory tools, parallelism adds overhead with minimal benefit. For HTTP-bound tools, the speedup is close to linear with the number of tools.

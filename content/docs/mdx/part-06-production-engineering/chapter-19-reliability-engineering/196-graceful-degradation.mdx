@@ -5,5 +5,177 @@ lastUpdatedDate: '2026-08-05'
 
 # 19.6 Graceful Degradation
 
-This section covers the details of 19.6 Graceful Degradation.
+When things break, the goal is to return something useful rather than nothing. A raw exception stack trace is never acceptable in a user-facing response. A meaningful partial result is always better than a hard failure.
 
+## The Degradation Ladder
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Tier 1: Full agent response                            │
+│  Tools available, model responsive, all systems nominal │
+└─────────────────────────────────────────────────────────┘
+                         │ (tool failure / slow response)
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  Tier 2: Cached previous response                       │
+│  Return last known good response, flagged as cached     │
+└─────────────────────────────────────────────────────────┘
+                         │ (cache miss / cache failure)
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  Tier 3: Simple model response (no tools)               │
+│  Model answers from training data, no real-time tools   │
+└─────────────────────────────────────────────────────────┘
+                         │ (model also unavailable)
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  Tier 4: Static fallback message                        │
+│  Human-written response explaining the situation        │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Implementation
+
+```python
+async def run_with_degradation(
+    message: str,
+    user_id: str,
+    cache: ResponseCache,
+) -> DegradedResponse:
+
+    # Tier 1: Full agent
+    try:
+        result = await asyncio.wait_for(
+            full_agent.run(message),
+            timeout=30.0,
+        )
+        cache.store(message, result)
+        return DegradedResponse(content=result, tier=1, cached=False)
+
+    except Exception as e:
+        logger.warning(f"Full agent failed: {e}")
+
+    # Tier 2: Cached response
+    cached = cache.get(message)
+    if cached:
+        return DegradedResponse(
+            content=cached.content,
+            tier=2,
+            cached=True,
+            cache_age_hours=cached.age_hours,
+            note="This response is from cache and may be slightly outdated.",
+        )
+
+    # Tier 3: Simple model (no tools)
+    try:
+        result = await asyncio.wait_for(
+            simple_model.complete(message),
+            timeout=10.0,
+        )
+        return DegradedResponse(
+            content=result,
+            tier=3,
+            cached=False,
+            note=(
+                "I'm currently unable to access real-time information. "
+                "This response is based on my training data only."
+            ),
+        )
+
+    except Exception as e:
+        logger.error(f"Simple model also failed: {e}")
+
+    # Tier 4: Static fallback
+    return DegradedResponse(
+        content=get_static_fallback(message),
+        tier=4,
+        cached=False,
+    )
+```
+
+## Response Cache
+
+```python
+import json
+import time
+import hashlib
+
+class ResponseCache:
+    def __init__(self, redis_client, ttl_seconds: int = 3600):
+        self.redis = redis_client
+        self.ttl = ttl_seconds
+
+    def _key(self, message: str) -> str:
+        h = hashlib.sha256(message.encode()).hexdigest()[:16]
+        return f"response_cache:{h}"
+
+    def store(self, message: str, response: str) -> None:
+        self.redis.setex(
+            self._key(message),
+            self.ttl,
+            json.dumps({"content": response, "stored_at": time.time()}),
+        )
+
+    def get(self, message: str) -> CachedResponse | None:
+        raw = self.redis.get(self._key(message))
+        if not raw:
+            return None
+        data = json.loads(raw)
+        age_hours = (time.time() - data["stored_at"]) / 3600
+        return CachedResponse(content=data["content"], age_hours=age_hours)
+```
+
+## Static Fallback Messages
+
+Human-written fallbacks for common failure scenarios:
+
+```python
+STATIC_FALLBACKS = {
+    "default": (
+        "I'm temporarily unable to process your request due to a technical issue. "
+        "Our team has been notified. Please try again in a few minutes."
+    ),
+    "research": (
+        "Real-time research is temporarily unavailable. "
+        "For immediate needs, please check the primary sources directly."
+    ),
+    "code_review": (
+        "Code review is temporarily unavailable. "
+        "Please try again in a few minutes, or review manually."
+    ),
+}
+
+def get_static_fallback(message: str) -> str:
+    # Simple keyword routing to the most relevant fallback
+    message_lower = message.lower()
+    if any(w in message_lower for w in ["search", "research", "find", "look up"]):
+        return STATIC_FALLBACKS["research"]
+    if any(w in message_lower for w in ["code", "review", "pr", "diff"]):
+        return STATIC_FALLBACKS["code_review"]
+    return STATIC_FALLBACKS["default"]
+```
+
+## Never Expose Raw Errors
+
+```python
+# BAD
+raise HTTPException(status_code=500, detail=str(exception))
+# → User sees: "HTTPConnectionPool(host='internal-db', port=5432): Max retries exceeded"
+# → Reveals: internal hostnames, infrastructure details
+
+# GOOD
+return JSONResponse(
+    status_code=503,
+    content={
+        "error": "service_temporarily_unavailable",
+        "message": "I'm unable to complete this request right now. Please try again.",
+        "retry_after": 30,
+    },
+)
+```
+
+## Related Sections
+
+- [19.3 Circuit Breakers](./193-circuit-breakers) — triggers degradation when a provider is down
+- [19.1 Retries](./191-retries) — exhausting retries before falling through to degradation
+- [19.7 Load Shedding](./197-load-shedding) — rejecting requests before they enter the degradation ladder

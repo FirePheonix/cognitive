@@ -5,5 +5,77 @@ lastUpdatedDate: '2026-08-05'
 
 # 17.1 Why Observability Matters
 
-This section covers the details of 17.1 Why Observability Matters.
+You can't debug what you can't see.
 
+LLM calls are fundamentally opaque — the model's internal state, attention patterns, and reasoning process are invisible. You submit a prompt and receive a completion. When the agent does something wrong, the only way to understand why is to examine what actually happened: what inputs it received, what tools it called, what the tools returned, and what reasoning led to the final output.
+
+Observability is how you make that reconstruction possible.
+
+## The Three Signals
+
+| Signal | Question Answered | Examples |
+|--------|------------------|---------|
+| **Traces** | What happened? | Full agent run record, tool call sequence, LLM inputs/outputs |
+| **Metrics** | How much / how often? | Token counts, latency, cost, error rate, tool call frequency |
+| **Logs** | Why? | Error details, security events, PII detections, anomalies |
+
+All three are necessary. Traces without metrics don't scale. Metrics without traces don't explain. Logs without traces lose context.
+
+## What Goes Wrong Without Observability
+
+| Problem | Without Observability | With Observability |
+|---------|-----------------------|-------------------|
+| Agent gives wrong answer | "It just said the wrong thing" | "It called search_web, got a stale result, and used that as the basis for its response" |
+| Agent is slow | "It's slow sometimes" | "The second LLM call averages 3.2s — it's waiting on the database tool" |
+| Costs are rising | "Usage went up" | "Feature X uses 4x more tokens than feature Y; user cohort Z uses it 10x more" |
+| Injection attack succeeded | "Something weird happened" | "At 14:32, the email fetcher returned content with a suspicious injection pattern; the agent called forward_email 30s later" |
+
+## The Trajectory Visualizer
+
+The trajectory visualizer at `atlas-agents/ch18_evaluation/online/trajectory_visualizer.py:270` renders agent runs as color-coded terminal timelines:
+
+```
+Agent Run: research_task_20260805_143201
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 1  [LLM]    claude-opus-4-5          142ms  1,204 tokens  $0.018
+        ├── Input:  "Research the latest papers on RAG architectures"
+        └── Output: <tool_call: search_web(query="RAG architecture 2026")>
+
+Step 2  [TOOL]   search_web               891ms
+        ├── Args:   {"query": "RAG architecture 2026"}
+        └── Result: [5 results returned]
+
+Step 3  [LLM]    claude-opus-4-5          203ms  3,891 tokens  $0.058
+        ├── Input:  [search results injected into context]
+        └── Output: <tool_call: fetch_url(url="https://arxiv.org/abs/...")>
+
+Step 4  [TOOL]   fetch_url                1,204ms
+        └── Result: [paper content, 8,432 chars]
+
+Step 5  [LLM]    claude-opus-4-5          445ms  6,102 tokens  $0.091
+        └── Output: "Here is a summary of recent RAG research..."
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Total:  2,885ms  |  11,197 tokens  |  $0.167
+```
+
+This view makes it immediately clear where time was spent, what each step cost, and what the agent actually did.
+
+## Observability is Not Optional for Production
+
+For development, you can reconstruct behavior from print statements. For production:
+
+- You cannot reproduce every user session for debugging
+- You cannot ask users what input triggered the bug
+- You cannot inspect the model's "reasoning" after the fact
+
+Without traces and metrics, production incidents become guesswork.
+
+> **The cost of not having observability is not zero.** It's the engineering hours spent debugging in the dark, the customer trust lost to unexplained failures, and the security incidents that go undetected until they become breaches.
+
+## Related Sections
+
+- [17.2 Traces](./172-traces) — the complete record of one agent run
+- [17.4 Token Metrics](./174-token-metrics) — tracking cost and usage
+- [17.10 Agent Tracing](./1710-agent-tracing) — LangSmith integration for automatic tracing

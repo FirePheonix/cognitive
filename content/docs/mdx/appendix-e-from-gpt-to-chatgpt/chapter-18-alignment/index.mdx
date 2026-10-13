@@ -391,3 +391,53 @@ The model learned to be *more useful*, not just *more fluent*. That's the gap al
 - **PPO**: Ratio = `π_new / π_old`. Clipped to `[1-ε, 1+ε]` to prevent destabilizing large updates. KL penalty prevents reward hacking.
 - **DPO**: Directly optimizes on preference data without a separate RM. Loss = `-log(sigma(beta * (chosen_improvement - rejected_improvement)))`. Simpler, more stable, now preferred by most practitioners.
 - Both RLHF and DPO use the **SFT model as a reference** — the aligned model should not deviate too far from it (prevents degenerate outputs).
+
+---
+
+## The Complete Math of RLHF and DPO
+
+**The Bradley-Terry reward model:**
+To learn which responses humans prefer, you train a reward model $r_\phi(x, y)$ that scores responses. With preference pairs $(x, y_w, y_l)$, the Bradley-Terry model says:
+
+$$P(y_w \succ y_l \mid x) = \sigma(r_\phi(x, y_w) - r_\phi(x, y_l))$$
+
+Training objective:
+
+$$\mathcal{L}_{\text{RM}} = -\log \sigma(r_\phi(x, y_w) - r_\phi(x, y_l))$$
+
+Intuition: train the model to assign higher reward to preferred responses. Sigmoid converts the score difference to a probability; log-likelihood training maximizes correct preference predictions.
+
+**The RLHF objective — reward + KL constraint:**
+
+$$\max_\theta \mathbb{E}_{y \sim \pi_\theta}[r_\phi(x, y)] - \beta D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}})$$
+
+Two competing forces:
+- Maximize reward (generate responses humans prefer)
+- Stay close to the reference policy $\pi_{\text{ref}}$ (don't drift too far from the original model)
+
+The $\beta$ coefficient controls this tradeoff. High $\beta$ = conservative (don't change much). Low $\beta$ = aggressive (chase reward more). The KL term is essential — without it, the model would learn to "hack" the reward model with outputs that score high but are nonsensical.
+
+**PPO — the gradient update rule:**
+PPO solves this with a clipped objective:
+
+$$\rho_t = \frac{\pi_\theta(a_t \mid s_t)}{\pi_{\theta_{\text{old}}}(a_t \mid s_t)}$$
+
+$$L = \mathbb{E}\left[\min\left(\rho_t A_t, \text{clip}(\rho_t, 1-\epsilon, 1+\epsilon) A_t\right)\right]$$
+
+The clip prevents any single update from changing the policy too much. If $\rho_t > 1 + \epsilon$, the gradient is cut off — don't let this step dominate. This is what makes PPO stable on long training runs.
+
+**DPO — skipping the reward model entirely:**
+DPO (Direct Preference Optimization) is mathematically elegant: it rearranges the RLHF objective to directly optimize preferences without ever training a reward model.
+
+$$\mathcal{L}_{\text{DPO}} = -\log \sigma\left(\beta \left[\log \frac{\pi_\theta(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)} - \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)}\right]\right)$$
+
+Interpretation: increase the model's relative probability of preferred responses ($y_w$) and decrease it for rejected responses ($y_l$), all relative to the reference model. No explicit reward model, no RL loop. Just gradient descent on paired preferences.
+
+**Goodhart's Law and alignment tax:**
+If your reward model $r_\phi$ isn't perfectly aligned with true human preferences $r^*$:
+
+$$r_\phi \neq r^*$$
+
+Then maximizing $r_\phi$ will eventually diverge from maximizing $r^*$. The model learns to game the proxy. This is Goodhart's Law in action: "When a measure becomes a target, it ceases to be a good measure."
+
+Post-training can also introduce an "alignment tax" — tradeoffs where making a model safer or more helpful in one dimension hurts other capabilities: calibration, factual diversity, reasoning on unusual topics.

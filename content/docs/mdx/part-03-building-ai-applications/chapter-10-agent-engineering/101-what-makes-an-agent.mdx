@@ -5,5 +5,113 @@ lastUpdatedDate: '2026-08-05'
 
 # 10.1 What Makes an Agent
 
-This section covers the details of 10.1 What Makes an Agent.
+## The Most Important Distinction First
 
+An agent is **not** a smarter chatbot.
+
+A chatbot answers once. You send it a message, it replies, conversation over. An agent keeps going — it takes an action, looks at what happened, decides what to do next, and repeats that cycle until the job is done (or it hits a wall).
+
+That loop is the whole idea.
+
+## The Four-Stage Agentic Loop
+
+Every agent — no matter how complex — runs through the same four stages:
+
+![The Agentic Loop — Perceive, Plan, Act, Observe](/part-03/chapter-10/agentic-loop.jpeg)
+*Fig: The Agentic Loop — Perceive, Plan, Act, Observe. Every agent, no matter how complex, runs this cycle.*
+
+```
+Perceive → Plan → Act → Observe
+    ↑                        |
+    └────────────────────────┘
+```
+
+| Stage | What happens | Concrete example |
+|---|---|---|
+| **Perceive** | Receive input from the environment | User asks: "What's the weather in Paris this weekend?" |
+| **Plan** | Decide what action to take next | "I need to call the weather API for Paris, Saturday and Sunday" |
+| **Act** | Execute the action | Calls `get_weather(city="Paris", date="2026-08-08")` |
+| **Observe** | Read the result | Gets back `{"temp": 24, "condition": "sunny"}` |
+
+Then the loop starts again. The agent perceives the observation, plans the next step (maybe format a response now), acts, and observes again — until there's nothing left to do.
+
+## The Decision Rule
+
+Before you build an agent, ask yourself this:
+
+> **"If I can draw my logic as a flowchart with no branches that depend on LLM output, I don't need an agent. I should just write the code."**
+
+A hard-coded pipeline that always runs step A → step B → step C is not an agent. It's a script. Agents are for situations where the *path through the problem* is unknown until you start walking it.
+
+## The Minimal Working Agent
+
+Here's the simplest agent that actually works — a ReAct loop in under 20 lines (from `atlas-agents/ch01_react_from_scratch/atlas_v01.py:172`):
+
+```python
+# The ReAct loop — the simplest agent that works
+def run_atlas(question: str) -> str:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+    for iteration in range(MAX_ITERATIONS):
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            tools=TOOL_SCHEMAS,
+        )
+        msg = response.choices[0].message
+        messages.append(msg)
+        if not msg.tool_calls:
+            return msg.content  # Final answer — no more tools needed
+        for tool_call in msg.tool_calls:
+            result = TOOLS[tool_call.function.name](**json.loads(tool_call.function.arguments))
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+    return "Agent reached maximum iterations without a final answer."
+```
+
+Walk through what this does:
+
+1. Sends the question to the LLM with a list of available tools
+2. If the LLM returns a final answer (no tool calls) → **done**
+3. If the LLM requests tools → execute each one, append results, loop again
+4. If it loops too many times → bail out with an error message
+
+Notice `MAX_ITERATIONS`. That guard is not optional — see [10.7 Loop Budgets](/docs/part-03-building-ai-applications/chapter-10-agent-engineering/107-loop-budgets) for why an uncapped loop is dangerous.
+
+## The Four Patterns That Dominate Production
+
+You'll encounter four architectural patterns repeatedly. Here's when to use each:
+
+| Pattern | How it works | Best for |
+|---|---|---|
+| **ReAct** | Think → Act → Observe, one step at a time | Open-ended tasks where the path is unknown |
+| **Chain-of-Thought** | Reason through steps in text before acting | Problems that benefit from explicit reasoning |
+| **Reflection** | Generate → critique → revise | Quality-sensitive output like code or reports |
+| **Plan-and-Execute** | Make a full plan upfront, then execute it | Structured workflows with a known scope |
+
+These patterns aren't mutually exclusive. A production agent might use Plan-and-Execute for the outer structure and Reflection for individual steps that produce artifacts.
+
+> **ReAct** is the right default. Start there. Add the other patterns when you have a specific reason.
+
+## Chatbot vs Agent: Side by Side
+
+```
+Chatbot:
+  User: "Summarize this document"
+  LLM: [produces summary]
+  Done.
+
+Agent:
+  User: "Research competitors and write a briefing"
+  LLM: "I'll search for each competitor first"
+  → search("Competitor A")  → reads result
+  → search("Competitor B")  → reads result
+  → search("Competitor C")  → reads result
+  LLM: "Now I'll write the briefing"
+  → write_file("briefing.md", content)
+  LLM: "Done. Here's a summary of what I wrote."
+  Done.
+```
+
+The agent's path through the problem wasn't known at the start. It discovered what to do by acting and observing. That's the essential difference.

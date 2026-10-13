@@ -5,5 +5,150 @@ lastUpdatedDate: '2026-08-05'
 
 # 19.3 Circuit Breakers
 
-This section covers the details of 19.3 Circuit Breakers.
+When an LLM provider is degraded or down, retrying every request wastes time and amplifies load on an already-struggling service. The circuit breaker pattern detects provider failures and routes around them automatically.
 
+## The Three States
+
+```
+                    failure_threshold reached
+                    ┌────────────────────────►  OPEN
+                    │                            │
+                 CLOSED                          │ cooldown_period expires
+                 (normal)                        │
+                    ▲                            ▼
+                    │                         HALF-OPEN
+                    │                         (recovery probe)
+                    │                            │
+                    └────────────────────────────┘
+                         probe succeeds → close
+                         probe fails → reopen
+```
+
+| State | Behavior |
+|-------|----------|
+| **Closed** | Normal operation. Requests pass through. Failures are counted. |
+| **Open** | Provider is down. Skip it, route to fallback, return error. No requests sent. |
+| **Half-open** | Cooldown expired. Send one probe request. If it succeeds, close. If it fails, reopen. |
+
+## Implementation
+
+From `atlas-agents/ch07_model_portability/online/model_router.py:137`:
+
+```python
+import time
+
+class ProviderState:
+    def __init__(self, name: str, failure_threshold: int = 3, cooldown_secs: int = 120):
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.cooldown_secs = cooldown_secs
+        self.failure_count = 0
+        self.last_failure: float = 0.0
+        self.state = "closed"
+
+    def is_available(self) -> bool:
+        """Returns True if this provider should receive requests."""
+        if self.state == "closed":
+            return True
+        if self.state == "open":
+            if self.is_on_cooldown():
+                return False
+            # Cooldown expired — transition to half-open
+            self.state = "half-open"
+            return True  # Allow one probe request
+        if self.state == "half-open":
+            return True  # Allow the probe
+
+    def is_on_cooldown(self) -> bool:
+        return time.time() - self.last_failure < self.cooldown_secs
+
+    def mark_failed(self) -> None:
+        self.failure_count += 1
+        self.last_failure = time.time()
+
+        if self.failure_count >= self.failure_threshold:
+            self.state = "open"
+            logger.warning(
+                f"Circuit breaker OPENED for provider '{self.name}' "
+                f"after {self.failure_count} failures."
+            )
+
+    def mark_succeeded(self) -> None:
+        if self.state == "half-open":
+            logger.info(f"Circuit breaker CLOSED for provider '{self.name}' — probe succeeded.")
+        self.state = "closed"
+        self.failure_count = 0
+```
+
+## The Model Router
+
+The circuit breaker lives in the router that tries providers in priority order:
+
+```python
+class ModelRouter:
+    def __init__(self, providers: list[str]):
+        self.states = {name: ProviderState(name) for name in providers}
+        self.priority = providers  # Try in this order
+
+    def complete(self, messages: list, **kwargs) -> str:
+        for provider_name in self.priority:
+            state = self.states[provider_name]
+
+            if not state.is_available():
+                logger.debug(f"Skipping '{provider_name}' — circuit breaker open.")
+                continue
+
+            try:
+                result = self._call_provider(provider_name, messages, **kwargs)
+                state.mark_succeeded()
+                return result
+
+            except (RateLimitError, APIStatusError) as e:
+                if e.status_code in (500, 502, 503, 504):
+                    state.mark_failed()
+                    logger.warning(f"Provider '{provider_name}' failed: {e}")
+                    continue  # Try next provider
+                raise  # Non-retryable — propagate immediately
+
+        raise AllProvidersUnavailableError(
+            "All LLM providers are unavailable. Please try again later."
+        )
+```
+
+## Provider Priority Configuration
+
+```python
+# Primary: Claude. Secondary: GPT-4. Tertiary: local Ollama.
+router = ModelRouter(
+    providers=["anthropic/claude-opus-4-5", "openai/gpt-4o", "ollama/llama3"]
+)
+
+# For cost-sensitive routing: fast/cheap primary, capable secondary
+router = ModelRouter(
+    providers=["anthropic/claude-haiku", "anthropic/claude-opus-4-5"]
+)
+```
+
+## Circuit Breaker Metrics
+
+Track circuit breaker state changes — they're production health signals:
+
+```python
+def mark_failed(self) -> None:
+    ...
+    if self.state == "open":
+        metrics.increment("circuit_breaker.opened", tags={"provider": self.name})
+        alert_oncall(f"Circuit breaker opened for {self.name}")
+
+def mark_succeeded(self) -> None:
+    if self.state == "half-open":
+        metrics.increment("circuit_breaker.closed", tags={"provider": self.name})
+```
+
+Frequent circuit breaker trips for a specific provider → investigate that provider's reliability or switch your default.
+
+## Related Sections
+
+- [19.1 Retries](./191-retries) — retries and circuit breakers work together
+- [19.4 Rate Limiting](./194-rate-limiting) — rate limiting prevents hitting circuit breaker thresholds
+- [19.6 Graceful Degradation](./196-graceful-degradation) — what to return when the circuit is open

@@ -5,5 +5,136 @@ lastUpdatedDate: '2026-08-05'
 
 # 8.3 Grammar-Constrained Generation
 
-This section covers the details of 8.3 Grammar-Constrained Generation.
+Grammar-constrained generation is the most reliable approach to structured output. Instead of asking the model to produce valid JSON and hoping it does, you intercept token selection at inference time and *only allow tokens that keep the output valid*.
 
+At each generation step, the engine evaluates which tokens from the vocabulary are legal given the current output and the target schema. Illegal tokens get their logit set to negative infinity — they simply cannot be chosen.
+
+The result: it is **mathematically impossible** for the model to generate invalid JSON or JSON that violates your schema.
+
+## How It Works
+
+Given the schema:
+
+```python
+class Report(BaseModel):
+    title: str
+    confidence: Literal["high", "medium", "low"]
+```
+
+When the model is generating the value for `confidence`, the token mask allows only `"high"`, `"medium"`, or `"low"`. Every other token is blocked. The model still exercises its understanding — it picks the most probable *valid* token — but it cannot produce `"very high"` or forget the field entirely.
+
+## Outlines
+
+[Outlines](https://github.com/outlines-dev/outlines) is the leading library for grammar-constrained generation with Pydantic schemas:
+
+```python
+import outlines
+from pydantic import BaseModel
+from typing import Literal
+
+class ResearchReport(BaseModel):
+    title: str
+    summary: str
+    findings: list[str]
+    confidence: Literal["high", "medium", "low"]
+
+# Load a local model
+model = outlines.models.transformers("mistralai/Mistral-7B-Instruct-v0.2")
+
+# Structured generator — enforces the schema at token level
+generator = outlines.generate.json(model, ResearchReport)
+
+report = generator("Summarize the latest findings on transformer reasoning.")
+# report is already a ResearchReport object — not a string
+print(report.confidence)  # "high" | "medium" | "low" — guaranteed
+```
+
+## Guidance
+
+[Guidance](https://github.com/guidance-ai/guidance) takes a template-based approach:
+
+```python
+import guidance
+from guidance import models, gen, select
+
+lm = models.LlamaCpp("mistral-7b.gguf")
+
+with guidance.system():
+    lm += "You are a research assistant."
+
+with guidance.user():
+    lm += "Summarize findings on LLM reasoning."
+
+with guidance.assistant():
+    lm += '{"title": "' + gen("title", stop='"') + '", '
+    lm += '"confidence": "' + select(["high", "medium", "low"], name="confidence") + '"}'
+```
+
+## llama.cpp with GBNF Grammars
+
+For C++ deployments, llama.cpp supports GBNF (Generalized Backus-Naur Form) grammars:
+
+```
+root   ::= object
+object ::= "{" ws "\"title\"" ws ":" ws string "," ws "\"confidence\"" ws ":" ws confidence "}" ws
+confidence ::= "\"high\"" | "\"medium\"" | "\"low\""
+string ::= "\"" [^"]* "\""
+ws ::= [ \t\n]*
+```
+
+Pass the grammar file to the server: `./server --grammar-file report.gbnf`
+
+## vLLM with Guided Decoding
+
+For high-throughput serving with guided decoding:
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(model="mistralai/Mistral-7B-Instruct-v0.2")
+
+sampling_params = SamplingParams(
+    guided_json=ResearchReport.model_json_schema(),  # Pass the JSON schema
+    temperature=0.7,
+)
+
+output = llm.generate("Summarize findings...", sampling_params)
+```
+
+## Ollama
+
+Ollama supports JSON schema constraints in its API:
+
+```python
+import ollama
+
+response = ollama.chat(
+    model="llama3.2",
+    messages=[{"role": "user", "content": "Summarize findings on LLM reasoning."}],
+    format=ResearchReport.model_json_schema(),  # Structured output
+)
+```
+
+## The Tradeoff
+
+| Approach | Schema Guarantee | Works with OpenAI/Anthropic | Throughput |
+|---|---|---|---|
+| Grammar-constrained | 100% | ❌ No | Lower (token masking overhead) |
+| JSON mode + validation | ~95% | ✅ Yes | Normal |
+| Prompt engineering only | ~80% | ✅ Yes | Normal |
+
+Grammar-constrained generation has two costs: it requires running the model yourself (or using a provider that exposes it), and it adds token-masking overhead that slightly reduces throughput.
+
+## When to Use It
+
+Use grammar-constrained generation when:
+
+- You control the inference stack (self-hosted, vLLM, Ollama)
+- Schema compliance failures would be costly or dangerous
+- You're building data pipelines where downstream code expects exact structure
+- You want to eliminate the entire retry/repair loop
+
+Don't use it when:
+- You're calling OpenAI, Anthropic, or Gemini APIs directly
+- Slightly occasional validation failures are acceptable and catchable
+- You need maximum throughput

@@ -5,5 +5,235 @@ lastUpdatedDate: '2026-08-05'
 
 # 14.7 Retrieval Failure Analysis
 
-This section covers the details of 14.7 Retrieval Failure Analysis.
+When your RAG system produces poor answers, the root cause is often retrieval — not the LLM. Systematic failure analysis tells you exactly what went wrong and where to fix it.
 
+## The Failure Taxonomy
+
+| Failure type | Symptom | Likely cause | Fix |
+|---|---|---|---|
+| Empty retrieval | No results returned | Query too specific, wrong embedding model, index empty | Expand query, verify index, check embedding |
+| Irrelevant retrieval | Results unrelated to query | Semantic mismatch, poor chunking | Better chunking, hybrid search, domain-tuned embeddings |
+| Missing key document | Correct doc exists but not retrieved | Low recall, embedding quality | Improve chunk overlap, increase K, better embeddings |
+| Stale retrieval | Correct doc but outdated info | Index not refreshed | Schedule index updates, add freshness metadata |
+| Context pollution | Too many irrelevant results | Low precision, K too high | Lower K, add reranking, metadata filters |
+| Chunking artifacts | Retrieved chunk lacks context | Chunk boundary cuts mid-sentence | Increase overlap, use semantic chunking |
+| Query-document vocabulary gap | User says "ML" but docs say "machine learning" | Terminology mismatch | Query expansion, hybrid BM25+vector |
+
+## Diagnostic Framework
+
+When a query returns poor results, work through the diagnostic stack:
+
+```python
+def diagnose_retrieval_failure(
+    query: str,
+    expected_doc_id: str,
+    retrieved_docs: list[dict],
+    vector_store,
+    all_documents: list[dict]
+) -> dict:
+    diagnosis = {}
+
+    # 1. Check: did the expected document even get retrieved?
+    retrieved_ids = {doc["id"] for doc in retrieved_docs}
+    diagnosis["expected_doc_retrieved"] = expected_doc_id in retrieved_ids
+
+    if not diagnosis["expected_doc_retrieved"]:
+        # 2. Check: does the expected document exist in the index?
+        doc_in_index = any(d["id"] == expected_doc_id for d in all_documents)
+        diagnosis["expected_doc_in_index"] = doc_in_index
+
+        if doc_in_index:
+            # 3. Check: what's the similarity score of the expected document?
+            query_embedding = embedding_model.encode(query)
+            expected_doc = next(d for d in all_documents if d["id"] == expected_doc_id)
+            expected_embedding = embedding_model.encode(expected_doc["content"])
+            similarity = float(np.dot(query_embedding, expected_embedding))
+
+            diagnosis["expected_doc_similarity"] = similarity
+            diagnosis["retrieved_top_similarity"] = max(
+                float(np.dot(query_embedding, embedding_model.encode(d["content"])))
+                for d in retrieved_docs
+            )
+
+            # 4. Diagnose: why was the similarity low?
+            if similarity < 0.6:
+                diagnosis["likely_cause"] = "vocabulary_mismatch_or_semantic_gap"
+                diagnosis["recommendation"] = "try hybrid BM25+vector, or query expansion"
+            elif similarity > 0.6 and similarity < diagnosis["retrieved_top_similarity"]:
+                diagnosis["likely_cause"] = "correct_doc_ranks_below_k"
+                diagnosis["recommendation"] = f"increase K (current: {len(retrieved_docs)})"
+
+    return diagnosis
+```
+
+## Analyzing Failure Patterns at Scale
+
+Run failure analysis across a golden dataset to identify systematic issues:
+
+```python
+def batch_failure_analysis(
+    golden_dataset: list[dict],
+    retriever,
+    k: int = 5
+) -> dict:
+    failure_counts = {
+        "empty_retrieval": 0,
+        "missing_key_doc": 0,
+        "irrelevant_results": 0,
+        "stale_content": 0,
+        "success": 0
+    }
+    failure_examples = []
+
+    for item in golden_dataset:
+        query = item["query"]
+        expected_ids = set(item["relevant_doc_ids"])
+
+        retrieved = retriever.retrieve(query, k=k)
+        retrieved_ids = {doc.metadata["id"] for doc in retrieved}
+
+        if not retrieved:
+            failure_counts["empty_retrieval"] += 1
+            failure_examples.append({"type": "empty", "query": query})
+            continue
+
+        overlap = expected_ids & retrieved_ids
+        if not overlap:
+            failure_counts["missing_key_doc"] += 1
+            failure_examples.append({"type": "missing", "query": query, "expected": list(expected_ids)})
+        elif len(overlap) < len(expected_ids):
+            failure_counts["irrelevant_results"] += 1
+        else:
+            failure_counts["success"] += 1
+
+    total = len(golden_dataset)
+    return {
+        "failure_rates": {k: v/total for k, v in failure_counts.items()},
+        "total_queries": total,
+        "top_failures": failure_examples[:10]
+    }
+```
+
+## Fixing Empty Retrieval
+
+```python
+def robust_retrieval_with_fallback(query: str, k: int = 5) -> list:
+    # Try 1: standard vector search
+    results = vector_store.similarity_search(query, k=k)
+
+    if results:
+        return results
+
+    # Try 2: BM25 keyword search (catches cases where semantic embedding fails)
+    results = bm25_index.search(query, top_n=k)
+    if results:
+        return results
+
+    # Try 3: Query expansion — generate alternative phrasings
+    expanded_query = expand_query(query)
+    results = vector_store.similarity_search(expanded_query, k=k)
+
+    if results:
+        return results
+
+    # Try 4: Entity extraction and search
+    entities = extract_entities(query)
+    for entity in entities:
+        results = vector_store.similarity_search(entity, k=k)
+        if results:
+            return results
+
+    return []  # truly empty — surface this as a known failure
+
+
+def expand_query(query: str) -> str:
+    """Generate an alternative phrasing to recover from vocabulary mismatch."""
+    expansion_prompt = f"""
+    Rephrase this search query using different terminology.
+    Keep the same meaning but use synonyms and alternative phrasings.
+    
+    Original: {query}
+    Rephrased:
+    """
+    return llm.invoke(expansion_prompt).content.strip()
+```
+
+## Fixing Missing Key Documents
+
+When the correct document exists but isn't being retrieved:
+
+```python
+# Problem: chunks are too small, lose context
+# Fix: increase overlap between chunks
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# Before: tight chunks, low overlap
+bad_splitter = RecursiveCharacterTextSplitter(chunk_size=256, chunk_overlap=0)
+
+# After: larger chunks, meaningful overlap
+good_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=512,
+    chunk_overlap=128,  # 25% overlap
+    separators=["\n\n", "\n", ". ", " ", ""]
+)
+
+# Also: add parent document retrieval
+# Index small chunks for retrieval, but return the parent (larger) chunk
+def add_with_parent_reference(doc: dict, chunk_size: int = 256):
+    chunks = good_splitter.split_text(doc["content"])
+    for i, chunk in enumerate(chunks):
+        vector_store.add_texts(
+            texts=[chunk],
+            metadatas=[{
+                "doc_id": doc["id"],
+                "chunk_index": i,
+                "parent_content": doc["content"]  # full doc stored in metadata
+            }]
+        )
+```
+
+## Fixing Context Pollution
+
+```python
+def filtered_retrieval(query: str, k: int = 5, similarity_threshold: float = 0.72) -> list:
+    """Apply a minimum similarity score to filter noise."""
+    results_with_scores = vector_store.similarity_search_with_score(query, k=k * 2)
+
+    # Filter by threshold
+    filtered = [
+        (doc, score) for doc, score in results_with_scores
+        if score >= similarity_threshold
+    ]
+
+    # If we have fewer than needed after filtering, return what we have
+    return [doc for doc, _ in filtered[:k]]
+```
+
+## Building a Retrieval Health Dashboard
+
+```python
+def retrieval_health_check(golden_dataset: list[dict], retriever) -> None:
+    """Run daily and alert on regressions."""
+    metrics = {
+        f"recall@{k}": recall_at_k(retriever, golden_dataset, k)
+        for k in [1, 3, 5, 10]
+    }
+    metrics.update({
+        f"precision@{k}": precision_at_k(retriever, golden_dataset, k)
+        for k in [3, 5]
+    })
+
+    failures = batch_failure_analysis(golden_dataset, retriever)
+    metrics["empty_retrieval_rate"] = failures["failure_rates"]["empty_retrieval"]
+    metrics["missing_doc_rate"] = failures["failure_rates"]["missing_key_doc"]
+
+    # Log and alert
+    for metric_name, value in metrics.items():
+        logger.info(f"retrieval.{metric_name}", extra={"value": value})
+
+        if metric_name == "recall@5" and value < 0.70:
+            alert(f"⚠️ Recall@5 dropped to {value:.2f} — investigate retrieval pipeline")
+```
+
+Schedule this daily. Silent degradation in retrieval quality is one of the most common production failures in RAG systems — and without systematic measurement, you'll only find out when users complain.

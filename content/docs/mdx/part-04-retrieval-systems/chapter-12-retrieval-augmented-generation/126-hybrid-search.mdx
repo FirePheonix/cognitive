@@ -5,5 +5,116 @@ lastUpdatedDate: '2026-08-05'
 
 # 12.6 Hybrid Search
 
-This section covers the details of 12.6 Hybrid Search.
+Hybrid search combines **dense vector search** (semantic) with **BM25** (keyword/sparse) into a single retrieval step. It consistently outperforms either approach alone.
 
+## The Complementary Strengths
+
+| | Dense (Semantic) | BM25 (Keyword) |
+|---|---|---|
+| **Finds** | Synonyms, paraphrases, concepts | Exact matches, rare terms |
+| **Misses** | Exact product names, version numbers, error codes | Paraphrasing, synonyms |
+| **Best for** | "How do I set up authentication?" | "ERROR_CODE_4821" |
+| **Weakness** | Exact technical terms get diluted | Requires exact token match |
+
+### Why Dense-Only Fails on Technical Queries
+
+```
+Query: "AttributeError: 'NoneType' object has no attribute 'split'"
+
+Dense search:
+  → Finds documents about "error handling" and "attribute errors"
+  → May miss the specific NoneType/split combination
+
+BM25 search:
+  → Finds documents containing "NoneType" AND "split" AND "AttributeError"
+  → Exact match on the error text
+
+Hybrid:
+  → BM25 finds the exact error; dense finds related debugging guides
+  → Both signal the same document → it ranks first
+```
+
+## Reciprocal Rank Fusion
+
+The standard way to combine dense and BM25 results is **Reciprocal Rank Fusion (RRF)**:
+
+```python
+def reciprocal_rank_fusion(
+    dense_results: list[tuple[str, float]],   # (doc_id, score)
+    bm25_results: list[tuple[str, float]],
+    k: int = 60,
+) -> list[tuple[str, float]]:
+    """Fuse two ranked lists using RRF."""
+    scores: dict[str, float] = {}
+
+    for rank, (doc_id, _) in enumerate(dense_results):
+        scores[doc_id] = scores.get(doc_id, 0) + 1 / (k + rank + 1)
+
+    for rank, (doc_id, _) in enumerate(bm25_results):
+        scores[doc_id] = scores.get(doc_id, 0) + 1 / (k + rank + 1)
+
+    # Sort by fused score descending
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+```
+
+RRF is preferred over simple score averaging because the two scoring systems are on different scales — adding raw scores would give BM25 an arbitrary advantage.
+
+## Qdrant Hybrid Search
+
+Qdrant supports hybrid search natively via `query_mode`:
+
+```python
+from qdrant_client.models import SparseVector
+
+# Requires a collection with both dense and sparse vector config
+results = qclient.query_points(
+    collection_name="agent_memory",
+    query=embed(query),                           # Dense vector
+    using="dense",
+    sparse_vector=SparseVector(                   # BM25 sparse vector
+        indices=bm25_encoder.encode_indices(query),
+        values=bm25_encoder.encode_values(query),
+    ),
+    query_mode="hybrid",                          # Automatic RRF fusion
+    limit=10,
+)
+```
+
+## LangChain Integration
+
+```python
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
+from langchain_community.vectorstores import Qdrant
+
+# Dense retriever
+vector_retriever = Qdrant(...).as_retriever(search_kwargs={"k": 10})
+
+# Sparse retriever
+bm25_retriever = BM25Retriever.from_documents(documents, k=10)
+
+# Hybrid: equal weight by default
+hybrid_retriever = EnsembleRetriever(
+    retrievers=[bm25_retriever, vector_retriever],
+    weights=[0.5, 0.5],
+)
+
+results = hybrid_retriever.invoke("AttributeError NoneType split")
+```
+
+## When to Weight Differently
+
+The 50/50 split is a sensible default, but tune it based on your workload:
+
+| Workload | Recommended weights |
+|---|---|
+| Technical docs with exact error codes | BM25: 0.6, Dense: 0.4 |
+| General knowledge base | BM25: 0.4, Dense: 0.6 |
+| Code search | BM25: 0.7, Dense: 0.3 |
+| Customer conversation history | BM25: 0.3, Dense: 0.7 |
+
+Measure retrieval quality using your golden dataset: find the weights that maximize the rate of relevant documents in the top 3 results across your specific document corpus.
+
+## Short Answer
+
+Always use hybrid search. The performance gains on exact technical terms alone justify it, and it never hurts precision on semantic queries.

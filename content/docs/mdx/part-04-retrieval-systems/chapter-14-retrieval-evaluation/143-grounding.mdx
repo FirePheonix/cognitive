@@ -5,5 +5,214 @@ lastUpdatedDate: '2026-08-05'
 
 # 14.3 Grounding
 
-This section covers the details of 14.3 Grounding.
+Grounding measures whether the model's answer is actually derived from the retrieved documents — or whether it's making things up. A fully grounded answer contains only information that can be traced back to retrieved content. An ungrounded answer, even if it sounds confident, is a hallucination.
 
+## What Grounding Measures
+
+Grounding evaluates the **faithfulness** of an answer to its source documents:
+
+- **Grounded claim:** "The refund window is 30 days" — supported by retrieved document containing "customers may request a refund within 30 days."
+- **Ungrounded claim:** "Refunds are processed within 3 business days" — no retrieved document mentions processing time.
+
+The ungrounded claim may or may not be true in reality. That's not the point. The point is: **the model generated it without evidence**.
+
+## Why Grounding Is the Hallucination Proxy
+
+Hallucinations are difficult to measure directly — you'd need to verify every claim against a ground-truth knowledge base. Grounding is a practical proxy: an answer where every claim is supported by retrieved documents is extremely unlikely to hallucinate domain-specific facts.
+
+The relationship:
+```
+High grounding rate → Model stays within retrieved evidence → Low hallucination risk
+Low grounding rate  → Model invents beyond evidence      → High hallucination risk
+```
+
+## Manual Grounding Evaluation
+
+For each claim in the answer, can you find a sentence in the retrieved documents that supports it?
+
+```python
+def manual_grounding_check(answer: str, retrieved_docs: list[str]) -> dict:
+    """
+    Walk through each sentence in the answer and attempt to find
+    supporting evidence in the retrieved documents.
+    """
+    sentences = split_into_sentences(answer)
+    results = []
+
+    for sentence in sentences:
+        supported = False
+        supporting_doc = None
+
+        for doc in retrieved_docs:
+            # Simple overlap check — in practice, use semantic similarity
+            if has_semantic_overlap(sentence, doc):
+                supported = True
+                supporting_doc = doc[:100]
+                break
+
+        results.append({
+            "claim": sentence,
+            "grounded": supported,
+            "source": supporting_doc
+        })
+
+    grounding_rate = sum(r["grounded"] for r in results) / len(results)
+    return {"grounding_rate": grounding_rate, "claims": results}
+```
+
+## Automated Grounding with RAGAS
+
+RAGAS (Retrieval-Augmented Generation Assessment) provides automated grounding measurement through its **faithfulness** metric:
+
+```python
+from ragas import evaluate
+from ragas.metrics import faithfulness, answer_relevancy
+from datasets import Dataset
+
+# Prepare evaluation data
+eval_data = {
+    "question": ["What is the refund policy?", "How do I cancel my subscription?"],
+    "answer": ["You can get a refund within 30 days.", "Cancel via account settings."],
+    "contexts": [
+        ["Customers may request refunds within 30 days of purchase."],
+        ["To cancel, go to Settings > Billing > Cancel Subscription."]
+    ],
+    "ground_truth": ["30 days refund window", "Account settings cancellation"]
+}
+
+dataset = Dataset.from_dict(eval_data)
+result = evaluate(dataset, metrics=[faithfulness, answer_relevancy])
+
+print(f"Faithfulness: {result['faithfulness']:.3f}")
+# Faithfulness: 0.923
+```
+
+The RAGAS faithfulness metric internally:
+1. Decomposes the answer into individual atomic claims.
+2. For each claim, asks an LLM whether it is supported by the retrieved context.
+3. Reports the fraction of claims that are supported.
+
+## Implementing Your Own Grounding Evaluator
+
+```python
+from openai import OpenAI
+
+client = OpenAI()
+
+def check_grounding(question: str, answer: str, retrieved_docs: list[str]) -> dict:
+    """
+    Evaluate whether each claim in the answer is supported by retrieved documents.
+    """
+    context = "\n\n".join(f"[Doc {i+1}]: {doc}" for i, doc in enumerate(retrieved_docs))
+
+    prompt = f"""
+    You are evaluating whether an answer is grounded in the retrieved documents.
+    
+    Question: {question}
+    
+    Retrieved Documents:
+    {context}
+    
+    Answer to evaluate:
+    {answer}
+    
+    Instructions:
+    1. Break the answer into individual factual claims.
+    2. For each claim, determine if it is directly supported by the retrieved documents.
+    3. A claim is "supported" only if a specific sentence in the documents backs it up.
+    
+    Return JSON:
+    {{
+      "claims": [
+        {{"claim": "...", "supported": true, "evidence": "quote from doc or null"}},
+        ...
+      ],
+      "grounding_rate": 0.85,
+      "ungrounded_claims": ["claim 1", "claim 2"]
+    }}
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"}
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+# Example usage
+result = check_grounding(
+    question="What is the return policy?",
+    answer="You can return items within 30 days. Returns are processed in 5 business days.",
+    retrieved_docs=["Customers may return items within 30 days of purchase for a full refund."]
+)
+
+# → {
+#   "claims": [
+#     {"claim": "Can return within 30 days", "supported": true, "evidence": "...within 30 days..."},
+#     {"claim": "Returns processed in 5 business days", "supported": false, "evidence": null}
+#   ],
+#   "grounding_rate": 0.5,
+#   "ungrounded_claims": ["Returns processed in 5 business days"]
+# }
+```
+
+## Grounding Thresholds by Use Case
+
+| Use case | Minimum acceptable grounding rate |
+|---|---|
+| Customer support (low-stakes) | 0.80 |
+| Legal / compliance | 0.99 |
+| Medical information | 0.99 |
+| Internal documentation Q&A | 0.85 |
+| Creative writing assistance | N/A |
+
+For any domain where factual accuracy matters, treat grounding rate < 0.90 as a system failure requiring investigation.
+
+## Grounding vs Correctness
+
+Grounding does not guarantee correctness. If your retrieved documents contain incorrect information, a 100% grounded answer can still be wrong. Grounding only tells you whether the model stayed within the evidence — not whether the evidence was right.
+
+| Grounding | Documents correct? | Answer |
+|---|---|---|
+| High | Yes | ✓ Correct |
+| High | No | ✗ Wrong (but faithfully wrong) |
+| Low | Yes | ✗ Hallucinated |
+| Low | No | ✗ Doubly wrong |
+
+The implication: grounding evaluation must be paired with corpus quality assurance. Verify that your indexed documents are accurate, not just that the model is using them faithfully.
+
+## Using Grounding in Production
+
+Run grounding checks as an async post-generation step for quality monitoring:
+
+```python
+async def generate_and_monitor(question: str, context_docs: list[str]) -> str:
+    answer = await llm.ainvoke(
+        f"Context: {context_docs}\n\nQuestion: {question}"
+    )
+
+    # Run grounding check asynchronously (don't block the response)
+    asyncio.create_task(
+        log_grounding_metrics(
+            question=question,
+            answer=answer,
+            docs=context_docs
+        )
+    )
+
+    return answer
+
+async def log_grounding_metrics(question, answer, docs):
+    result = check_grounding(question, answer, docs)
+    metrics.gauge("grounding_rate", result["grounding_rate"])
+    
+    if result["grounding_rate"] < 0.80:
+        logger.warning(
+            "Low grounding detected",
+            extra={"question": question, "ungrounded": result["ungrounded_claims"]}
+        )
+```
+
+Grounding rate is the single most important quality signal for a RAG system in production.

@@ -5,5 +5,178 @@ lastUpdatedDate: '2026-08-05'
 
 # 4.3 Memory Layout
 
-This section covers the details of 4.3 Memory Layout.
+Where does the KV cache actually live, how is it organized in memory, and why does this matter for performance? The answers drive some of the most important architectural decisions in modern inference systems.
 
+## GPU Memory Hierarchy
+
+Modern GPUs have two main memory types relevant to inference:
+
+```
+SRAM (on-chip, per SM):
+  A100: ~40 MB total (across all SMs)
+  Speed: ~10,000 GB/s
+  Use: registers, shared memory, L1/L2 cache
+  KV cache fits here? NO — too small
+
+HBM (off-chip, high-bandwidth memory):
+  A100 40GB: 40 GB
+  A100 80GB: 80 GB
+  H100 80GB: 80 GB
+  Speed: 2,000–3,350 GB/s
+  Use: model weights, KV cache, activations
+  KV cache lives here ✓
+```
+
+The KV cache lives in **HBM**. Every decode step, the GPU reads the relevant KV vectors from HBM into SRAM to compute attention. This read is the primary bottleneck in decode-phase inference.
+
+## Physical Layout in Memory
+
+The KV cache is organized as a multi-dimensional array:
+
+```
+Layout: [2, num_layers, num_heads, max_seq_len, head_dim]
+         ^              
+         K and V
+
+Alternatively: 
+  K cache: [num_layers, num_heads, max_seq_len, head_dim]
+  V cache: [num_layers, num_heads, max_seq_len, head_dim]
+```
+
+In `float16` (fp16), each element is 2 bytes. For Llama-3-8B with GQA:
+
+```
+2 (K,V) × 32 (layers) × 8 (KV heads) × 4096 (max_seq) × 128 (head_dim) × 2 (bytes)
+= 2 × 32 × 8 × 4096 × 128 × 2
+= 536,870,912 bytes
+≈ 512 MB per sequence at max context
+```
+
+For a 70B model at 128K context:
+
+```
+2 × 80 × 8 × 131072 × 128 × 2 ≈ 42 GB
+```
+
+That's more than a full A100 GPU's memory just for the KV cache of one sequence — which is why 128K context on 70B models requires multi-GPU setups.
+
+## The Pre-Allocation Problem
+
+The fundamental challenge: **you don't know how long the output will be before generation starts**.
+
+The naive approach — pre-allocate max context length per request — wastes enormous amounts of GPU memory:
+
+```
+Scenario: max_seq_len = 4096
+          You serve 10 simultaneous requests
+          Actual average output: 200 tokens
+
+Pre-allocation:
+  10 requests × 512 MB (max) = 5.12 GB reserved
+  Actual used: 10 × (200/4096) × 512 MB ≈ 250 MB
+  Wasted: 4.87 GB (95% waste)
+```
+
+This directly limits concurrency. Fewer active sequences = lower throughput.
+
+## PagedAttention: Virtual Memory for KV Cache
+
+vLLM introduced **PagedAttention** (2023) to solve this. The idea comes directly from OS virtual memory:
+
+```
+Traditional:                      PagedAttention:
+┌─────────────────────────┐       ┌────────────────────────────────┐
+│ Request A: 4096 tokens  │       │ Block 0: tokens  0-15 (Req A)  │
+│ [pre-allocated, mostly  │       │ Block 1: tokens 16-31 (Req A)  │
+│  empty]                 │       │ Block 2: tokens  0-15 (Req B)  │
+│                         │       │ Block 3: tokens 16-31 (Req C)  │
+│ Request B: 4096 tokens  │       │ Block 4: tokens 32-47 (Req A)  │
+│ [pre-allocated, mostly  │       │   ... (allocated on demand)    │
+│  empty]                 │       │                                │
+└─────────────────────────┘       └────────────────────────────────┘
+Memory waste: ~80-90%             Memory waste: <4%
+```
+
+PagedAttention divides the KV cache into fixed-size **blocks** (typically 16 tokens per block). Each block holds KV vectors for 16 tokens across all layers. A **block table** maps logical token positions to physical block locations.
+
+```
+Block table for Request A:
+  Logical position 0-15   → Physical block #0
+  Logical position 16-31  → Physical block #1
+  Logical position 32-47  → Physical block #4  (non-contiguous!)
+  Logical position 48-63  → Physical block #7
+```
+
+Non-contiguous allocation is fine — the attention kernel uses the block table to look up the right physical address.
+
+## Memory Layout with PagedAttention
+
+```
+Physical KV cache pool (contiguous GPU memory):
+┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┐
+│ Blk0 │ Blk1 │ Blk2 │ Blk3 │ Blk4 │ Blk5 │ Blk6 │ Blk7 │
+└──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┘
+   │      │      │      │      │      │      │      │
+  ReqA   ReqA   ReqB   ReqC   ReqA  (free)  ReqB   ReqA
+  0-15  16-31   0-15   0-15  32-47         16-31  48-63
+
+Each block: 16 tokens × layers × heads × head_dim × 2 bytes
+```
+
+The block manager allocates new blocks as sequences grow, and frees blocks when sequences complete. Defragmentation is unnecessary — new requests just get assigned to free blocks wherever they happen to be.
+
+## Quantizing the KV Cache
+
+For further memory reduction, the KV cache can be stored in int8 instead of fp16:
+
+| Format | Memory per 1K tokens (7B model) | Quality impact |
+|---|---|---|
+| fp16 | ~0.5 MB | None |
+| int8 | ~0.25 MB | Minimal (<1% quality loss) |
+| int4 | ~0.125 MB | Noticeable on some benchmarks |
+
+vLLM supports fp8 KV cache quantization:
+
+```python
+from vllm import LLM
+
+llm = LLM(
+    model="meta-llama/Meta-Llama-3-8B-Instruct",
+    kv_cache_dtype="fp8",   # quantized KV cache
+    gpu_memory_utilization=0.90,
+)
+```
+
+With fp8, you effectively double the number of tokens you can cache in the same GPU memory.
+
+## Practical Memory Budget Planning
+
+For a production deployment, plan your GPU memory like this:
+
+```
+Total GPU memory:              80 GB  (A100 80GB)
+
+Model weights (7B fp16):      ~14 GB
+Framework overhead:            ~2 GB
+Activations / temp buffers:    ~2 GB
+─────────────────────────────────────
+Available for KV cache:       ~62 GB
+
+KV cache per token (7B GQA):   ~0.128 MB
+Maximum cacheable tokens:     ~484,000 tokens
+
+With 10K context per request:  ~48 concurrent requests
+With 4K context per request:   ~120 concurrent requests
+```
+
+This is why concurrency and context length are in direct tension — they compete for the same KV cache memory.
+
+## Summary
+
+- The KV cache lives in GPU HBM (high-bandwidth memory), not the fast on-chip SRAM
+- Physical layout: `[layers × KV_heads × seq_len × head_dim]` per K and V, in fp16 or fp8
+- Pre-allocating max sequence length per request wastes 80–90% of cache memory
+- PagedAttention (vLLM) treats the KV cache like virtual memory pages — allocate on demand, non-contiguous, free when done
+- PagedAttention reduces memory waste from ~80% to <4%, enabling 2–4× more concurrent requests
+- KV cache quantization (int8, fp8) can halve memory consumption with minimal quality loss
+- Always plan GPU memory as: weights + overhead + (tokens_per_request × concurrent_requests × cache_per_token)

@@ -5,5 +5,163 @@ lastUpdatedDate: '2026-08-05'
 
 # 6.5 Parallel Decoding
 
-This section covers the details of 6.5 Parallel Decoding.
+Speculative decoding generates tokens serially in the draft model and verifies them in parallel. Parallel decoding goes further: it tries to generate multiple output positions truly simultaneously, breaking the fundamental serial constraint of autoregressive generation. The tradeoff is that you get speed at the cost of exact distribution matching.
 
+## The Serial Generation Constraint
+
+Standard autoregressive decoding is serial by design:
+
+```
+token_1 = f(prompt)
+token_2 = f(prompt, token_1)    ← needs token_1
+token_3 = f(prompt, token_1, token_2)    ← needs token_1, token_2
+...
+```
+
+This dependency chain means you genuinely cannot start computing token_N without token_{N-1}. Any approach that breaks this must either:
+1. Precompute tentative values and refine them (Jacobi decoding)
+2. Add extra prediction capacity to the model (Medusa, EAGLE)
+3. Accept some distribution shift (most parallel methods)
+
+## Jacobi Decoding
+
+Jacobi decoding treats the output generation as a system of equations and iterates toward a fixed point, analogous to the Jacobi iterative method for solving linear systems.
+
+**Initialization**: start with a random initial guess for all N output tokens.
+
+**Iteration**: for each position i, recompute the token at position i given the current values at all other positions. Run all positions in parallel, then update.
+
+```
+Iteration 0 (random init): ["the", "cat", "ran", "fast", "away"]
+                                ↓ run all positions in parallel
+Iteration 1:               ["the", "cat", "sat", "on",   "mat"]
+                                ↓ run all positions in parallel
+Iteration 2:               ["the", "cat", "sat", "on",   "the"]
+                                ↓ run all positions in parallel
+Iteration 3:               ["the", "cat", "sat", "on",   "the"]
+                                          ← converged! (no change)
+```
+
+In practice, Jacobi decoding converges in 3–5 iterations on average (vs N iterations for serial generation), achieving a **2–4× speedup** depending on task predictability.
+
+The output distribution is approximate — the converged sequence may not match what a serial model would have generated exactly. For most applications, the difference is imperceptible.
+
+## Medusa: Multiple Decode Heads
+
+Medusa adds γ additional output heads to the language model, each head predicting a different "future" position:
+
+```
+Standard LM:
+  hidden state → [head 0] → logits for token at position t
+
+Medusa:
+  hidden state → [head 0] → logits for token at t   (original head)
+               → [head 1] → logits for token at t+1
+               → [head 2] → logits for token at t+2
+               → [head 3] → logits for token at t+3
+               → [head 4] → logits for token at t+4
+```
+
+All heads run on the same hidden state, in parallel, with no additional forward passes. The predictions from heads 1–4 are speculative; they're verified using tree attention on a small candidate tree.
+
+```python
+# Medusa usage (fine-tuned model required)
+from medusa.model.medusa_model import MedusaModel
+from medusa.model.utils import generate_medusa
+
+model = MedusaModel.from_pretrained("FasterDecoding/medusa-1-llama-2-7b-v1.0")
+
+output = generate_medusa(
+    model,
+    input_ids,
+    max_new_tokens=512,
+    medusa_choices=[[0], [0, 0], [1], [0, 1], [2]],  # candidate tree
+    temperature=0.7,
+)
+```
+
+Medusa speedup: 2–3× on typical tasks. Requires fine-tuning the extra heads on the target model's training data or a representative dataset.
+
+## EAGLE: Draft Based on Feature Propagation
+
+EAGLE (Extrapolation Algorithm for Greater Language-model Efficiency) trains a lightweight 1-layer transformer to predict future tokens based on the target model's own internal representations:
+
+```
+Standard decode step:
+  Input token embedding + KV cache → [Transformer layers] → hidden state → token
+
+EAGLE:
+  Hidden state h_t → [EAGLE lightweight transformer] → candidate tokens t+1, t+2, ...
+  → target model verifies in one parallel pass
+```
+
+Because EAGLE operates on the target model's own feature space, its predictions are highly correlated with what the target would output — achieving higher acceptance rates than a separate small model.
+
+EAGLE acceptance rates: 85–92% on typical benchmarks, compared to 70–80% for small external draft models. This translates to **3–4× speedup** in practice.
+
+## Comparison: Parallel Decoding Approaches
+
+| Method | How it works | Speedup | Quality | Training needed | Memory overhead |
+|---|---|---|---|---|---|
+| Jacobi | Iterative convergence on output positions | 2–4× | Approximate | None | None |
+| Medusa | Extra output heads on same model | 2–3× | ~Exact (tree verification) | Yes (heads) | ~5% per head |
+| EAGLE | Lightweight draft on target's hidden states | 3–4× | High (~exact) | Yes (EAGLE layer) | Small |
+| EAGLE-2 | Adaptive token tree based on confidence | 3–5× | High | Yes | Small |
+
+## The Distribution Shift Question
+
+For most methods, the key question is: does the distribution shift matter for your application?
+
+```
+Strict quality requirements (legal, medical, regulated):
+  → Use speculative decoding (Chapter 6.1) — provably exact distribution
+  → Or accept Medusa's tree-verified output (very close to exact)
+
+General applications (chat, coding, summarization):
+  → Jacobi or EAGLE distribution shift is imperceptible in practice
+  → Prioritize speed
+```
+
+In blind evaluations, users typically cannot distinguish between standard and Jacobi-decoded outputs on general tasks. The distribution difference is real but practically irrelevant for most use cases.
+
+## Parallel Decoding for Batch Processing
+
+At large batch sizes, parallel decoding methods are particularly valuable because:
+
+1. Large batches are often compute-bound rather than memory-bound
+2. The extra heads in Medusa / the EAGLE layer are parallelizable across the batch
+3. The verification step (one forward pass) amortizes over multiple accepted tokens
+
+```python
+# Batch processing with Medusa
+outputs = []
+for batch in batches:
+    output = generate_medusa(
+        model,
+        batch_input_ids,       # batch of N sequences
+        max_new_tokens=256,
+        batch_size=len(batch), # verify N sequences simultaneously
+    )
+    outputs.extend(output)
+```
+
+## Implementation Status and Availability
+
+| Method | Available in HuggingFace | Available in vLLM | Notes |
+|---|---|---|---|
+| Jacobi | Experimental | No | Academic/research stage |
+| Medusa | Via separate package | Yes (--speculative-model medusa) | Requires fine-tuned model |
+| EAGLE | Via separate package | Partial | Active development |
+| Prompt lookup | Yes (built-in) | Yes (built-in) | Production-ready |
+
+Prompt lookup decoding is the most production-ready zero-training parallel speedup. For higher speedups with training budget, EAGLE is the state of the art.
+
+## Summary
+
+- Parallel decoding breaks the serial autoregressive constraint — multiple output positions computed simultaneously
+- **Jacobi decoding**: iterate all positions until convergence, ~2–4× speedup, no training, approximate distribution
+- **Medusa**: extra output heads on the target model, ~2–3× speedup, requires fine-tuning extra heads
+- **EAGLE**: lightweight transformer trained on target's hidden states, ~3–4× speedup, high acceptance rate
+- Distribution shift: most methods produce approximately (not exactly) the target distribution
+- For strict quality requirements, stick to speculative decoding with full rejection sampling (Chapter 6.1)
+- Production readiness: prompt lookup (zero cost) > Medusa/EAGLE (require training) > Jacobi (experimental)

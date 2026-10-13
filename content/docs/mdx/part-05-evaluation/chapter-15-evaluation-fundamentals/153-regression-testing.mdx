@@ -5,5 +5,106 @@ lastUpdatedDate: '2026-08-05'
 
 # 15.3 Regression Testing
 
-This section covers the details of 15.3 Regression Testing.
+A regression is when the agent stops doing something it previously did correctly. Regressions are silent — the code still runs, the tests still pass, but the behavior has degraded.
 
+The only defense is a systematic regression testing process.
+
+## The Regression Rule
+
+When a bug reaches production, follow this exact sequence:
+
+1. **Write the eval case** that would have caught it
+2. **Verify it fails** with the current (broken) agent
+3. **Fix the agent**
+4. **Verify the eval case passes**
+5. **Commit the fix AND the eval case together** — in the same commit
+
+If you fix the bug without writing the eval case, the bug will return. This is not speculation — it is the documented history of every AI system ever shipped.
+
+## CI Thresholds
+
+The CI eval runner at `atlas-agents/ch18_evaluation/online/ci_eval_runner.py:159` enforces four hard thresholds on every pull request:
+
+```python
+# atlas-agents/ch18_evaluation/online/ci_eval_runner.py:159
+PASS_RATE_THRESHOLD = 0.70        # At least 70% of cases must pass
+HALLUCINATION_THRESHOLD = 0.10   # At most 10% of cases may hallucinate
+JUDGE_SCORE_THRESHOLD = 3.0      # Average judge score must be ≥ 3.0
+REGRESSION_DELTA = 0.05          # Alert if pass rate drops > 5% from baseline
+```
+
+These are not suggestions. A PR that violates any threshold is blocked from merging.
+
+## The CI Integration Flow
+
+```
+Pull Request opened
+        │
+        ▼
+Run eval suite against new code
+        │
+        ▼
+Compare results to saved baseline
+        │
+   ┌────┴────┐
+   │         │
+passes    fails / regresses
+   │         │
+   ▼         ▼
+ Merge     Block + Alert
+```
+
+```python
+# Simplified CI eval runner
+def run_ci_eval(agent, golden_dataset: list[EvalCase]) -> CIResult:
+    results = [evaluate_case(agent, case) for case in golden_dataset]
+
+    pass_rate = sum(r.passed for r in results) / len(results)
+    hallucination_rate = sum(r.hallucinated for r in results) / len(results)
+    avg_judge_score = sum(r.judge_score for r in results) / len(results)
+
+    baseline = load_baseline()
+    regression_delta = pass_rate - baseline["pass_rate"]
+
+    failures = []
+    if pass_rate < PASS_RATE_THRESHOLD:
+        failures.append(f"Pass rate {pass_rate:.1%} below threshold {PASS_RATE_THRESHOLD:.1%}")
+    if hallucination_rate > HALLUCINATION_THRESHOLD:
+        failures.append(f"Hallucination rate {hallucination_rate:.1%} exceeds threshold")
+    if avg_judge_score < JUDGE_SCORE_THRESHOLD:
+        failures.append(f"Judge score {avg_judge_score:.2f} below threshold {JUDGE_SCORE_THRESHOLD}")
+    if regression_delta < -REGRESSION_DELTA:
+        failures.append(f"Regression detected: {regression_delta:.1%} drop from baseline")
+
+    return CIResult(passed=len(failures) == 0, failures=failures, metrics={...})
+```
+
+## Baseline Management
+
+The baseline is the previous run's scores. Save it after every successful deployment:
+
+```python
+def save_baseline(results: CIResult, path: str = "eval_baseline.json"):
+    baseline = {
+        "pass_rate": results.metrics["pass_rate"],
+        "hallucination_rate": results.metrics["hallucination_rate"],
+        "avg_judge_score": results.metrics["avg_judge_score"],
+        "timestamp": datetime.utcnow().isoformat(),
+        "git_sha": get_current_git_sha(),
+    }
+    with open(path, "w") as f:
+        json.dump(baseline, f, indent=2)
+```
+
+Store the baseline file in version control. When you intentionally improve the agent, update the baseline to reflect the new higher bar. Never lower the baseline to make a failing test pass — that defeats the purpose.
+
+## What to Regression-Test
+
+| Event | Run eval? | Block on failure? |
+|---|---|---|
+| Every PR | Yes | Yes (critical tests) |
+| Prompt change | Yes | Yes |
+| Model version update | Yes | Yes |
+| Tool addition | Yes | No (new capability, not regression) |
+| Scheduled weekly | Yes | Alert only |
+| Post-incident | Yes | Fix required before re-deploy |

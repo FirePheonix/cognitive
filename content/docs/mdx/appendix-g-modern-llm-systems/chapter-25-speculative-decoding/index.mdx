@@ -179,3 +179,31 @@ Typical real-world speedup: 2-3× for code, 1.5-2× for general text
 - **Output distribution is mathematically identical** to running the target model alone — the correction step ensures this. Not an approximation.
 - Speedup depends on **acceptance rate** — how often the draft model's guesses match the target's preference. High agreement → high speedup. Very different models → no benefit.
 - Real-world: 2–3× speedup for code generation with matched model families. Best results with same-family models (7B drafting for 70B).
+
+---
+
+## The Formal Acceptance Rule and Why It's Lossless
+
+The magic of speculative decoding is that it's mathematically guaranteed to produce the same distribution as the target model alone — it's not an approximation. Here's why.
+
+**The acceptance criterion:**
+For each draft token $x$ proposed by the small draft model $p$, the target model $q$ computes its own probability. The acceptance rule is:
+$$\alpha(x) = \min\left(1, \frac{q(x)}{p(x)}\right)$$
+
+- If $q(x) \ge p(x)$: accept with probability 1 (the target model would have been at least as likely to generate this)
+- If $q(x) < p(x)$: accept with probability $q(x)/p(x)$ (the target model is less enthusiastic — accept proportionally)
+
+When a token is rejected, you don't give up — you resample from the corrected distribution $q(x) - p(x)$ (normalized), ensuring the final output distribution matches the target exactly.
+
+**The key efficiency metric: acceptance rate:**
+$$A = \frac{\text{accepted draft tokens}}{\text{proposed draft tokens}}$$
+
+If $A = 0.8$ and you propose $K=4$ tokens per draft step, you accept on average 3.2 tokens per target model call instead of 1. That's a 3.2× speedup in tokens per second.
+
+The acceptance rate depends entirely on how similar the draft model is to the target. A 7B draft model used with a 70B target typically achieves $A \approx 0.7$–$0.85$ for natural language.
+
+**Why this works at all (the intuition):**
+Most of the time, the next token isn't surprising. "The cat sat on the ____" — "mat", "floor", "couch" are all very predictable. A small, fast model gets these easy tokens right almost always. The expensive target model is only "needed" for the hard, uncertain tokens. Speculative decoding exploits this asymmetry.
+
+**Dynamic speculation:**
+Fixed lookahead $K$ isn't optimal. Easy positions (high confidence) deserve more draft tokens; hard positions (high entropy) should use fewer, because draft tokens will mostly be rejected anyway. Adaptive speculation adjusts $K$ based on the draft model's confidence, maximizing accepted tokens per target model call.

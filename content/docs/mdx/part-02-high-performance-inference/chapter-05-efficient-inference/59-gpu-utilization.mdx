@@ -5,5 +5,208 @@ lastUpdatedDate: '2026-08-05'
 
 # 5.9 GPU Utilization
 
-This section covers the details of 5.9 GPU Utilization.
+A GPU at 99% utilization doesn't mean it's doing 99% useful work. This is one of the most misunderstood metrics in ML engineering. Understanding what GPU utilization actually measures — and how to interpret it correctly — is essential for diagnosing real performance bottlenecks.
 
+## What "GPU Utilization" Actually Means
+
+When `nvidia-smi` reports 95% GPU utilization, it means: **the GPU was not idle for 95% of the measurement interval**. But "not idle" includes:
+
+- Useful compute (matrix multiplications)
+- Waiting for memory transfers to complete (memory stalls)
+- Synchronization overhead
+- Kernel launch overhead
+
+A GPU can be at 99% utilization while mostly waiting for HBM reads. This is exactly what happens during LLM decode: the GPU's CUDA cores are technically "active" (executing the attention kernel), but they're blocked waiting for KV cache data from HBM.
+
+## The Right Metrics for LLM Inference
+
+### MFU (Model FLOP Utilization)
+
+MFU measures what fraction of the GPU's peak theoretical FLOP/s is actually being used for model computation:
+
+```
+MFU = (actual FLOPs per second) / (GPU peak FLOPs per second)
+
+For A100:
+  Peak FLOP/s (bf16): 312 TFLOP/s
+  Actual during decode: ~15–30 TFLOP/s
+  MFU: ~5–10%
+```
+
+A 5–10% MFU during decode doesn't mean the GPU is inefficient — it means decode is memory-bandwidth-bound, not compute-bound. The GPU arithmetic units are waiting for memory, not the other way around.
+
+Good MFU targets for LLM inference:
+- **Prefill**: 30–50% (compute-bound, closer to optimal)
+- **Decode**: 5–15% (memory-bound by design — this is expected and acceptable)
+- **Training**: 40–60% (target for well-optimized training)
+
+### Token Throughput
+
+Tokens per second per GPU is a directly actionable metric:
+
+```
+7B model, A100:
+  Batch=1:    ~150 tokens/second  (memory-bound decode)
+  Batch=32:   ~3,000 tokens/second
+  Batch=128:  ~7,000 tokens/second (approaching compute-saturation)
+```
+
+Compare to theoretical max:
+```
+GPU bandwidth: 2,000 GB/s
+Weight size (7B fp16): 14 GB
+Max weight reads per second: 2,000/14 = 143 passes/second
+At batch=1: 143 tokens/second → we're already near theoretical max
+```
+
+This is actually good! At batch=1, decode efficiency is close to optimal — you're using nearly 100% of the available memory bandwidth.
+
+### Memory Bandwidth Utilization
+
+More useful than compute utilization for decode:
+
+```
+Memory bandwidth utilization = 
+    (bytes actually transferred per second) / (peak HBM bandwidth)
+
+During decode on A100:
+  Bytes transferred: ~14 GB/step × 143 steps/second = 2,002 GB/s
+  Peak bandwidth: 2,000 GB/s
+  MBU: ~100%  ← excellent, we're at the hardware limit
+```
+
+A high memory bandwidth utilization (>70%) during decode is a sign of a well-optimized system.
+
+## Profiling Tools
+
+### NVIDIA Nsight Systems
+
+The primary tool for GPU performance profiling:
+
+```bash
+# Profile a vLLM workload
+nsys profile \
+    --trace=cuda,nvtx \
+    --output=profile_output \
+    python -c "
+from vllm import LLM, SamplingParams
+llm = LLM('meta-llama/Meta-Llama-3-8B-Instruct')
+outputs = llm.generate(['Hello world'] * 100)
+"
+
+# Open profile_output.nsys-rep in Nsight Systems GUI
+```
+
+Look for:
+- Long memory transfers (PCIe or HBM reads)
+- Kernel execution gaps (idle GPU)
+- Small kernel launches (overhead-dominated workload)
+
+### PyTorch Profiler
+
+For framework-level profiling:
+
+```python
+import torch
+from torch.profiler import profile, record_function, ProfilerActivity
+
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    record_shapes=True,
+    with_flops=True,
+) as prof:
+    with record_function("model_inference"):
+        output = model.generate(input_ids, max_new_tokens=100)
+
+print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+```
+
+### nvidia-smi dmon (Continuous Monitoring)
+
+```bash
+# Sample GPU metrics every 500ms
+nvidia-smi dmon -s pucvmet -d 0.5
+
+# Key columns:
+# sm   — SM (streaming multiprocessor) utilization
+# mem  — memory utilization (HBM bandwidth usage)
+# fb   — framebuffer (VRAM) usage in MB
+# pwr  — power draw
+```
+
+### vLLM Built-in Metrics (Prometheus)
+
+```bash
+# vLLM exposes Prometheus metrics at /metrics
+curl http://localhost:8000/metrics | grep -E "(throughput|utilization|cache)"
+
+# vllm:gpu_cache_usage_perc        — KV cache fill level
+# vllm:num_running_requests        — current active batch size  
+# vllm:avg_generation_throughput   — tokens/second
+# vllm:avg_prompt_throughput       — prompt tokens/second
+```
+
+## Diagnosing Bottlenecks
+
+### High GPU utilization + Low throughput
+
+```
+Symptom: nvidia-smi shows 95% utilization, but only 200 tokens/second
+
+Likely cause:
+  Memory bandwidth saturation at large batch sizes
+  The GPU is running kernels, but they're memory-stalled
+
+Diagnosis: check memory bandwidth utilization
+  If MBU > 90%: you're at the hardware limit — need faster GPU or quantization
+  If MBU < 50%: something else is wrong (kernel launch overhead, fragmented access)
+```
+
+### Low GPU utilization + Low throughput
+
+```
+Symptom: nvidia-smi shows 20% utilization, low throughput
+
+Likely causes:
+  - Small batch size (decode at batch=1–4)
+  - Python overhead between GPU calls
+  - I/O bottleneck (loading data, network)
+  - CPU preprocessing bottleneck
+
+Fix: increase batch size, profile CPU path, check I/O
+```
+
+### High TTFT despite low GPU utilization
+
+```
+Symptom: TTFT > 2 seconds, GPU at 30% utilization
+
+Likely cause:
+  Requests are waiting in queue (CPU scheduler delay, or all GPU memory is used)
+  
+Diagnosis: check vllm:num_requests_waiting
+  If queue > 0: requests are backed up → add replicas or increase batch size
+  If queue = 0: the prefill itself is slow → prompt too long, or compute-bound prefill
+```
+
+## Practical Interpretation Guide
+
+| Metric | What it tells you | Healthy range |
+|---|---|---|
+| `nvidia-smi` SM utilization | GPU is doing work | >50% during load |
+| MFU (during prefill) | Compute efficiency | 30–50% |
+| MFU (during decode) | Memory efficiency | 5–15% (expected) |
+| Memory bandwidth util | Decode efficiency | 60–90% |
+| `gpu_cache_usage_perc` | KV cache pressure | 70–85% |
+| `num_requests_waiting` | Queue depth | Near 0 |
+| Token throughput / (batch_size × theoretical_max) | Batching efficiency | >70% |
+
+## Summary
+
+- GPU utilization (nvidia-smi) measures "not idle time" — it includes memory stalls, not just compute
+- A decode GPU at 99% utilization with low throughput is normal and expected — decode is memory-bound
+- Better metrics: MFU (compute efficiency) and memory bandwidth utilization
+- Good MFU for decode is 5–15%; for prefill, target 30–50%
+- Primary profiling tools: NVIDIA Nsight Systems, PyTorch Profiler, vLLM Prometheus metrics
+- Diagnosing throughput bottlenecks: check memory bandwidth utilization first, then batch size, then queue depth
+- High utilization + low throughput during decode → near hardware memory bandwidth limit → need better GPU or quantization

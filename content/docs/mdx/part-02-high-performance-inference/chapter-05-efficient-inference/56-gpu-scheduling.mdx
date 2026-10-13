@@ -5,5 +5,183 @@ lastUpdatedDate: '2026-08-05'
 
 # 5.6 GPU Scheduling
 
-This section covers the details of 5.6 GPU Scheduling.
+The scheduler is the traffic controller of an inference server. It decides which requests run now, which wait, and what happens when resources run out. A poorly designed scheduler causes unnecessary latency spikes, unfair resource distribution, and wasted GPU cycles — even when the underlying model and hardware are well-optimized.
 
+## What the Scheduler Controls
+
+In a continuous batching system, the scheduler makes decisions at every decode iteration:
+
+1. **Which waiting requests to admit** into the active batch (prefill them)
+2. **Which active sequences to preempt** when memory is full
+3. **How to prioritize** across requests with different priorities, ages, or sizes
+4. **How to handle preempted sequences** (swap to CPU or discard and recompute)
+
+These decisions happen thousands of times per second.
+
+## The Admission Problem
+
+When a new request arrives, the scheduler must decide: admit it now (run prefill, allocate KV cache blocks) or wait?
+
+Constraints:
+- **KV cache capacity**: there must be enough free blocks to store the prefill + some decode steps
+- **Batch size limit**: the active batch can't exceed `max_num_seqs`
+- **Compute budget**: running too many sequences in prefill simultaneously increases TTFT for all
+
+```python
+# Simplified admission logic
+def should_admit(request, active_batch, free_blocks):
+    required_blocks = estimate_blocks(request.prompt_tokens + request.max_tokens)
+    
+    if free_blocks < required_blocks:
+        return False  # not enough memory
+    
+    if len(active_batch) >= MAX_NUM_SEQS:
+        return False  # batch full
+    
+    return True  # admit
+```
+
+The challenge: `request.max_tokens` is a hint, not a guarantee. The model might generate fewer tokens (hitting EOS early), in which case you've over-reserved. Or it might generate exactly `max_tokens`, and you've allocated correctly.
+
+## The Preemption Problem
+
+When the GPU runs out of KV cache memory while sequences are still generating, the scheduler must preempt — evict one or more active sequences to free blocks:
+
+```
+Active sequences: [A: 500 tokens, B: 300 tokens, C: 800 tokens]
+GPU memory: 90% full
+New prefill request D arrives (2000 tokens = large memory need)
+
+Options:
+  1. Reject D (poor experience — request fails)
+  2. Preempt B (free 300 tokens of KV cache, ~38MB)
+     → B's state is either swapped to CPU or discarded
+     → If B resumes later, must re-prefill from scratch (or restore from CPU)
+  3. Preempt C (free 800 tokens, more room)
+     → Same tradeoff
+```
+
+**Preemption cost analysis:**
+
+| Preemption action | Latency cost | Memory cost |
+|---|---|---|
+| Swap to CPU RAM | 100–500ms (transfer time) | CPU RAM consumed |
+| Discard and re-prefill | Full prefill cost on resume | No extra memory needed |
+| Swap to disk | Seconds (too slow for serving) | Disk space |
+
+Swapping to CPU is generally preferred — it preserves the KV state and avoids recomputation at the cost of transfer latency. vLLM supports CPU swap via `--swap-space`:
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-8B-Instruct \
+    --swap-space 20    # 20 GB of CPU memory for preempted sequences
+```
+
+## Scheduling Policies
+
+### FCFS (First Come, First Served)
+
+The default in most systems. Simple, fair, no starvation.
+
+```
+Queue: [D (arrived 10ms ago), C (5ms ago), A (1ms ago)]
+Scheduler: serve D first
+```
+
+Problems:
+- A single very long request admitted early can starve many short ones that arrived later
+- No way to prioritize paying customers over free-tier users
+
+### Priority Scheduling
+
+Assign each request a priority. Higher priority requests are admitted first:
+
+```python
+# vLLM SamplingParams priority
+params = SamplingParams(
+    temperature=0.7,
+    max_tokens=512,
+    priority=10,   # higher = more important
+)
+```
+
+The challenge: what counts as "higher priority"? Common schemes:
+- **Tier-based**: enterprise > pro > free
+- **Age-based**: older waiting requests get higher priority (prevent starvation)
+- **Size-based**: shorter requests first (minimize head-of-line blocking)
+- **Deadline-based**: requests with SLA commitments
+
+### Shortest-Job-First (SJF)
+
+Prioritize requests expected to generate fewer tokens. This minimizes average latency across the batch.
+
+Problem: you don't know output length in advance. You can estimate it (based on the nature of the task, or via a separate short predictor), but it's approximate.
+
+### Preemptive Scheduling with Aging
+
+A common production policy: FCFS by default, but with aging — waiting time increases priority:
+
+```python
+def effective_priority(request):
+    base_priority = request.user_tier_priority
+    age_bonus = min(request.wait_time_seconds * 0.1, 5.0)  # cap aging bonus
+    return base_priority + age_bonus
+```
+
+This prevents starvation while still respecting business priority tiers.
+
+## Chunked Prefill and Scheduling
+
+Modern schedulers (vLLM v2) use chunked prefill: instead of running an entire new request's prefill in one shot (which can spike GPU usage and delay the decode batch), split it into chunks that interleave with decode:
+
+```
+Traditional prefill:
+  Iteration N:   [decode: A, B, C] + [prefill ALL of D: 2000 tokens]
+  → D's prefill monopolizes the GPU for this iteration
+
+Chunked prefill:
+  Iteration N:   [decode: A, B, C] + [prefill D chunk 1: 256 tokens]
+  Iteration N+1: [decode: A, B, C] + [prefill D chunk 2: 256 tokens]
+  ...
+  Iteration N+7: [decode: A, B, C, D]  ← D joins decode
+```
+
+Benefits:
+- Decode latency for A, B, C is not affected by D's prefill
+- Better TTFT for A, B, C during D's prefill phase
+- More predictable latency overall
+
+```bash
+# Enable chunked prefill in vLLM
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-8B-Instruct \
+    --enable-chunked-prefill \
+    --max-num-batched-tokens 4096   # total tokens per iteration (prefill + decode)
+```
+
+## Monitoring Scheduler Health
+
+Key metrics to expose and monitor:
+
+```
+vllm:num_requests_waiting     — queue depth (spike = overloaded)
+vllm:num_requests_running     — active batch size
+vllm:num_preemptions_total    — preemptions so far (should be near 0)
+vllm:gpu_cache_usage_perc     — KV cache fill level
+```
+
+A healthy system shows:
+- Queue depth near 0 (requests served as fast as they arrive)
+- Active batch size near `max_num_seqs` (GPU fully utilized)
+- Preemptions at 0 (no memory pressure)
+- GPU cache usage 70–85% (headroom for bursts)
+
+## Summary
+
+- The scheduler decides: which requests to admit, which to preempt, and in what order to serve
+- Admission requires sufficient free KV cache blocks and batch capacity
+- Preemption options: swap to CPU (preferred) or discard and re-prefill (fallback)
+- Scheduling policies: FCFS (default), priority-based (tiers), SJF (latency-optimal but requires output prediction)
+- Aging prevents starvation in priority schedulers
+- Chunked prefill interleaves new request prefill with ongoing decode — avoids latency spikes
+- Monitor `num_requests_waiting`, `num_preemptions`, and `gpu_cache_usage_perc` in production

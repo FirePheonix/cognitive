@@ -5,5 +5,110 @@ lastUpdatedDate: '2026-08-05'
 
 # 18.5 Workflow Cost
 
-This section covers the details of 18.5 Workflow Cost.
+A workflow is a sequence of agent calls — a pipeline where one agent's output feeds another's input. Workflow cost is the sum of all LLM calls across the entire pipeline.
 
+This is where costs surprise teams at scale. The individual agent looks cheap. The full workflow is not.
+
+## The Newsletter Crew Example
+
+From `atlas-agents/ch06_multi_agent/newsletter_crew.py` — a 4-agent newsletter generation pipeline:
+
+```
+User request: "Generate this week's AI newsletter"
+         │
+         ▼
+[Research Agent]          3 turns × $0.012  = $0.036
+  → searches web, finds 10 stories
+         │
+         ▼
+[Filter Agent]            1 turn  × $0.008  = $0.008
+  → filters to 5 most relevant stories
+         │
+         ▼
+[Writer Agent]            4 turns × $0.015  = $0.060
+  → writes full newsletter draft
+         │
+         ▼
+[Editor Agent]            2 turns × $0.012  = $0.024
+  → polishes and formats
+         │
+         ▼
+[Eval Judge]              1 call  × $0.006  = $0.006
+  → quality check
+─────────────────────────────────────────────────────
+Total workflow cost per newsletter:           $0.134
+```
+
+At 1,000 newsletters/month, that's **$134/month** in LLM costs for one workflow. Know this number before you scale.
+
+## Workflow Cost Tracking
+
+```python
+# atlas-agents/ch06_multi_agent/newsletter_crew.py
+class NewsletterCrew:
+    def run(self, topic: str) -> NewsletterResult:
+        workflow_cost = 0.0
+
+        # Research phase
+        research_result, cost = self.research_agent.run_with_cost(topic)
+        workflow_cost += cost
+
+        # Filter phase
+        filtered, cost = self.filter_agent.run_with_cost(research_result)
+        workflow_cost += cost
+
+        # Write phase
+        draft, cost = self.writer_agent.run_with_cost(filtered)
+        workflow_cost += cost
+
+        # Edit phase
+        final, cost = self.editor_agent.run_with_cost(draft)
+        workflow_cost += cost
+
+        logger.info(f"Newsletter workflow cost: ${workflow_cost:.4f}")
+        track_workflow_cost("newsletter_crew", workflow_cost)
+
+        return NewsletterResult(content=final, total_cost=workflow_cost)
+```
+
+## Workflow Cost Variance
+
+Workflow costs are not constant — they vary based on input:
+
+| Input type | Typical cost | Why |
+|---|---|---|
+| Short topic ("AI news") | $0.08–$0.15 | Focused search, shorter documents |
+| Broad topic ("technology trends") | $0.20–$0.50 | Many searches, large context |
+| Topic with many search results | $0.30–$0.60 | Filter agent sees more content |
+
+Track the **distribution** (p50, p95, p99), not just the average. A p99 of $2.00 with a p50 of $0.13 means occasional runaway jobs you need to cap.
+
+## Cost Circuit Breakers
+
+```python
+WORKFLOW_COST_LIMITS = {
+    "newsletter_crew": 1.00,    # Max $1 per newsletter
+    "research_agent":  0.50,    # Max $0.50 per research job
+}
+
+class CostCircuitBreaker:
+    def __init__(self, workflow: str, limit: float):
+        self.workflow = workflow
+        self.limit = limit
+        self.accumulated = 0.0
+
+    def record_and_check(self, cost: float):
+        self.accumulated += cost
+        if self.accumulated >= self.limit:
+            raise WorkflowCostLimitExceeded(
+                workflow=self.workflow,
+                accumulated=self.accumulated,
+                limit=self.limit,
+            )
+```
+
+A workflow that hits its circuit breaker returns a partial result rather than running up an unbounded bill. This is especially important for multi-agent loops where one agent can trigger another in a cycle.
+
+## Workflow Cost Trends
+
+Monitor workflow cost per run over time. If the cost per newsletter increases week-over-week with no code changes, external factors are at work: search results are longer, the model is generating more text, or retrieved documents have grown. Investigate before it becomes a budget crisis.

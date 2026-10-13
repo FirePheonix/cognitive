@@ -5,5 +5,119 @@ lastUpdatedDate: '2026-08-05'
 
 # 12.5 Metadata Filtering
 
-This section covers the details of 12.5 Metadata Filtering.
+Metadata filtering lets you **narrow the search space before running semantic similarity**. Instead of searching all 100,000 documents for the most similar chunks, you first filter to the 1,000 relevant documents and search those.
 
+This improves both retrieval quality and search speed.
+
+## The Problem Metadata Solves
+
+Without filtering, semantic search finds the most similar document across your entire corpus. When the user asks "What changed in the authentication API?", the most semantically similar document might be an old version from 2 years ago — before you replaced the auth system entirely.
+
+With a `date >= last_month` filter applied first, you only search recent documents. The semantic search then finds the right recent document.
+
+## What to Store as Metadata
+
+Every document chunk should be tagged with rich metadata at index time:
+
+```python
+metadata = {
+    # Provenance
+    "source":      "api_docs",              # Which document collection
+    "document_id": "api-reference-v3.md",   # Which specific document
+    "section":     "Authentication",         # Which section within the document
+
+    # Temporal
+    "created_at":  "2026-08-01",            # When was this content created
+    "updated_at":  "2026-08-05",            # When was it last updated
+    "version":     "3.2",                   # Document version
+
+    # Classification
+    "type":        "technical",             # Type of content
+    "audience":    "developers",            # Intended audience
+    "language":    "en",                    # Content language
+
+    # Access control
+    "tenant_id":   "acme_corp",            # Which tenant owns this
+    "visibility":  "internal",             # public / internal / confidential
+}
+```
+
+## ChromaDB Filtering
+
+ChromaDB's `where` clause filters metadata before semantic search:
+
+```python
+# Only search preference documents
+results = collection.query(
+    query_texts=["What does the user prefer for notifications?"],
+    where={"type": "preference"},
+    n_results=5,
+)
+
+# Only search recent technical docs
+results = collection.query(
+    query_texts=["How does authentication work?"],
+    where={
+        "$and": [
+            {"type": "technical"},
+            {"updated_at": {"$gte": "2026-01-01"}},
+        ]
+    },
+    n_results=5,
+)
+```
+
+## Qdrant Filtering
+
+Qdrant's filter syntax is more expressive — use it for complex conditions:
+
+```python
+from qdrant_client.models import Filter, FieldCondition, MatchValue, Range
+
+results = qclient.search(
+    collection_name="agent_memory",
+    query_vector=embed("How does authentication work?"),
+    query_filter=Filter(
+        must=[
+            FieldCondition(key="type", match=MatchValue(value="technical")),
+            FieldCondition(key="version", match=MatchValue(value="3.2")),
+        ],
+        must_not=[
+            FieldCondition(key="visibility", match=MatchValue(value="confidential")),
+        ],
+    ),
+    limit=5,
+)
+```
+
+## Multi-Tenant Isolation
+
+In multi-tenant systems, metadata filtering is your **security boundary** for retrieval:
+
+```python
+def retrieve_for_tenant(query: str, tenant_id: str) -> list[str]:
+    """Tenants can only retrieve their own documents."""
+    results = qclient.search(
+        collection_name="documents",
+        query_vector=embed(query),
+        query_filter=Filter(
+            must=[
+                FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id)),
+            ]
+        ),
+        limit=5,
+    )
+    return [r.payload["content"] for r in results]
+```
+
+Never rely on the LLM to enforce tenant isolation — enforce it at the retrieval layer through metadata filtering.
+
+## Metadata Filtering Best Practices
+
+| Practice | Why |
+|---|---|
+| Filter before semantic search, not after | Pre-filtering is fast (indexed); post-filtering is slow (scan results) |
+| Store dates as ISO strings (`2026-08-05`) | Enables range queries |
+| Use controlled vocabularies for type/category | Prevents filter fragmentation (`"tech"` vs `"technical"` as different values) |
+| Index high-cardinality metadata fields | tenant_id, document_id — frequently used in filters |
+| Never store PII in metadata | Metadata may be logged; use opaque IDs instead |

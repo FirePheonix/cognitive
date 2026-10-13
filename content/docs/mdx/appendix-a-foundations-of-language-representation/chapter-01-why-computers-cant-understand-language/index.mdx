@@ -107,3 +107,67 @@ Here's a quick check on the key ideas from this section:
 - The meaning in these vectors isn't hardcoded — it *emerges* from training on massive amounts of text.
 
 The next two sections cover exactly these two steps: tokenization and embeddings. Both are simpler than they sound, and both have some genuinely surprising depth once you look closely.
+
+---
+
+## The Three Eras of NLP: A Brief History
+
+NLP has gone through three fundamentally different paradigms — and understanding each one makes the current moment easier to reason about.
+
+### Era 1 — Symbolic NLP (1950s–1980s)
+
+Linguists hand-wrote rules. "If a word ends in *-ed*, it's probably past tense." "If you see *not* before a verb, negate the meaning." These systems worked on the narrow tasks they were built for. But they broke the moment they met language they hadn't been programmed for. Maintaining them was like maintaining a city's plumbing — patch one leak, another appears. The rules never converged; language was just too messy.
+
+### Era 2 — Statistical NLP (1990s–2000s)
+
+Instead of hand-writing rules, researchers let probability do the work. The core insight: rather than specifying what language *should* look like, estimate what language *does* look like from data. The unified framing became:
+
+$$\hat{y} = \arg\max_y P(y \mid x)$$
+
+Read this as: "pick the output $y$ that has the highest probability given the input $x$." Typical systems included n-gram language models, Hidden Markov Models, CRFs for named entity recognition, and statistical machine translation. The key leap was "learn the rules from data" — but the *features* (what to measure in the first place) still had to be designed by hand.
+
+### Era 3 — Neural NLP / Foundation Models (2010s–now)
+
+Neural networks took over feature engineering too:
+
+$$h = f_\theta(x), \quad \hat{y} = g_\theta(h)$$
+
+No one hand-crafts features anymore. The architecture is the prior; the data shapes everything else. The pretraining paradigm formalized this shift:
+
+```
+Large-scale self-supervised pretraining
+        ↓
+General-purpose language representation
+        ↓
+Many downstream tasks with minimal additional data
+```
+
+A single model pretrained on web-scale text can be adapted to translation, summarization, question answering, and code generation — often with just a few examples or a well-written prompt. That's a qualitative change from how AI systems were built before.
+
+### The Unified Probability Framing
+
+Under the hood, almost all modern language models share one mathematical backbone — the chain rule of probability:
+
+$$P(x_{1:T}) = \prod_{t=1}^{T} P(x_t \mid x_{<t})$$
+
+This says: the probability of a sequence equals the product of each word's probability given everything that came before it. Unroll it for a three-word sentence "the cat sat":
+
+$$P(\text{the cat sat}) = P(\text{the}) \cdot P(\text{cat} \mid \text{the}) \cdot P(\text{sat} \mid \text{the cat})$$
+
+This one equation is the foundation of GPT, Claude, Gemini, and every modern autoregressive language model. When a model "generates text," it's sampling from this distribution one token at a time — repeatedly asking "given everything so far, what comes next?"
+
+### Why Language Is Hard — Five Dimensions
+
+Before leaving this section, it's worth naming the five core reasons language keeps challenging every system we build. These aren't edge cases. They're fundamental.
+
+1. **Ambiguity** — "I saw the man with the telescope." Who has the telescope — me or the man? A single sentence, two completely different meanings. Language is saturated with this.
+
+2. **Compositionality** — Sentence meaning isn't just the sum of word meanings. "Not bad" means good. "I couldn't care less" and "I could care less" mean the same thing in casual speech (but logically shouldn't). The whole is not the sum of its parts.
+
+3. **Long-range dependency** — "The keys that were sitting on the table near the stack of books were..." — the subject is *keys*, not *table* or *books*. Subject-verb agreement can span many words, clauses, and nested phrases. You have to hold the relevant piece in memory across a long span.
+
+4. **World knowledge** — "She put the cake in the fridge before it got too hot." What got too hot — the cake or the fridge? Disambiguating this requires knowing that fridges don't get hot, but cakes fresh from the oven do. That knowledge lives nowhere in the sentence itself.
+
+5. **Social context** — "Can you pass the salt?" is grammatically a yes/no question about your physical capability, but functionally it's a polite request. Language meaning depends on the social frame surrounding it, which models can only infer from patterns.
+
+> **What this means for AI engineers:** When a language model fails, it usually fails on one of these five dimensions — not because of a bug in the code, but because language is genuinely hard. Understanding *which* dimension is failing tells you which fix to try. A factual error is probably dimension 4 (world knowledge). A strange reference resolution is probably dimension 3 (long-range dependency). A tone-deaf response is probably dimension 5 (social context).

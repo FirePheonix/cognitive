@@ -5,5 +5,176 @@ lastUpdatedDate: '2026-08-05'
 
 # 6.2 Draft Models
 
-This section covers the details of 6.2 Draft Models.
+The draft model is the engine of speculative decoding. Its job is to propose tokens fast enough that even with some rejections, the net effect is faster generation than the target model alone. Choosing the right draft model — or deciding whether to use an external model or an alternative approach — is one of the key practical decisions in deploying speculative decoding.
 
+## The Draft Model's Performance Requirement
+
+For speculative decoding to provide a speedup, the draft model must satisfy a basic time budget:
+
+```
+Time for γ draft steps < Time for 1 target model step
+
+For a 70B target model at batch=1 on A100:
+  Target step time: ~7ms (read 14 GB... wait, 70B = ~140GB ÷ 2 GPUs = 70GB per GPU...)
+  Actually: ~14ms per step for 70B on 2× A100
+
+Draft must complete γ=5 steps in < 14ms
+→ Each draft step budget: < 2.8ms
+
+A 7B draft model at batch=1 on the same hardware:
+  7B weights = 14 GB on 1 GPU
+  Step time: ~7ms  ← too slow for γ=5!
+
+A 1B draft model:
+  1B weights = 2 GB
+  Step time: ~1ms  ← fast enough
+```
+
+The draft model must be **memory-bandwidth-fast**, not just small in parameter count. The right sizing depends on available GPU memory and the target model's step time.
+
+## Model Size Ratio Guidelines
+
+General guidance for the draft-to-target ratio:
+
+| Target model | Recommended draft | Size ratio | Expected speedup |
+|---|---|---|---|
+| 70B | 7B or 8B | 10× | 2–3× |
+| 70B | 1B | 70× | 1.5–2× (lower acceptance rate) |
+| 13B | 1B | 13× | 2–3× |
+| 7B/8B | 1B | 7–8× | 1.5–2.5× |
+
+Bigger draft = better acceptance rate. Smaller draft = faster proposal. The 10× ratio is a rough optimum that balances both.
+
+## The Vocabulary Constraint
+
+The draft model must share vocabulary with the target model. This is a hard constraint — if token ID 5000 in the draft maps to "hello" but token ID 5000 in the target maps to "world", the acceptance calculation is meaningless.
+
+Common compatible families:
+
+```
+Llama-3 family (all share vocabulary):
+  Llama-3.2-1B  → draft for →  Llama-3-8B, Llama-3-70B
+
+Mistral family:
+  Mistral-7B v0.1 has a different tokenizer than Mistral-7B v0.3
+  ⚠ Even within a family, check tokenizer compatibility
+
+Phi family:
+  Phi-3-mini → draft for → Phi-3-medium (same tokenizer)
+```
+
+Always verify with:
+```python
+from transformers import AutoTokenizer
+
+draft_tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+target_tok = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-70B-Instruct")
+
+# Verify same vocab size
+assert draft_tok.vocab_size == target_tok.vocab_size, "Incompatible tokenizers!"
+
+# Spot-check a few tokens
+test_tokens = [0, 100, 5000, 50000]
+for t in test_tokens:
+    d = draft_tok.decode([t])
+    tgt = target_tok.decode([t])
+    assert d == tgt, f"Token {t} mismatch: '{d}' vs '{tgt}'"
+```
+
+## Alternatives to External Draft Models
+
+Separate draft models have a real cost: memory (you need to load two models) and management overhead. Several approaches eliminate the need for a separate model.
+
+### Medusa: Multiple Output Heads
+
+Medusa adds multiple prediction heads directly to the target model. Each head predicts a different "future" token position:
+
+```
+Standard LM head: predicts token at position t
+Medusa head 1:   predicts token at position t+1
+Medusa head 2:   predicts token at position t+2
+Medusa head 3:   predicts token at position t+3
+Medusa head 4:   predicts token at position t+4
+```
+
+All heads run in parallel during the single target model forward pass. A tree-based verification scheme accepts consistent paths:
+
+```python
+# Medusa adds minimal overhead to the target model
+# ~5% more memory per extra head
+# No separate model needed
+
+from medusa.model.medusa_model import MedusaModel
+
+model = MedusaModel.from_pretrained(
+    "FasterDecoding/medusa-vicuna-7b-v1.3",
+    medusa_num_heads=4,
+    medusa_num_layers=1,
+)
+```
+
+Medusa speedup: 2–3× with no additional model. The tradeoff: the extra heads must be trained (fine-tuned) specifically for the target model.
+
+### EAGLE: Draft Head Trained on Target's Features
+
+EAGLE (Extrapolation Algorithm for Greater Language-model Efficiency) trains a single transformer layer that takes the target model's internal hidden states as input and predicts future tokens:
+
+```
+Target model generates hidden state h_t at position t
+EAGLE processes h_t to predict tokens at t+1, t+2, ...
+```
+
+Because EAGLE operates on the target's own representations, its predictions are highly accurate — better acceptance rates than a separate small model.
+
+### Prompt Lookup Decoding: No Model at All
+
+For tasks where the output repeats or paraphrases the input (code completion, document editing, summarization), you can look for likely continuations directly in the prompt text:
+
+```python
+def prompt_lookup_decode(prompt_tokens, last_n=3, max_proposals=5):
+    """
+    Find where the last n tokens appear in the prompt,
+    propose what follows in the prompt as draft tokens.
+    """
+    search_pattern = prompt_tokens[-last_n:]
+    
+    proposals = []
+    for i in range(len(prompt_tokens) - last_n):
+        if prompt_tokens[i:i+last_n] == search_pattern:
+            # Found a match — propose what comes after
+            continuation = prompt_tokens[i+last_n:i+last_n+max_proposals]
+            proposals.append(continuation)
+    
+    return proposals[0] if proposals else []  # return first match
+```
+
+No model needed — just pattern matching in the prompt. Surprisingly effective for:
+- Code completion (the same variable names appear repeatedly)
+- RAG (model often quotes the retrieved text verbatim)
+- Document editing (model often returns portions of the original)
+
+Typical speedup for these tasks: 2–5×.
+
+## Draft Quality vs Draft Speed Tradeoff
+
+| Draft approach | Acceptance rate | Proposal speed | Memory overhead | Training required |
+|---|---|---|---|---|
+| Large external (7–8B) | High (80–90%) | Moderate | Large | No |
+| Small external (1B) | Moderate (60–75%) | Fast | Small | No |
+| Medusa heads | Moderate-high (70–85%) | Fastest (same model) | Minimal | Yes |
+| EAGLE | High (85–90%) | Fast | Small (1 layer) | Yes |
+| Prompt lookup | Task-dependent (0–95%) | Near-zero | Zero | No |
+
+For production: if you have the memory for a separate draft model, a 10× smaller model from the same family is the lowest-friction option. If you need to minimize memory, Medusa or EAGLE are excellent alternatives (at the cost of fine-tuning investment).
+
+## Summary
+
+- Draft models must complete γ steps in less time than one target model step
+- Typical size ratio: 10× smaller (70B → 7B, 8B → 1B)
+- Hard constraint: draft and target must share vocabulary — verify tokenizer compatibility before deploying
+- Alternatives to separate models:
+  - **Medusa**: extra output heads, no separate model, requires fine-tuning
+  - **EAGLE**: single transformer layer trained on target's hidden states, high acceptance rate
+  - **Prompt lookup**: zero-model pattern matching, great for repetitive output tasks
+- Bigger draft = better acceptance rate; smaller draft = faster proposals
+- Prompt lookup is underrated — try it first for code completion and RAG tasks

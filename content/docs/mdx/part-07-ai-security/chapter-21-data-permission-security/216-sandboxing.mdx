@@ -5,5 +5,171 @@ lastUpdatedDate: '2026-08-05'
 
 # 21.6 Sandboxing
 
-This section covers the details of 21.6 Sandboxing.
+Sandboxing isolates code execution so that even if an agent is compromised, the damage is contained. Three levels of isolation, each with different cost/security tradeoffs.
 
+## The Three Levels
+
+| Level | Isolation | Cost | Setup | Use Case |
+|-------|-----------|------|-------|----------|
+| **Path sandboxing** | File system only | Free | Zero | File read/write agents |
+| **Docker containerization** | Full OS | Low | Medium | Code execution agents |
+| **E2B microVMs** | Separate VM | ~$0.01/task | Zero (hosted) | Untrusted/arbitrary code |
+
+## Level 1: Path Sandboxing
+
+The cheapest form of isolation — restrict file access to a specific directory:
+
+```python
+from pathlib import Path
+
+AGENT_SANDBOX = Path("/tmp/agent-workspace").resolve()
+
+def sandbox_file_op(rel_path: str, operation: callable) -> any:
+    target = (AGENT_SANDBOX / rel_path).resolve()
+    if not target.is_relative_to(AGENT_SANDBOX):
+        raise PermissionError(f"Path escapes sandbox: {rel_path}")
+    return operation(target)
+```
+
+**Limitations:** Only restricts file system. The agent can still make network calls, spawn processes, access environment variables, etc.
+
+**Best for:** Agents that read and write files within a project directory, with no code execution.
+
+## Level 2: Docker Containerization
+
+Full OS isolation — the agent runs in a container with no access to the host:
+
+```dockerfile
+# Dockerfile for code execution agent
+FROM python:3.12-slim
+
+# No host filesystem
+# No host network (use --network=none if appropriate)
+# No host processes
+
+WORKDIR /workspace
+COPY requirements.txt .
+RUN pip install -r requirements.txt --no-cache-dir
+
+# Run as non-root
+RUN useradd -m -u 1000 agent
+USER agent
+
+CMD ["python", "-m", "atlas_agent"]
+```
+
+```python
+import docker
+
+def run_in_docker(code: str, timeout: int = 30) -> str:
+    client = docker.from_env()
+    container = client.containers.run(
+        "atlas-agent-sandbox:latest",
+        command=f"python -c '{code}'",
+        remove=True,          # Container deleted after execution
+        network_disabled=True, # No network access
+        mem_limit="256m",     # Memory limit
+        cpu_period=100000,
+        cpu_quota=50000,      # 50% of one CPU
+        timeout=timeout,
+    )
+    return container.decode("utf-8")
+```
+
+**Best for:** Agents that execute arbitrary code within a known language/runtime.
+
+## Level 3: E2B MicroVMs
+
+Cloud-hosted microVMs — the code runs in a completely separate virtual machine that is destroyed after the task. From `atlas-agents/ch15_agent_harness/online/e2b_sandbox.py:134`:
+
+```python
+from e2b_code_interpreter import Sandbox
+
+class E2BAgentHarness(AgentHarness):
+    """
+    Agent harness backed by E2B microVMs.
+    Each task runs in a fresh VM, ~300ms spin-up, fully destroyed after.
+    Nothing persists between tasks. Nothing can escape the VM.
+    """
+
+    def __init__(self, template: str = "base"):
+        self.template = template
+        self.sandbox: Sandbox | None = None
+
+    def __enter__(self):
+        self.sandbox = Sandbox(template=self.template)
+        return self
+
+    def __exit__(self, *args):
+        if self.sandbox:
+            self.sandbox.close()  # VM destroyed — nothing persists
+        self.sandbox = None
+
+    def run_command(self, command: str) -> str:
+        """
+        Command runs inside a microVM, not on your host machine.
+        Even rm -rf / only destroys the VM.
+        """
+        if self.sandbox is None:
+            raise RuntimeError("Must use as context manager.")
+        result = self.sandbox.process.start_and_wait(command)
+        return result.stdout
+
+    def write_file(self, path: str, content: str) -> None:
+        self.sandbox.filesystem.write(path, content)
+
+    def read_file(self, path: str) -> str:
+        return self.sandbox.filesystem.read(path)
+```
+
+Usage:
+
+```python
+# Each task gets a fresh, isolated VM
+with E2BAgentHarness(template="python-data-science") as harness:
+    harness.write_file("analysis.py", model_generated_code)
+    output = harness.run_command("python analysis.py")
+    result = harness.read_file("output.csv")
+# VM is destroyed here — no trace of execution remains on your infrastructure
+```
+
+**Key properties:**
+- ~300ms spin-up time
+- Fully destroyed after each task
+- Nothing persists between tasks
+- Nothing can escape to the host
+- Supports pre-built templates (Python, Node.js, data science environments)
+
+## Choosing the Right Level
+
+```
+Does the agent execute arbitrary/untrusted code?
+    │
+    ├── YES → E2B microVMs (strongest isolation)
+    │         or Docker (if you prefer self-hosted)
+    │
+    └── NO: Does the agent only read/write files?
+              │
+              ├── YES → Path sandboxing (free, sufficient)
+              │
+              └── NO: Does the agent make network calls or spawn processes?
+                        │
+                        └── YES → Docker (network + process isolation)
+```
+
+## The Production Recommendation
+
+For any agent that runs code generated by an LLM:
+
+- **Development/testing:** Docker with `--network=none`
+- **Production with arbitrary code:** E2B microVMs
+- **Production with controlled code (your own scripts):** Docker
+- **File-only agents (no code execution):** Path sandboxing
+
+> **Never run LLM-generated code directly on your host machine without sandboxing.** A sufficiently clever injection can generate code that exfiltrates data, establishes persistence, or damages infrastructure. The only safe assumption is that generated code is untrusted.
+
+## Related Sections
+
+- [21.5 Secure Tool Execution](./215-secure-tool-execution) — the harness enforcement layers that run inside the sandbox
+- [21.1 Permission Boundaries](./211-permission-boundaries) — least privilege access within the sandbox
+- [20.5 Tool Injection](../chapter-20-prompt-security/205-tool-injection) — the attacks sandboxing defends against

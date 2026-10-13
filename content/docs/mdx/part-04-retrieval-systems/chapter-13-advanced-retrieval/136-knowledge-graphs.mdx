@@ -5,5 +5,229 @@ lastUpdatedDate: '2026-08-05'
 
 # 13.6 Knowledge Graphs
 
-This section covers the details of 13.6 Knowledge Graphs.
+Knowledge graphs represent factual knowledge as structured triples: **(subject, predicate, object)**. Rather than storing information as unstructured text that must be interpreted at query time, a knowledge graph encodes relationships explicitly and makes them queryable with precision.
 
+## The Triple Foundation
+
+Every fact in a knowledge graph is expressed as a triple:
+
+| Subject | Predicate | Object |
+|---|---|---|
+| Alice | works_at | Anthropic |
+| Anthropic | founded_in | 2021 |
+| Anthropic | headquarters | San Francisco |
+| Alice | role | Research Engineer |
+| GPT-4 | developed_by | OpenAI |
+
+This structure makes certain queries trivially fast and precise — queries that would require careful semantic search or paragraph-level reading comprehension when stored in prose.
+
+## Comparison: Vector Search vs BM25 vs Knowledge Graphs
+
+| Capability | Vector Search | BM25 | Knowledge Graph |
+|---|---|---|---|
+| Semantic similarity | ✓✓ | ✗ | ✗ |
+| Keyword matching | ✓ | ✓✓ | ✗ |
+| Exact fact lookup | ✗ | ✓ | ✓✓ |
+| Multi-hop traversal | ✗ | ✗ | ✓✓ |
+| Aggregation queries | ✗ | ✗ | ✓✓ |
+| Uncertainty/similarity | ✓✓ | ✓ | ✗ |
+
+Knowledge graphs excel where vector and keyword search fail: **precise fact retrieval and relationship traversal**.
+
+## Building a Knowledge Graph from Text
+
+Use an LLM to extract triples from unstructured documents:
+
+```python
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+import json
+
+triple_extraction_prompt = ChatPromptTemplate.from_messages([
+    ("system", """
+    Extract factual triples from the text. 
+    Return JSON: {"triples": [{"subject": "...", "predicate": "...", "object": "..."}]}
+    
+    Rules:
+    - Use consistent entity names (full names, not pronouns)
+    - Use snake_case predicates: works_at, founded_by, located_in, part_of, etc.
+    - Only extract facts explicitly stated in the text, not inferences
+    """),
+    ("human", "{text}")
+])
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+chain = triple_extraction_prompt | llm
+
+text = """
+Alice Johnson joined Anthropic in 2022 as a Research Engineer. 
+Anthropic was founded in 2021 by Dario Amodei and Daniela Amodei 
+and is headquartered in San Francisco.
+"""
+
+result = chain.invoke({"text": text})
+triples = json.loads(result.content)["triples"]
+# [
+#   {"subject": "Alice Johnson", "predicate": "works_at", "object": "Anthropic"},
+#   {"subject": "Alice Johnson", "predicate": "joined_year", "object": "2022"},
+#   {"subject": "Alice Johnson", "predicate": "role", "object": "Research Engineer"},
+#   {"subject": "Anthropic", "predicate": "founded_in", "object": "2021"},
+#   {"subject": "Anthropic", "predicate": "founded_by", "object": "Dario Amodei"},
+#   {"subject": "Anthropic", "predicate": "headquarters", "object": "San Francisco"},
+# ]
+```
+
+## Storing in Neo4j
+
+Neo4j is the most widely used graph database for production AI applications:
+
+```python
+from neo4j import GraphDatabase
+
+driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "password"))
+
+def ingest_triples(triples: list[dict]):
+    with driver.session() as session:
+        for triple in triples:
+            # Create nodes and relationship atomically
+            session.run("""
+                MERGE (s:Entity {name: $subject})
+                MERGE (o:Entity {name: $object})
+                MERGE (s)-[r:RELATION {type: $predicate}]->(o)
+            """, 
+            subject=triple["subject"],
+            predicate=triple["predicate"],
+            object=triple["object"]
+            )
+
+ingest_triples(triples)
+```
+
+## Querying the Knowledge Graph
+
+Once populated, the graph answers relationship questions cleanly:
+
+```python
+def query_kg(question: str) -> list[dict]:
+    with driver.session() as session:
+        
+        # Who does Alice work for?
+        result = session.run("""
+            MATCH (p:Entity {name: "Alice Johnson"})-[r:RELATION {type: "works_at"}]->(org:Entity)
+            RETURN org.name AS organization
+        """)
+        
+        # Who founded Anthropic?
+        result = session.run("""
+            MATCH (org:Entity {name: "Anthropic"})<-[r:RELATION {type: "founded_by"}]-(founder:Entity)
+            RETURN founder.name AS founder_name
+        """)
+
+        # Multi-hop: Who works at the company Alice works at?
+        result = session.run("""
+            MATCH (alice:Entity {name: "Alice Johnson"})-[:RELATION {type: "works_at"}]->(org:Entity)
+                  <-[:RELATION {type: "works_at"}]-(colleague:Entity)
+            WHERE colleague.name <> "Alice Johnson"
+            RETURN colleague.name AS colleague
+        """)
+
+        return [dict(r) for r in result]
+```
+
+## The Hybrid RAG + KG Approach
+
+Neither vector search nor graph queries alone handles all question types. The production approach routes queries to the appropriate retrieval mechanism:
+
+```python
+def hybrid_retrieval(question: str) -> str:
+    # Step 1: classify the question type
+    classification_prompt = f"""
+    Classify this question:
+    - "factual_lookup": asks about a specific fact (name, date, number)
+    - "relationship": asks about how entities relate to each other
+    - "semantic": asks about concepts, explanations, or broad topics
+    
+    Question: {question}
+    Return only the category name.
+    """
+    query_type = llm.invoke(classification_prompt).content.strip()
+
+    if query_type == "relationship":
+        # Graph traversal for relationship questions
+        cypher = natural_language_to_cypher(question)
+        kg_results = execute_cypher(cypher)
+        return format_kg_results(kg_results)
+
+    elif query_type == "factual_lookup":
+        # Try KG first (precise), fall back to vector if not found
+        kg_results = entity_lookup(question)
+        if kg_results:
+            return format_kg_results(kg_results)
+        # Fall through to semantic
+
+    # Default: semantic vector search
+    vector_results = vector_store.similarity_search(question, k=5)
+    return synthesize_answer(question, vector_results)
+```
+
+## Natural Language to Cypher
+
+For user-facing systems, translate natural language questions to Cypher automatically:
+
+```python
+nl_to_cypher_prompt = """
+Convert this natural language question to a Neo4j Cypher query.
+The graph has Entity nodes with a 'name' property and RELATION edges with a 'type' property.
+
+Common relation types: works_at, founded_by, located_in, part_of, manages, reports_to, 
+acquired_by, invested_in, founded_in, role
+
+Question: {question}
+Return only the Cypher query, no explanation.
+"""
+
+def natural_language_to_cypher(question: str) -> str:
+    return llm.invoke(nl_to_cypher_prompt.format(question=question)).content.strip()
+
+# Example:
+# "Who manages the team Alice is on?"
+# → MATCH (a:Entity {name: "Alice"})-[:RELATION {type: "part_of"}]->(t:Entity)
+#          <-[:RELATION {type: "manages"}]-(mgr:Entity)
+#   RETURN mgr.name
+```
+
+## Best Use Cases
+
+Knowledge graphs provide the highest ROI in domains where:
+
+- **Organizational data:** org charts, reporting structures, team assignments
+- **Product catalogs:** product hierarchies, compatibility relationships, specifications
+- **Scientific literature:** citation networks, author collaborations, concept taxonomies
+- **Regulatory compliance:** rule dependencies, applicability relationships
+- **Supply chain:** supplier relationships, component dependencies
+
+These domains have dense, explicit relationship structures that are poorly served by similarity-based retrieval.
+
+## Validation and Quality Control
+
+Triple extraction is imperfect. Before production ingestion:
+
+```python
+def validate_triple(triple: dict, source_text: str) -> bool:
+    """Verify the triple can be grounded in the source text."""
+    verification_prompt = f"""
+    Source text: "{source_text}"
+    
+    Triple claim: {triple['subject']} {triple['predicate']} {triple['object']}
+    
+    Is this triple explicitly stated in the source text?
+    Answer YES or NO only.
+    """
+    answer = llm.invoke(verification_prompt).content.strip()
+    return answer == "YES"
+
+# Filter out hallucinated triples before ingestion
+validated_triples = [t for t in triples if validate_triple(t, source_text)]
+```
+
+Production knowledge graph quality is gated on extraction quality. Invest in validation before scale.

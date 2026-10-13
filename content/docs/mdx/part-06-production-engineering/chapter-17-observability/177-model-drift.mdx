@@ -5,5 +5,111 @@ lastUpdatedDate: '2026-08-05'
 
 # 17.7 Model Drift
 
-This section covers the details of 17.7 Model Drift.
+Model providers update their models without warning. The model named `gpt-4o` or `claude-opus-4-5` today is not the same model it was six months ago. Providers retrain, fine-tune, and update safety filters continuously.
 
+> **GPT-4o today ≠ GPT-4o six months ago.**
+
+This matters because your prompts, your eval suite, and your users' expectations were calibrated against the old model. When the model changes, behavior changes — often subtly, sometimes dramatically.
+
+## What Changes in Model Updates
+
+| Type of Change | Typical Impact |
+|----------------|---------------|
+| Safety filter update | Tasks the model previously did now get refused |
+| Instruction following improvement | Outputs more accurate, format compliance improves |
+| Hallucination reduction | Agent gets better at saying "I don't know" |
+| Capability expansion | New tasks work that previously failed |
+| Regression | Specific use cases that worked before stop working |
+
+The last type — regression — is the dangerous one, because the provider doesn't announce it.
+
+## Detection: Scheduled Eval Runs
+
+The only reliable detection is a scheduled eval suite that runs against production:
+
+```python
+# atlas-agents/ch18_evaluation/online/ci_eval_runner.py:159
+# Pytest integration with regression threshold
+
+import pytest
+
+REGRESSION_DELTA = 0.05  # Alert if pass rate drops by more than 5%
+
+def test_no_model_regression(baseline_pass_rate: float):
+    """
+    Runs the eval suite and fails if pass rate drops below baseline.
+    Run this on a schedule (daily, weekly) against production models.
+    """
+    current_results = run_eval_suite()
+    current_pass_rate = current_results.pass_rate
+
+    drop = baseline_pass_rate - current_pass_rate
+
+    assert drop <= REGRESSION_DELTA, (
+        f"Model regression detected: pass rate dropped from "
+        f"{baseline_pass_rate:.1%} to {current_pass_rate:.1%} "
+        f"(delta: -{drop:.1%}, threshold: -{REGRESSION_DELTA:.1%})"
+    )
+```
+
+```python
+# Schedule in your CI/CD or cron
+# .github/workflows/model-drift-check.yml
+# cron: '0 6 * * *'  # Daily at 6am UTC
+
+def scheduled_drift_check():
+    baseline = load_baseline_pass_rate()
+    results = run_eval_suite(model="claude-opus-4-5")
+
+    if results.pass_rate < baseline - REGRESSION_DELTA:
+        alert_team(
+            subject="Model drift detected",
+            body=f"Pass rate: {results.pass_rate:.1%} (baseline: {baseline:.1%})\n"
+                 f"Failing cases: {results.failing_cases}",
+        )
+
+    # Update baseline if improved
+    if results.pass_rate > baseline:
+        save_baseline_pass_rate(results.pass_rate)
+```
+
+## The Regression Rule
+
+> When a bug reaches production, write the eval case that would have caught it — before fixing it.
+
+```python
+# Bug report: agent failed to extract action items from meeting notes
+# Step 1: write the eval case
+@pytest.mark.regression
+def test_action_item_extraction_from_meeting_notes():
+    result = agent.run(MEETING_NOTES_FIXTURE)
+    assert "action items" in result.lower()
+    assert "John" in result  # known action item owner in fixture
+    assert "@" in result     # known deadline format
+
+# Step 2: verify it fails (it should, that's the bug)
+# Step 3: fix the bug
+# Step 4: verify it passes
+# Now this case runs daily as a regression guard
+```
+
+This practice builds an eval suite that grows with every production issue. The suite becomes the institutional memory of what has gone wrong.
+
+## Pinning Model Versions
+
+For stability-critical applications, pin to a specific model version rather than the latest:
+
+```python
+# Unpinned — behavior can change without notice
+model = "claude-opus-4-5"
+
+# Pinned — specific version, predictable behavior
+model = "claude-opus-4-5-20251101"
+```
+
+The tradeoff: pinned models don't get safety updates or capability improvements. Unpin, run evals, and re-pin on a deliberate schedule rather than letting the provider update you silently.
+
+## Related Sections
+
+- [17.8 Prompt Drift](./178-prompt-drift) — drift from changes on your side, not the provider's
+- [17.6 Error Analysis](./176-error-analysis) — distinguishing drift from bugs

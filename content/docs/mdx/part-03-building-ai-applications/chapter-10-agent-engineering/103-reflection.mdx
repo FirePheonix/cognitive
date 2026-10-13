@@ -5,5 +5,124 @@ lastUpdatedDate: '2026-08-05'
 
 # 10.3 Reflection
 
-This section covers the details of 10.3 Reflection.
+## The Core Idea
 
+![The autonomy spectrum](/part-03/chapter-10/autonomy-spectrum.png)
+*Fig: The autonomy spectrum: from fully human-supervised to fully autonomous. Reflection agents operate in the middle, self-correcting before escalating.*
+
+Reflection is a three-step pattern: **generate, critique, revise**.
+
+1. The agent (or LLM) produces a first draft
+2. A critic — the same model, a different model, or a separate agent — reviews the draft and identifies problems
+3. The generator revises based on the critique
+
+This pattern exploits a well-documented asymmetry in how LLMs work: **they are better at spotting errors than avoiding them during generation**. It's easier to read a paragraph and say "this argument doesn't hold" than to write a perfect paragraph on the first try.
+
+## The Basic Reflection Loop
+
+```python
+def reflection_loop(task: str, max_rounds: int = 3) -> str:
+    draft = generate(task)
+
+    for round in range(max_rounds):
+        critique = criticize(draft, task)
+
+        # If the critic says it's good, stop early
+        if critique["score"] >= 7:
+            break
+
+        # Otherwise, revise
+        draft = revise(draft, critique["feedback"])
+
+    return draft
+```
+
+Each round: generate → critique → revise. Stop when quality is high enough or when you hit the round limit.
+
+## Why Not Just Ask for a Better Answer the First Time?
+
+You can try. Prompts like "think carefully and produce a high-quality answer" do help at the margins. But reflection is structurally different — it creates a **second pass with explicit evaluation criteria**.
+
+The critic can be given a rubric:
+
+```python
+CRITIQUE_PROMPT = """
+Review this code for:
+1. Correctness: Does it do what was asked?
+2. Edge cases: What inputs would break it?
+3. Security: Any injection or unsafe operations?
+4. Style: Does it follow the project conventions?
+
+Score each dimension 1-10. Give specific line references for problems.
+"""
+```
+
+That rubric is much more precise than "be careful." The critic knows exactly what to look for.
+
+## Quality Gates: The Code Review Example
+
+In `atlas-agents/ch05_state_graphs/code_review_agent.py:182`, reflection is implemented as a quality gate. The agent reviews code and produces a score. If the score is below 7, it retries.
+
+```python
+# Simplified from atlas-agents/ch05_state_graphs/code_review_agent.py
+def review_node(state: AgentState) -> AgentState:
+    review = run_code_review(state["code"])
+    score = extract_score(review)
+
+    if score >= 7:
+        state["approved"] = True
+    else:
+        state["retry_count"] += 1
+        state["feedback"] = review["issues"]
+
+    return state
+```
+
+The score threshold is a design parameter. A score of 7/10 for code review is a reasonable production default — strict enough to catch real problems, lenient enough that the loop terminates in 1-2 rounds rather than 10.
+
+From the book:
+
+> *"We highly recommend adding at least a couple of reflection loops for code generation — even with the most advanced models, it tends to improve code correctness and often catches edge cases."*
+
+## The Two-Agent Debate Variant
+
+Instead of one agent critiquing itself, two agents argue:
+
+- **Advocate**: proposes a solution and defends it
+- **Critic**: attacks the solution, looks for weaknesses
+
+Forcing both roles to argue — not just comment — produces stronger critiques. An agent that knows it will be challenged tends to produce more defensible first drafts.
+
+In `atlas-agents/ch06_multi_agent/online/debate_with_jury.py`, this pattern runs to completion:
+
+1. **Advocate** makes a case
+2. **Critic** attacks it
+3. **Advocate** rebuts
+4. **Critic** responds
+5. A **Jury** agent reads the full transcript and synthesizes a verdict
+
+The jury doesn't just pick a winner — it explains which arguments were compelling and why. That explanation is the actual output.
+
+## When to Use Reflection
+
+| Use case | Reflection worth it? |
+|---|---|
+| Code generation | **Yes** — catches edge cases and logic errors |
+| Report writing | **Yes** — improves structure and accuracy |
+| Simple Q&A | Probably not — adds latency for marginal gain |
+| Real-time responses | Usually not — latency budget doesn't allow it |
+| Security-critical output | **Yes** — always validate |
+
+## The Cost
+
+Reflection trades latency and cost for quality. A 3-round reflection loop roughly triples the LLM calls for that task. For a long document or complex code, that's often worth it. For a quick lookup, it's not.
+
+One way to manage this: use a cheap, fast model for the critic role (Claude Haiku, GPT-4o-mini) and reserve the expensive model for generation. The critic doesn't need to be brilliant — it needs to be systematic.
+
+```python
+draft = generate(task, model="claude-sonnet-4-5")        # expensive, creative
+critique = criticize(draft, model="claude-haiku-3")      # cheap, systematic
+revised = revise(draft, critique, model="claude-sonnet-4-5")  # expensive again
+```
+
+This hybrid approach captures most of the quality benefit at roughly half the cost of running the full reflection loop on the expensive model.

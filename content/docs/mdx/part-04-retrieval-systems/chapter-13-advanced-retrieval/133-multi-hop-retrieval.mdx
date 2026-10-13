@@ -5,5 +5,200 @@ lastUpdatedDate: '2026-08-05'
 
 # 13.3 Multi-Hop Retrieval
 
-This section covers the details of 13.3 Multi-Hop Retrieval.
+Standard single-shot RAG works well when the answer to a question exists in a single document. It breaks down when answering a question requires combining information across multiple retrieval steps — where the result of one retrieval shapes the query for the next.
 
+## The Problem with Single-Shot Retrieval
+
+Consider the question: *"What is the headquarters city of the company that acquired OpenAI?"*
+
+A vector search for this exact query might retrieve documents about OpenAI's founding, its valuation, or its products. The query doesn't contain the word "Microsoft," so a standard retrieval pass will likely miss the document that says "Microsoft is headquartered in Redmond, WA."
+
+The two hops required:
+1. **Hop 1:** "Which company acquired OpenAI?" → answer: Microsoft
+2. **Hop 2:** "Where is Microsoft's headquarters?" → answer: Redmond, WA
+
+Each hop's query depends on the previous hop's answer.
+
+## The Multi-Hop Pattern
+
+```
+Initial query: "What is the HQ city of OpenAI's acquirer?"
+        │
+        ▼
+┌──────────────────┐
+│   Hop 1: Retrieve │  query: "OpenAI acquisition"
+│   Observe result  │  result: "Microsoft acquired OpenAI..."
+└──────────────────┘
+        │
+        ▼
+┌──────────────────────────────┐
+│   Hop 2: Refine query        │  query: "Microsoft headquarters location"
+│   Retrieve again             │  result: "Microsoft HQ is Redmond, WA"
+└──────────────────────────────┘
+        │
+        ▼
+┌──────────────────────────────┐
+│   Synthesize final answer    │  "The headquarters city is Redmond, WA"
+└──────────────────────────────┘
+```
+
+## Implementation: Agent Loop
+
+The simplest implementation is a ReAct-style agent loop with a retrieval tool. The agent decides when to retrieve and how to form the next query based on what it already knows.
+
+```python
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain.tools import Tool
+from langchain_openai import ChatOpenAI
+from langchain import hub
+
+# Define the retrieval tool
+def knowledge_search(query: str) -> str:
+    """Search the knowledge base for information relevant to the query."""
+    docs = vector_store.similarity_search(query, k=3)
+    return "\n\n".join(d.page_content for d in docs)
+
+tools = [
+    Tool(
+        name="knowledge_search",
+        func=knowledge_search,
+        description="Search the knowledge base. Use this to look up facts."
+    )
+]
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+prompt = hub.pull("hwchase17/react")
+agent = create_react_agent(llm, tools, prompt)
+executor = AgentExecutor(agent=agent, tools=tools, verbose=True, max_iterations=6)
+
+result = executor.invoke({
+    "input": "What is the headquarters city of the company that acquired OpenAI?"
+})
+```
+
+The agent's internal reasoning trace:
+
+```
+Thought: I need to find which company acquired OpenAI.
+Action: knowledge_search
+Action Input: "OpenAI acquisition"
+Observation: Microsoft made a major investment in OpenAI in 2023...
+
+Thought: Now I know the company is Microsoft. I need to find their HQ.
+Action: knowledge_search
+Action Input: "Microsoft headquarters location"
+Observation: Microsoft is headquartered in Redmond, Washington...
+
+Thought: I have the answer.
+Final Answer: The headquarters city is Redmond, Washington.
+```
+
+## Iterative RAG
+
+A more structured variant is Iterative RAG — a pipeline that explicitly checks after each retrieval whether the question is answerable and generates a refined query if not.
+
+```python
+def iterative_rag(question: str, max_hops: int = 4) -> str:
+    context = []
+    current_query = question
+
+    for hop in range(max_hops):
+        # Retrieve for current query
+        docs = retriever.retrieve(current_query)
+        context.extend(docs)
+
+        # Ask: is the question answerable with current context?
+        check_prompt = f"""
+        Question: {question}
+        
+        Context gathered so far:
+        {chr(10).join(context)}
+        
+        Can you fully answer the question with this context?
+        If yes, provide the answer.
+        If no, provide a follow-up search query to find the missing information.
+        
+        Respond in JSON: {{"answerable": true/false, "answer": "...", "next_query": "..."}}
+        """
+
+        response = llm.invoke(check_prompt)
+        result = json.loads(response.content)
+
+        if result["answerable"]:
+            return result["answer"]
+
+        current_query = result["next_query"]
+
+    # Fallback: answer with whatever we have
+    return synthesize_answer(question, context)
+```
+
+## Query Decomposition
+
+For complex questions, decompose the question into sub-questions before retrieval. Each sub-question is answered independently, then the partial answers are combined.
+
+```python
+def decompose_and_retrieve(question: str) -> str:
+    # Step 1: decompose the question
+    decomposition_prompt = f"""
+    Break this complex question into 2–4 simpler sub-questions
+    that can each be answered with a single search:
+    
+    Question: {question}
+    
+    Return a JSON list of sub-questions.
+    """
+    sub_questions = json.loads(llm.invoke(decomposition_prompt).content)
+
+    # Step 2: retrieve for each sub-question
+    sub_answers = {}
+    for sq in sub_questions:
+        docs = retriever.retrieve(sq)
+        sub_answers[sq] = synthesize_answer(sq, docs)
+
+    # Step 3: synthesize final answer from sub-answers
+    synthesis_prompt = f"""
+    Original question: {question}
+    
+    Sub-question answers:
+    {json.dumps(sub_answers, indent=2)}
+    
+    Based on these partial answers, provide a comprehensive final answer.
+    """
+    return llm.invoke(synthesis_prompt).content
+```
+
+## When Multi-Hop Is Needed
+
+| Query type | Single-hop? | Multi-hop needed? |
+|---|---|---|
+| Direct fact lookup | ✓ | |
+| Comparison between two entities | Sometimes | ✓ |
+| Causal chain questions | | ✓ |
+| Relationship traversal | | ✓ |
+| Aggregation over multiple docs | | ✓ |
+
+## Controlling Hop Depth
+
+Unconstrained multi-hop loops are a hallucination amplifier — each hop can introduce errors that compound. Set hard limits:
+
+```python
+MAX_HOPS = 4          # never more than 4 retrieval steps
+CONFIDENCE_THRESHOLD = 0.85  # stop early if answer confidence is high
+
+# Track the retrieval path for debugging
+retrieval_trace = []
+for hop in range(MAX_HOPS):
+    query = refine_query(original_question, context_so_far)
+    docs = retriever.retrieve(query)
+    retrieval_trace.append({"hop": hop, "query": query, "doc_count": len(docs)})
+    # ...
+```
+
+Log the full retrieval trace. When multi-hop retrieval produces wrong answers, the trace usually reveals exactly which hop went off course.
+
+## Latency Considerations
+
+Each hop adds retrieval latency. A 3-hop retrieval at 150ms per hop = 450ms of retrieval time before the LLM even starts generating. For user-facing applications, make the tradeoff explicit: is the question complex enough to justify multi-hop, or can a simpler single-pass approach with a broader query get close enough?
+
+A practical heuristic: start with single-shot RAG and add multi-hop only for query types where single-shot measurably fails in your eval suite.

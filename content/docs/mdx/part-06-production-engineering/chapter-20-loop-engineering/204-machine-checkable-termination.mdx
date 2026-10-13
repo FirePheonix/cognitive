@@ -1,0 +1,283 @@
+---
+title: '20.4 Machine-Checkable Termination Conditions'
+lastUpdatedDate: '2026-08-05'
+---
+
+# 20.4 Machine-Checkable Termination Conditions
+
+The termination condition is the single most important thing you define when building an engineered loop. Get it wrong and every other component — the feedback, the fingerprinting, the escalation logic — is working in service of the wrong goal.
+
+## The Fundamental Principle
+
+A termination condition must be answerable by a machine in under 60 seconds. Not "mostly done," not "probably correct," not "the code looks cleaner." A binary: pass or fail.
+
+Consider the difference:
+
+| Statement | Termination Condition? | Why |
+|---|---|---|
+| "All 214 tests pass and ruff reports zero errors" | ✅ Yes | Machine can check in 30 seconds |
+| "Improve the codebase" | ❌ No | No machine check exists |
+| "Make it work better" | ❌ No | "Better" is not measurable |
+| "Fix the issues" | ❌ No | "Issues" is undefined |
+| "curl /health returns 200 within 500ms" | ✅ Yes | Machine can check in 1 second |
+| "Refactor this" | ❌ No | No success state defined |
+| "All required fields present in generated JSON" | ✅ Yes | jsonschema.validate() does this |
+| "The code is readable" | ❌ No | Subjectivity; not machine-checkable |
+
+The bad examples aren't goals — they're directions. A direction tells the agent which way to walk. A termination condition tells it where to stop.
+
+## A Catalog of Good Termination Conditions
+
+### Code Quality
+
+```python
+# Tests pass
+def pytest_passes() -> tuple[bool, str]:
+    result = subprocess.run(
+        ["python", "-m", "pytest", "--tb=short", "-q"],
+        capture_output=True, text=True, timeout=300
+    )
+    return result.returncode == 0, result.stdout[-2000:]
+
+# Linter clean
+def ruff_clean() -> tuple[bool, str]:
+    result = subprocess.run(
+        ["ruff", "check", "--select", "E,F", "."],
+        capture_output=True, text=True
+    )
+    return result.returncode == 0, result.stdout[-500:]
+
+# Type checker passes
+def mypy_passes() -> tuple[bool, str]:
+    result = subprocess.run(
+        ["mypy", ".", "--ignore-missing-imports"],
+        capture_output=True, text=True, timeout=120
+    )
+    return result.returncode == 0, result.stdout[-1000:]
+
+# No security issues
+def bandit_passes() -> tuple[bool, str]:
+    result = subprocess.run(
+        ["bandit", "-r", ".", "-ll"],  # Only medium+ severity
+        capture_output=True, text=True
+    )
+    return result.returncode == 0, result.stdout[-500:]
+```
+
+### API and Service Health
+
+```python
+import requests
+
+def api_healthy(url: str, max_ms: int = 500) -> tuple[bool, str]:
+    """Service responds within max_ms milliseconds."""
+    import time
+    try:
+        t0 = time.time()
+        r = requests.get(url, timeout=max_ms / 1000)
+        elapsed_ms = (time.time() - t0) * 1000
+        passed = r.status_code == 200 and elapsed_ms <= max_ms
+        return passed, f"Status: {r.status_code}, Elapsed: {elapsed_ms:.0f}ms"
+    except requests.exceptions.Timeout:
+        return False, f"Timeout after {max_ms}ms"
+    except Exception as e:
+        return False, str(e)
+
+def endpoints_all_pass(endpoints: list[dict]) -> tuple[bool, str]:
+    """All specified endpoints return expected status codes."""
+    results = []
+    all_passed = True
+    for ep in endpoints:
+        r = requests.request(ep["method"], ep["url"], timeout=10)
+        passed = r.status_code == ep["expected_status"]
+        results.append(f"{ep['method']} {ep['url']}: {r.status_code} ({'✓' if passed else '✗'})")
+        if not passed:
+            all_passed = False
+    return all_passed, "\n".join(results)
+```
+
+### Data and Schema Validation
+
+```python
+import json
+import jsonschema
+
+def json_matches_schema(data_path: str, schema: dict) -> tuple[bool, str]:
+    """Generated JSON file conforms to the required schema."""
+    try:
+        with open(data_path) as f:
+            data = json.load(f)
+        jsonschema.validate(data, schema)
+        return True, f"Validated {data_path} against schema."
+    except json.JSONDecodeError as e:
+        return False, f"Invalid JSON: {e}"
+    except jsonschema.ValidationError as e:
+        return False, f"Schema violation: {e.message} at {list(e.path)}"
+
+def required_fields_present(data: dict, required: list[str]) -> tuple[bool, str]:
+    """All required fields are present and non-null."""
+    missing = [f for f in required if data.get(f) is None]
+    if missing:
+        return False, f"Missing fields: {missing}"
+    return True, "All required fields present."
+```
+
+### Build and Compilation
+
+```python
+def docker_build_succeeds(dockerfile: str = "Dockerfile") -> tuple[bool, str]:
+    result = subprocess.run(
+        ["docker", "build", "-f", dockerfile, "-t", "test-build", "."],
+        capture_output=True, text=True, timeout=600
+    )
+    return result.returncode == 0, (result.stdout + result.stderr)[-1000:]
+
+def npm_build_succeeds() -> tuple[bool, str]:
+    result = subprocess.run(
+        ["npm", "run", "build"],
+        capture_output=True, text=True, timeout=300
+    )
+    return result.returncode == 0, result.stderr[-1000:]
+```
+
+## The `/grill-me` Pattern
+
+Before running a loop — especially a long-running or expensive one — it's worth interrogating the specification. The `/grill-me` pattern: the agent asks hard questions about the termination condition before the first attempt.
+
+```python
+GRILL_ME_PROMPT = """Before we start, I need to nail down exactly what 'done' looks like.
+
+Answer these questions precisely:
+
+1. What is the exact command that will tell us the task is complete? (Must be a shell command that returns exit code 0 on success)
+2. Are there any edge cases that the success condition doesn't cover?
+3. What would a false positive look like — what could pass the check but still be wrong?
+4. What are you absolutely certain should NOT change during this task?
+5. Is there anything ambiguous about the goal that I should clarify before starting?
+
+Answer each question. If you can't answer #1 with a concrete shell command, we need to refine the goal before proceeding."""
+
+def grill_the_spec(goal: str) -> str:
+    """Have the agent interrogate the goal before starting the loop."""
+    from openai import OpenAI
+    client = OpenAI()
+    
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": GRILL_ME_PROMPT},
+            {"role": "user", "content": f"Task: {goal}"}
+        ],
+        max_tokens=1024
+    )
+    
+    return response.choices[0].message.content
+```
+
+Run `/grill-me` before any loop you're unsure about. It surfaces vague termination conditions before they cause infinite loops or false completions.
+
+## Composite Termination Conditions
+
+Real tasks often require multiple conditions to all pass:
+
+```python
+from typing import Callable
+
+TermCheck = Callable[[], tuple[bool, str]]
+
+def all_pass(*checks: TermCheck) -> TermCheck:
+    """All checks must pass. Fails fast on the first failure."""
+    def run() -> tuple[bool, str]:
+        for check in checks:
+            passed, evidence = check()
+            if not passed:
+                return False, evidence
+        return True, "All checks passed."
+    return run
+
+def any_pass(*checks: TermCheck) -> TermCheck:
+    """At least one check must pass."""
+    def run() -> tuple[bool, str]:
+        evidences = []
+        for check in checks:
+            passed, evidence = check()
+            if passed:
+                return True, evidence
+            evidences.append(evidence)
+        return False, "\n---\n".join(evidences)
+    return run
+
+
+# Example: code must pass tests AND linter AND type check
+is_done = all_pass(
+    pytest_passes,
+    ruff_clean,
+    mypy_passes
+)
+
+# Example: service is up OR at least returns a non-500
+is_service_alive = any_pass(
+    lambda: api_healthy("http://localhost:8000/health"),
+    lambda: api_healthy("http://localhost:8000/status")
+)
+```
+
+## Avoiding the Three Failure Modes
+
+### Failure Mode 1: The Moving Goalpost
+
+The termination condition passes, but you keep discovering new things that should also be fixed. This happens when the original condition was underspecified.
+
+**Fix:** run `/grill-me` before the loop. Ask explicitly: "What else would make this task incomplete even if the stated condition passes?"
+
+### Failure Mode 2: The False Positive
+
+The termination condition passes, but the task is genuinely not done. Common causes:
+- Tests that don't actually cover the changed behavior
+- A linter that's been configured to ignore the relevant rules
+- An API health check on a path that doesn't exercise the changed code
+
+**Fix:** before trusting a termination condition, ask: "What could make this pass while the task is actually wrong?" Add checks for those cases.
+
+### Failure Mode 3: The Impossible Condition
+
+The termination condition can never be satisfied because it's asking for something the agent cannot achieve (missing permissions, broken environment, inherently flaky test).
+
+**Fix:** stall detection catches this — the fingerprint won't change. But you can also add a pre-flight check that runs the termination condition before the first attempt. If it never passes even with no changes, the task is undoable and should escalate immediately.
+
+```python
+def preflight_check(condition: TermCheck) -> bool:
+    """
+    Verify the termination condition isn't already broken before starting.
+    If it passes with no changes, great — nothing to do.
+    If it fails with no changes and the error looks environmental,
+    escalate immediately rather than attempting fixes.
+    """
+    passed, evidence = condition()
+    if passed:
+        print("Already passing — nothing to do.")
+        return False  # Don't run the loop
+    
+    environmental_indicators = [
+        "Permission denied",
+        "No module named",
+        "command not found",
+        "Connection refused"
+    ]
+    
+    for indicator in environmental_indicators:
+        if indicator in evidence:
+            raise EnvironmentError(
+                f"Environmental issue detected before loop start: {indicator}\n{evidence[:300]}"
+            )
+    
+    return True  # Safe to proceed with loop
+```
+
+## Key Takeaways
+
+- A termination condition must be answerable by a machine: binary, executable, and authoritative
+- "Improve X" is a direction. "All tests pass and ruff reports 0 errors" is a termination condition
+- Build a catalog of reusable `TermCheck` functions and compose them for complex tasks
+- Use the `/grill-me` pattern before long-running loops to surface vague or impossible conditions early
+- Preflight checks catch environmental failures before burning the entire attempt budget

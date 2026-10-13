@@ -1,9 +1,160 @@
 ---
-title: 6.3 Verification Models
+title: 6.3 Verification in Speculative Decoding
 lastUpdatedDate: '2026-08-05'
 ---
 
-# 6.3 Verification Models
+# 6.3 Verification in Speculative Decoding
 
-This section covers the details of 6.3 Verification Models.
+Verification is the mathematical core of speculative decoding. It's what makes the speedup lossless — the verification step guarantees that accepting or rejecting draft tokens produces the exact same output distribution as if the large model had generated every token from scratch. This section explains the algorithm precisely and why it works.
 
+## The Setup
+
+After the draft model proposes γ tokens, the target model runs one forward pass over the sequence extended by all γ draft tokens. This gives us:
+
+```
+Current sequence: [x₁, x₂, ..., xₙ]
+Draft proposals:  [d₁, d₂, d₃, d₄]  (γ = 4)
+
+Target model sees: [x₁, ..., xₙ, d₁, d₂, d₃, d₄]
+
+Target model outputs (next-token distributions at each position):
+  q(·|x₁,...,xₙ)     ← distribution for position n+1 (where d₁ sits)
+  q(·|x₁,...,xₙ,d₁)  ← distribution for position n+2 (where d₂ sits)
+  q(·|x₁,...,xₙ,d₁,d₂)  ← distribution for position n+3
+  q(·|x₁,...,xₙ,d₁,d₂,d₃)  ← distribution for position n+4
+  q(·|x₁,...,xₙ,d₁,d₂,d₃,d₄)  ← bonus: free distribution for sampling next token
+```
+
+Draft model provided (when it generated each dᵢ):
+```
+  p(d₁|x₁,...,xₙ)
+  p(d₂|x₁,...,xₙ,d₁)
+  p(d₃|x₁,...,xₙ,d₁,d₂)
+  p(d₄|x₁,...,xₙ,d₁,d₂,d₃)
+```
+
+## The Accept/Reject Algorithm
+
+For each draft token dᵢ in order:
+
+```python
+def verify_token(d_i, p_draft, q_target, rng):
+    """
+    d_i: the draft token
+    p_draft: draft model's probability for d_i
+    q_target: target model's full distribution at this position
+    
+    Returns: (accepted: bool, token: int)
+    """
+    acceptance_prob = min(1.0, q_target[d_i] / p_draft[d_i])
+    
+    if rng.random() < acceptance_prob:
+        return True, d_i  # accept draft token
+    else:
+        # Reject: sample from the "residual" distribution
+        # This distribution represents where q and p disagree
+        residual = {
+            token: max(0, q_target[token] - p_draft[token])
+            for token in vocabulary
+        }
+        residual_sum = sum(residual.values())
+        corrected_token = sample_from(residual, normalize=residual_sum)
+        return False, corrected_token
+```
+
+The process stops at the first rejection. All tokens before the rejection point are accepted; the rejection produces one corrected token; no tokens after the rejection are considered.
+
+**On the bonus token**: after processing all γ draft tokens (whether some were rejected or all were accepted), the target model has computed a free distribution for the position after the last accepted token. This is sampled unconditionally — you always get at least 1 token of output for the cost of the verification step.
+
+## Proof of Correctness
+
+Why does this produce the exact target distribution?
+
+Consider position i. The probability that token t appears at this position in the output is:
+
+```
+P(token t at position i) 
+    = P(accept dᵢ = t) × P(dᵢ = t from draft)
+    + P(reject dᵢ) × P(t from residual)
+
+Case 1: t == dᵢ (draft proposed t, we check if we accept)
+    P(accept dᵢ) = acceptance_prob = min(1, q(t)/p(t))
+    Contribution: min(1, q(t)/p(t)) × p(t) = min(p(t), q(t))
+
+Case 2: t is sampled from residual
+    P(residual produces t) = max(0, q(t) - p(t)) / Z
+    where Z = Σ max(0, q(t') - p(t'))
+    Contribution: P(reject) × max(0, q(t) - p(t)) / Z
+
+Total:
+    min(p(t), q(t)) + P(reject) × max(0, q(t) - p(t)) / Z
+```
+
+After algebraic simplification (known from importance sampling literature), this equals `q(t)` — the target distribution.
+
+The output is provably identical to sampling from q(t) at every step.
+
+## Parallel Verification Efficiency
+
+The key insight: the target model's forward pass over `[x₁,...,xₙ, d₁, d₂, d₃, d₄]` produces all four distributions in one parallel pass. This is fundamentally different from sequential generation:
+
+```
+Sequential generation of 4 tokens:
+  Pass 1: generate d₁ at position n+1
+  Pass 2: generate d₂ at position n+2 (needs d₁)
+  Pass 3: generate d₃ at position n+3 (needs d₁, d₂)
+  Pass 4: generate d₄ at position n+4 (needs d₁, d₂, d₃)
+  Total: 4 forward passes
+
+Parallel verification:
+  Pass 1: verify all positions n+1, n+2, n+3, n+4 simultaneously
+  Total: 1 forward pass
+```
+
+The causal attention mask ensures each position only attends to previous positions, so computing all γ+1 distributions in one pass is mathematically equivalent to computing them sequentially.
+
+## Average Token Yield
+
+The expected number of tokens produced per verification step depends on the acceptance rate α:
+
+```
+E[tokens per step] = Σᵢ₌₁ᵞ P(first i-1 accepted, iᵗʰ rejected) × i + P(all accepted) × (γ+1)
+
+For constant acceptance rate α across all positions:
+  E[tokens per step] = (1 - αᵞ⁺¹) / (1 - α)
+
+At α = 0.8, γ = 5:
+  E[tokens] = (1 - 0.8⁶) / (1 - 0.8) = (1 - 0.262) / 0.2 = 3.69
+
+vs 1 token per step without speculation.
+Speedup ≈ 3.69× (assuming draft steps are much cheaper than target steps)
+```
+
+## Handling Temperature and Sampling Parameters
+
+When the target model uses temperature T ≠ 1 or top-p sampling, the verification still works correctly — you just use the *adjusted* target distribution q(t) after applying temperature and top-p:
+
+```python
+def get_target_distribution(logits, temperature, top_p):
+    """Compute the actual sampling distribution used by the target"""
+    logits = logits / temperature
+    # Apply top-p
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    cumulative_probs = torch.cumsum(F.softmax(sorted_logits), dim=-1)
+    sorted_logits[cumulative_probs > top_p] = float('-inf')
+    # Restore order and softmax
+    logits[sorted_indices] = sorted_logits
+    return F.softmax(logits)
+```
+
+The verification math works for any target distribution — it doesn't matter how it was computed.
+
+## Summary
+
+- Verification: for each draft token, compute `min(1, q_target / p_draft)` and accept with that probability
+- On rejection: sample from the residual distribution `max(0, q - p)` and stop processing further draft tokens
+- Bonus token: after all draft tokens are processed, sample freely from the target distribution at the next position
+- **Correctness proof**: the acceptance/rejection scheme is mathematically equivalent to sampling from the target distribution exactly — no quality loss
+- Parallel efficiency: the target model verifies all γ positions in one forward pass (causal attention handles the dependencies)
+- Expected yield: at α=0.8, γ=5 → ~3.7 tokens per verification step
+- Works correctly with temperature and top-p — just use the adjusted target distribution

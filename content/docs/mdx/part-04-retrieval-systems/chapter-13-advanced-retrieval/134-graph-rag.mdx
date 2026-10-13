@@ -5,5 +5,209 @@ lastUpdatedDate: '2026-08-05'
 
 # 13.4 Graph RAG
 
-This section covers the details of 13.4 Graph RAG.
+Flat vector retrieval finds documents that are *semantically similar* to a query. It cannot easily answer questions that require traversing *relationships* between entities across multiple documents. Graph RAG addresses this by building an explicit knowledge graph from your documents and querying it alongside (or instead of) vector search.
 
+## The Relationship Problem
+
+Consider these two separate documents in your corpus:
+
+> **Document A:** "Alice leads Project Apollo as its engineering manager."
+
+> **Document B:** "Bob joined the Project Apollo team in Q3 as a backend engineer."
+
+A vector search for "Who manages Bob?" will likely fail. Neither document connects Bob to Alice directly. The relationship exists *across* documents, not within either one.
+
+Graph RAG solves this by extracting the entities and relationships from both documents and storing them as graph edges:
+
+```
+(Alice) --[MANAGES]--> (Project Apollo)
+(Bob)   --[WORKS_ON]--> (Project Apollo)
+```
+
+Now the query "Who manages Bob?" becomes a two-hop graph traversal:
+1. Find the project Bob works on.
+2. Find who manages that project.
+
+## Knowledge Graph Construction
+
+The first step is entity and relationship extraction from raw text using an LLM:
+
+```python
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+import json
+
+extraction_prompt = ChatPromptTemplate.from_messages([
+    ("system", """Extract entities and relationships from the text.
+    Return JSON with:
+    - entities: list of {{name, type, properties}}
+    - relationships: list of {{source, relation, target}}
+    
+    Entity types: Person, Project, Organization, Location, Technology
+    """),
+    ("human", "{text}")
+])
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+chain = extraction_prompt | llm
+
+def extract_graph(text: str) -> dict:
+    result = chain.invoke({"text": text})
+    return json.loads(result.content)
+
+# Example extraction
+doc = "Alice leads Project Apollo as its engineering manager. Bob joined the Project Apollo team."
+graph_data = extract_graph(doc)
+# → {
+#     "entities": [
+#       {"name": "Alice", "type": "Person"},
+#       {"name": "Bob", "type": "Person"},
+#       {"name": "Project Apollo", "type": "Project"}
+#     ],
+#     "relationships": [
+#       {"source": "Alice", "relation": "MANAGES", "target": "Project Apollo"},
+#       {"source": "Bob", "relation": "WORKS_ON", "target": "Project Apollo"}
+#     ]
+#   }
+```
+
+## Storing in Neo4j
+
+```python
+from neo4j import GraphDatabase
+
+driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "password"))
+
+def ingest_graph(graph_data: dict):
+    with driver.session() as session:
+        # Create entities
+        for entity in graph_data["entities"]:
+            session.run(
+                f"MERGE (n:{entity['type']} {{name: $name}})",
+                name=entity["name"]
+            )
+
+        # Create relationships
+        for rel in graph_data["relationships"]:
+            session.run(
+                """
+                MATCH (a {name: $source}), (b {name: $target})
+                MERGE (a)-[r:REL {type: $relation}]->(b)
+                """,
+                source=rel["source"],
+                target=rel["target"],
+                relation=rel["relation"]
+            )
+```
+
+## Querying the Graph
+
+Once the knowledge graph is built, relationship traversal queries become straightforward Cypher:
+
+```python
+# From atlas-agents/ch11_memory/online/graph_rag_neo4j.py:123
+query = """
+MATCH (person:Person {name: "Bob"})-[:WORKS_ON]->(project:Project)
+      <-[:FUNDS]-(org:Organization)
+RETURN org.name AS funder
+"""
+
+# Who manages Bob?
+who_manages_bob = """
+MATCH (bob:Person {name: "Bob"})-[:WORKS_ON]->(project:Project)
+      <-[:MANAGES]-(manager:Person)
+RETURN manager.name AS manager_name
+"""
+
+# All projects connected to a given organization
+org_projects = """
+MATCH (org:Organization {name: $org_name})-[:FUNDS|OWNS]->(project:Project)
+      <-[:WORKS_ON]-(person:Person)
+RETURN project.name, collect(person.name) AS team_members
+"""
+```
+
+## The Hybrid Approach: Vector + Graph
+
+Neither pure vector search nor pure graph traversal wins for all query types. The production pattern is to combine them:
+
+```
+User query
+    │
+    ├─── Semantic? ──► Vector search ──► Relevant passages
+    │
+    └─── Relational? ─► Graph query ──► Entity relationships
+                                              │
+                                              ▼
+                                   Combine results → LLM context
+```
+
+```python
+def hybrid_graph_retrieval(query: str) -> str:
+    # 1. Extract entities mentioned in the query
+    entities = extract_entities_from_query(query)
+
+    # 2. Vector search for semantically relevant passages
+    vector_results = vector_store.similarity_search(query, k=5)
+
+    # 3. Graph traversal for entity relationships
+    graph_results = []
+    for entity in entities:
+        cypher = f"""
+        MATCH (n {{name: "{entity}"}})-[r*1..3]-(connected)
+        RETURN n, r, connected
+        LIMIT 20
+        """
+        graph_results.extend(driver.session().run(cypher).data())
+
+    # 4. Combine and pass to LLM
+    context = format_context(vector_results, graph_results)
+    return llm.invoke(f"Answer based on context:\n{context}\n\nQuestion: {query}").content
+```
+
+## Microsoft's GraphRAG
+
+Microsoft's 2024 GraphRAG paper introduced a different approach: instead of querying the graph for specific entity relationships, it uses **community detection** to group related entities into clusters, then generates summaries of each community.
+
+This enables what they call "global questions" — questions about broad themes across the entire corpus:
+
+> "What are the main research directions in this scientific literature?"
+
+Neither standard RAG (retrieves specific passages) nor point query graph traversal (finds specific entities) handles this well. Community summaries give the LLM a map of the knowledge landscape.
+
+```python
+# Conceptual GraphRAG community query
+def global_query(question: str) -> str:
+    # Retrieve relevant community summaries instead of raw passages
+    community_summaries = retrieve_top_communities(question, top_k=10)
+
+    # Each summary represents a cluster of related entities and their relationships
+    context = "\n\n".join(
+        f"[Community: {c.label}]\n{c.summary}"
+        for c in community_summaries
+    )
+
+    return llm.invoke(f"Answer this global question:\n{question}\n\nContext:\n{context}").content
+```
+
+## When to Use Graph RAG
+
+| Use case | Vector RAG | Graph RAG |
+|---|---|---|
+| "What does document X say about Y?" | ✓ | |
+| "Who reports to Alice?" | | ✓ |
+| "What projects is Bob connected to?" | | ✓ |
+| "Summarize the main topics in this corpus" | | ✓ (community) |
+| "Find documents similar to this one" | ✓ | |
+| "What companies partner with whom?" | | ✓ |
+
+Graph RAG is most valuable for: **organizational data, product catalogs, scientific literature with citation networks, and any domain where entities have explicit relationships.**
+
+## Practical Challenges
+
+Building a production knowledge graph is non-trivial:
+
+- **Extraction errors:** LLMs sometimes extract hallucinated relationships. Validate extractions before ingestion.
+- **Entity resolution:** "Alice", "Alice Johnson", and "A. Johnson" may refer to the same person. Requires deduplication logic.
+- **Schema design:** Define your entity types and relationship types upfront. A freeform graph becomes unmaintainable.
+- **Update frequency:** Re-extracting from updated documents and merging changes into the graph is complex. Plan for it from the start.

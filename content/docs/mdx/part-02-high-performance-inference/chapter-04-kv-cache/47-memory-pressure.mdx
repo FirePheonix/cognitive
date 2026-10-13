@@ -5,5 +5,179 @@ lastUpdatedDate: '2026-08-05'
 
 # 4.7 Memory Pressure
 
-This section covers the details of 4.7 Memory Pressure.
+GPU memory is a hard constraint. The KV cache, model weights, and active computation all compete for the same physical bytes on the GPU. When demand exceeds supply, performance degrades — and understanding the tradeoffs lets you make deliberate choices rather than being surprised by OOM errors or throughput drops.
 
+## The Memory Budget
+
+On an A100 80GB GPU running a 7B model:
+
+```
+Total GPU memory:                  80 GB
+
+Fixed costs:
+  Model weights (7B, fp16):       ~14 GB
+  CUDA overhead / framework:       ~2 GB
+  Peak activation buffers:         ~2 GB
+  ─────────────────────────────────────
+  Fixed total:                    ~18 GB
+
+Variable costs:
+  KV cache:                  up to ~62 GB
+
+Available for KV cache:           ~62 GB
+```
+
+The KV cache can consume up to 77% of available GPU memory. This is normal — you want to maximize cache utilization because more cache = more concurrent requests = higher throughput.
+
+## How Model Size Changes the Math
+
+Larger models leave less room for KV cache:
+
+| Model | Weights (fp16) | A100 80GB available for KV cache | Notes |
+|---|---|---|---|
+| 7B | ~14 GB | ~62 GB | Comfortable |
+| 13B | ~26 GB | ~50 GB | Good |
+| 34B | ~68 GB | ~8 GB | Tight — consider 2 GPUs |
+| 70B | ~140 GB | N/A on single GPU | Requires 2+ A100s |
+| 70B (int4) | ~35 GB | ~41 GB | Fits on single A100 80GB |
+
+Quantization is often the deciding factor between "fits on one GPU" and "requires multi-GPU infrastructure."
+
+## Serving 70B on Two A100s (Tensor Parallelism)
+
+For models that don't fit on a single GPU, **tensor parallelism** splits each layer across multiple GPUs:
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-70B-Instruct \
+    --tensor-parallel-size 2    # split across 2 A100 80GBs
+```
+
+Each GPU holds half the weights (~70 GB total). The KV cache is also split — each GPU holds half of the KV state for each request.
+
+```
+Available for KV cache (2× A100 80GB):
+  Total memory: 160 GB
+  Weights: ~140 GB
+  Overhead: ~4 GB
+  KV cache: ~16 GB
+
+KV cache per token (70B GQA): ~0.5 MB
+Max concurrent tokens: ~32,000
+At 4K context: ~8 concurrent requests
+```
+
+70B on 2 GPUs is memory-constrained. Use quantization for better concurrency.
+
+## The Batching Tradeoff
+
+Larger batches improve GPU utilization but require more KV cache memory per time slice:
+
+```
+Batch size 1:   1 sequence × 4K tokens = 4K tokens of KV cache
+Batch size 8:   8 sequences × 4K tokens = 32K tokens of KV cache
+Batch size 32: 32 sequences × 4K tokens = 128K tokens of KV cache
+```
+
+At some point, the batch is limited by KV cache memory rather than compute. The sweet spot depends on your workload:
+
+- **Short contexts, high QPS**: larger batches benefit throughput
+- **Long contexts, few users**: smaller batches, more cache per sequence
+- **Mixed workload**: continuous batching dynamically adjusts (see Chapter 5.2)
+
+## KV Cache Quantization
+
+When memory pressure is high, quantizing the KV cache reduces its footprint:
+
+```python
+# vLLM with fp8 KV cache
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="meta-llama/Meta-Llama-3-8B-Instruct",
+    kv_cache_dtype="fp8",           # half the memory vs fp16
+    gpu_memory_utilization=0.92,    # use 92% of GPU memory for cache
+)
+```
+
+Memory impact:
+
+| KV cache format | Relative size | Quality impact |
+|---|---|---|
+| fp16 | 1× | Baseline |
+| fp8 | 0.5× | <0.5% degradation |
+| int8 | 0.5× | <1% degradation |
+| int4 | 0.25× | 1–3% degradation |
+
+fp8 KV cache is increasingly the default for production deployments — it halves cache memory with negligible quality loss.
+
+## Continuous Batching Helps Memory Efficiency
+
+Traditional static batching allocates KV cache for the max output length of every sequence in the batch upfront. Continuous batching (vLLM) only allocates what's needed, as sequences grow:
+
+```
+Static batching:
+  Allocate for max 4096 tokens per sequence
+  Batch of 8: 8 × 4096 = 32K tokens reserved
+  Actual average output: 500 tokens
+  Wasted: ~87%
+
+Continuous batching:
+  Allocate blocks as sequences grow
+  After 500 tokens: only 500 × 8 = 4K tokens used
+  Waste: <4% (PagedAttention overhead)
+```
+
+This is why continuous batching and PagedAttention together are so impactful — they address both compute efficiency (decode utilization) and memory efficiency (KV cache waste).
+
+## Memory Pressure Monitoring
+
+Key metrics to track in production:
+
+```python
+# vLLM exposes these via its metrics endpoint (Prometheus format)
+# GET http://localhost:8000/metrics
+
+# Key metrics:
+vllm:gpu_cache_usage_perc          # fraction of KV cache currently used
+vllm:num_preemptions_total         # how often sequences are evicted
+vllm:cache_config_info             # total KV cache blocks available
+```
+
+```
+Healthy state:
+  gpu_cache_usage: 70–85%
+  num_preemptions: near 0
+
+Unhealthy state:
+  gpu_cache_usage: >90% consistently
+  num_preemptions: increasing → sequences being evicted, causing latency spikes
+```
+
+If `num_preemptions` is consistently non-zero, you're operating above sustainable capacity. Options:
+1. Reduce `max_tokens` limits
+2. Reduce `max_context_length`
+3. Add a GPU
+4. Use KV cache quantization
+5. Use a smaller model
+
+## Practical Memory Configuration for vLLM
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-8B-Instruct \
+    --gpu-memory-utilization 0.90 \   # leave 10% for safety margin
+    --max-model-len 8192 \            # cap context to reduce cache per sequence
+    --kv-cache-dtype fp8 \            # halve KV cache memory
+    --max-num-seqs 256                # cap concurrent sequences
+```
+
+## Summary
+
+- KV cache memory = total GPU memory − model weights − framework overhead
+- A 7B model leaves ~62 GB for KV cache on an A100 80GB; a 70B model leaves almost nothing
+- Larger batches increase throughput but require proportionally more KV cache memory
+- KV cache quantization (fp8) halves memory with negligible quality impact
+- Continuous batching + PagedAttention together achieve <4% KV cache waste (vs 80–90% static)
+- Monitor `gpu_cache_usage_perc` and `num_preemptions` — high preemption rates signal memory pressure
+- When memory pressure is real: quantize the cache, cap context length, add GPUs, or accept lower concurrency

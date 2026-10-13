@@ -439,3 +439,23 @@ This is why transformers are so much more powerful than static embeddings (like 
 - **√d_k scaling** prevents the softmax from saturating when dimensions are large, keeping gradients healthy.
 - **Causal masking** (`-inf` on upper-triangle positions) makes GPT-style decoders respect time: each position can only use information from previous positions.
 - Self-attention transforms static token vectors into contextual ones — the geometric direction of each token's representation shifts based on what attends to it.
+
+---
+
+## Why √d_k? The Variance Argument
+
+The scaling factor $\frac{1}{\sqrt{d_k}}$ in attention looks arbitrary, but it's there for a precise mathematical reason.
+
+When you compute the dot product $q^\top k$ where $q$ and $k$ are $d_k$-dimensional vectors with components that each have mean 0 and variance 1, the dot product has mean 0 but **variance $d_k$**. This is because variance adds across independent dimensions:
+$$\text{Var}(q^\top k) = \sum_{i=1}^{d_k} \text{Var}(q_i k_i) = d_k$$
+
+So with $d_k = 64$, the dot products will have standard deviation $\sqrt{64} = 8$. Those large values get passed to softmax, where they push the distribution toward extreme values (near 0 or 1). An almost-one-hot softmax means the gradient nearly vanishes for everything except the dominant position — making training unstable and slow.
+
+Dividing by $\sqrt{d_k}$ rescales the dot products back to unit variance, keeping softmax in a healthy operating range.
+
+**The causal mask — preventing the future from leaking:**
+Autoregressive language models can't see future tokens. The mask enforces this:
+$$M_{ij} = \begin{cases} 0 & j \le i \\ -\infty & j > i \end{cases}$$
+After softmax, $-\infty$ becomes exactly 0 attention weight. In practice, this means:
+$$A = \text{softmax}\left(\frac{QK^\top}{\sqrt{d_k}} + M\right)$$
+Token at position 3 can attend to positions 1, 2, 3 — but not 4, 5, 6. The lower-triangular pattern is what gives the "causal" in causal attention.

@@ -5,5 +5,147 @@ lastUpdatedDate: '2026-08-05'
 
 # 8.7 Fallback Chains
 
-This section covers the details of 8.7 Fallback Chains.
+When structured output fails completely — repair failed, retries exhausted — you still need to return *something* useful. The fallback chain is a sequence of degradation steps that ensures your system never crashes on a bad LLM output.
 
+> "Never crash production on a bad LLM output."
+
+## The Four-Level Fallback Chain
+
+```python
+from pydantic import BaseModel, ValidationError
+import json
+import re
+
+def robust_parse(
+    raw: str,
+    model: type[BaseModel],
+    llm_repair_fn=None,
+) -> tuple[BaseModel | dict | None, str]:
+    """
+    Returns (result, source) where source indicates how we got the result.
+    """
+
+    # Level 1: Pydantic parse (full schema compliance)
+    try:
+        result = model.model_validate_json(raw)
+        return result, "pydantic"
+    except (ValidationError, json.JSONDecodeError):
+        pass
+
+    # Level 2: JSON repair (structural fix)
+    repaired = regex_repair(raw)
+    try:
+        result = model.model_validate_json(repaired)
+        return result, "regex_repair"
+    except (ValidationError, json.JSONDecodeError):
+        pass
+
+    # Level 3: Regex extraction of key fields (partial result)
+    partial = partial_parse(raw)
+    if partial:
+        return partial, "partial"
+
+    # Level 4: Safe default (never None if you can avoid it)
+    default = get_safe_default(model)
+    return default, "default"
+
+
+def get_safe_default(model: type[BaseModel]) -> dict:
+    """Return a safe empty-ish default for the schema."""
+    return {
+        "title": "Unable to parse response",
+        "summary": "The model returned an unparseable response.",
+        "findings": [],
+        "sources": [],
+        "confidence": "low",  # Always low confidence on defaults
+    }
+```
+
+The `source` field tells the caller which fallback level was hit — critical for monitoring and alerting.
+
+## Circuit Breaker for Model Providers
+
+The circuit-breaker pattern referenced at `atlas-agents/ch07_model_portability/online/model_router.py:137` applies directly here. When a model provider consistently fails to produce valid structured output, skip it:
+
+```python
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+
+@dataclass
+class CircuitState:
+    failure_count: int = 0
+    last_failure: datetime | None = None
+    cooldown_seconds: int = 120
+
+    def is_open(self) -> bool:
+        """True means circuit is open (provider is skipped)."""
+        if self.failure_count < 3:
+            return False
+        if self.last_failure is None:
+            return False
+        return datetime.now() - self.last_failure < timedelta(seconds=self.cooldown_seconds)
+
+    def record_failure(self):
+        self.failure_count += 1
+        self.last_failure = datetime.now()
+
+    def record_success(self):
+        self.failure_count = 0
+        self.last_failure = None
+
+
+class StructuredOutputRouter:
+    def __init__(self, providers: list[str]):
+        self.providers = providers
+        self.circuits = {p: CircuitState() for p in providers}
+
+    def parse_with_fallback(self, prompt: str, model: type[BaseModel]) -> BaseModel:
+        for provider in self.providers:
+            if self.circuits[provider].is_open():
+                continue  # On cooldown — skip
+
+            try:
+                raw = call_provider(provider, prompt)
+                result = model.model_validate_json(raw)
+                self.circuits[provider].record_success()
+                return result
+            except Exception:
+                self.circuits[provider].record_failure()
+                continue
+
+        # All providers failed — return safe default
+        return model.model_construct(**get_safe_default(model))
+```
+
+## Provider Fallback Ordering
+
+Typical ordering for structured output reliability (most → least reliable):
+
+1. **OpenAI `beta.chat.completions.parse()`** — native schema enforcement
+2. **Gemini Flash with `response_schema`** — strong schema support
+3. **Claude Sonnet with tool calling** — use a tool schema as the output schema
+4. **Any provider with JSON mode + Pydantic validation** — fallback to JSON mode
+5. **Regex extraction** — salvage what's possible
+
+## Surface the Fallback Level to Users
+
+Don't silently degrade. Tell users (or downstream systems) when they're getting a fallback:
+
+```python
+result, source = robust_parse(raw, ResearchReport)
+
+if source == "default":
+    # Don't show this to users — trigger a human review
+    alert_on_call(f"Structured output completely failed for request {request_id}")
+elif source == "partial":
+    # Show with a warning
+    result["_warning"] = "Some fields could not be extracted from the model response."
+elif source in ("regex_repair", "pydantic"):
+    pass  # Normal path
+```
+
+The `confidence: "low"` field on defaults also propagates this signal — any downstream consumer checking `report.confidence` will see the degraded state.
+
+## Reference
+
+The circuit-breaker fallback between model providers: `atlas-agents/ch07_model_portability/online/model_router.py:137`

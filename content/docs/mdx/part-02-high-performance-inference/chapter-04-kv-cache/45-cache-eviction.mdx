@@ -5,5 +5,167 @@ lastUpdatedDate: '2026-08-05'
 
 # 4.5 Cache Eviction
 
-This section covers the details of 4.5 Cache Eviction.
+GPU memory is finite. The KV cache competes with model weights and active computation for the same physical memory. When the cache fills up, the system must evict some entries — and the policy for choosing what to evict has a real impact on performance.
 
+## Why Eviction Happens
+
+On a typical A100 80GB GPU running a 7B model:
+
+```
+Model weights (fp16):        ~14 GB
+Framework/driver overhead:    ~2 GB
+Active computation buffers:   ~2 GB
+─────────────────────────────────────
+Available for KV cache:       ~62 GB
+
+KV cache per token (GQA):    ~128 KB
+Max cacheable tokens:         ~484,000
+
+If serving 50 concurrent users at 10K context each:
+  Required: 50 × 10K × 128 KB = 64 GB
+  Available: 62 GB
+  → Need to evict ~16,000 tokens worth of cached data
+```
+
+Eviction is not an edge case — it's a normal operating condition under load.
+
+## The Cost of Eviction
+
+When a KV cache entry is evicted and that sequence needs to continue (e.g., the user sends another message), the entire evicted context must be **recomputed via prefill**. There's no shortcut.
+
+```
+Sequence has 5,000 tokens cached.
+GPU is full → evict this sequence.
+30 seconds later, user sends a follow-up message.
+
+Without the cache:
+  Reprocess all 5,000 tokens from scratch (full prefill)
+  Cost: proportional to 5,000 tokens of compute
+  Latency: potentially several seconds of TTFT
+```
+
+This is why eviction is expensive. Evicting and re-admitting the same sequence is strictly worse than never evicting it.
+
+## Eviction Policies
+
+Different policies trade off different objectives:
+
+### LRU (Least Recently Used)
+
+Evict the sequence that was last accessed furthest in the past. The assumption: recently used sequences are more likely to be needed again soon.
+
+```
+Eviction queue (oldest access → newest):
+[Seq C (accessed 5 min ago)] [Seq A (2 min ago)] [Seq B (10 sec ago)]
+                    ↑ evict this first
+```
+
+**Good for**: interactive sessions where users are actively chatting.  
+**Bad for**: batch jobs where all sequences are equally "stale."
+
+### LFU (Least Frequently Used)
+
+Evict the sequence accessed the fewest total times.
+
+**Good for**: distinguishing frequently reused prefixes (shared system prompt) from one-off sequences.  
+**Bad for**: new sequences that haven't had time to accumulate accesses.
+
+### Priority-Based
+
+Assign explicit priority values. Common prioritization factors:
+
+| Factor | Higher priority |
+|---|---|
+| Request tier | Premium customers > free tier |
+| Sequence age | Younger (more likely to continue) |
+| Sequence length | Longer (more expensive to recompute) |
+| Prefill cost | More expensive prefills (protect the investment) |
+
+```python
+# Conceptual priority scoring
+def eviction_priority(sequence) -> float:
+    """Lower score = evict first"""
+    age_penalty = (now - sequence.last_access).seconds / 60  # minutes since access
+    length_bonus = sequence.num_tokens / 1000  # protect long sequences
+    tier_bonus = 10 if sequence.is_premium else 0
+    return -age_penalty + length_bonus + tier_bonus
+```
+
+### FIFO (First In, First Out)
+
+Simplest possible policy: evict whatever was cached first. No accounting for recency, frequency, or value. Only appropriate when all sequences have equal value and similar lifetimes.
+
+## vLLM's Block-Level Eviction
+
+vLLM's PagedAttention stores KV cache in fixed-size blocks (16 tokens each). Eviction happens at the block level:
+
+```
+Sequence A occupies blocks: [0, 3, 7, 12]    (64 tokens)
+Sequence B occupies blocks: [1, 4, 9]         (48 tokens)
+Sequence C occupies blocks: [2, 5, 6, 8, 11]  (80 tokens)
+
+Under memory pressure, evict sequence B's blocks [1, 4, 9]:
+  Free 48 tokens worth of memory
+  Sequence B's position is recorded so it can be re-prefilled if needed
+```
+
+Partial sequence eviction is also possible — evict the oldest blocks of a long sequence, keeping the most recent context.
+
+## CPU Swapping: The Second Tier
+
+Before fully evicting a sequence, some inference servers move (swap) the KV cache to CPU RAM as a slower fallback tier:
+
+```
+GPU HBM (fast):   Active sequences, recently accessed
+CPU DRAM (slow):  Sequences swapped out under GPU pressure
+Disk (very slow): Rarely used in practice (too slow for LLM serving)
+```
+
+GPU → CPU swap speed: A100 PCIe ~64 GB/s, NVLink ~600 GB/s  
+CPU RAM → GPU speed (read back): same rates
+
+Swapping adds latency (10–100ms) but avoids the full recompute cost of eviction. vLLM supports this with `--swap-space`:
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-8B-Instruct \
+    --swap-space 10    # 10 GB of CPU memory for swapped KV cache
+```
+
+## Eviction in Multi-Turn Chat Applications
+
+Multi-turn conversations are particularly sensitive to eviction. If a conversation gets evicted mid-session:
+
+```
+Turn 1–5: cached, fast responses (~200ms TTFT)
+Turn 6:   cache evicted under load
+Turn 7:   user message arrives
+          → must re-prefill all of turns 1–6 (~2000 tokens)
+          → TTFT spikes to 2–3 seconds
+          → user notices the slowdown
+```
+
+Mitigation strategies:
+- **Reserve memory for active sessions**: set aside KV cache capacity for sessions with recent activity
+- **Proactive summarization**: compress old turns into a summary before they get evicted
+- **Pinning**: mark high-value sessions as non-evictable (use sparingly — it reduces total throughput)
+
+## Design Implications
+
+1. **Set appropriate `max_tokens` limits** — unnecessarily long max_tokens pre-reserves KV cache capacity in some systems, crowding out other sequences.
+
+2. **Keep conversations focused** — long conversation histories are expensive to maintain in cache and costly to re-prefill if evicted.
+
+3. **Use prompt caching for shared prefixes** — a shared system prompt cached at the provider level won't compete for your serving infrastructure's KV cache.
+
+4. **Monitor cache hit rates** — a good inference server exposes metrics like `cache_hit_rate` and `eviction_rate`. Low hit rates or high eviction rates indicate memory pressure.
+
+## Summary
+
+- Cache eviction is normal under production load — GPU memory is always a shared resource
+- Eviction cost: re-computing a sequence requires a full prefill, which can take seconds for long contexts
+- Eviction policies: LRU (recency), LFU (frequency), priority-based (business rules), FIFO (simple)
+- vLLM evicts at the block level (16 tokens per block) — partial sequence eviction is possible
+- CPU swapping provides a slower fallback tier before full eviction
+- Multi-turn conversations are most sensitive — cache eviction mid-session causes visible TTFT spikes
+- Keep system prompts short or use provider-side caching; keep conversation histories manageable

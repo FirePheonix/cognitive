@@ -5,5 +5,150 @@ lastUpdatedDate: '2026-08-05'
 
 # 2.3 System Prompts
 
-This section covers the details of 2.3 System Prompts.
+The system prompt is the first thing the model reads on every single request. It sets the frame for everything that follows. Get it wrong and even perfect context can't save you. Get it right and you've done half the work before the user says a word.
 
+But "get it right" is harder than it sounds, because a system prompt is not just a set of instructions — it's a persona, a policy document, a workflow manual, and a format spec all rolled into one.
+
+---
+
+## The Four-Layer Architecture
+
+![The four-layer prompt architecture](/part-01/chapter-02/prompt-architecture.png)
+*Fig: The four-layer prompt architecture: Identity → Instructions → Context Injection → Output Constraints, and the flow from user query to tool interaction.*
+
+The book structures system prompts into four layers, each with a distinct job. Assembling them in order produces a prompt that's both clear to the model and maintainable by engineers.
+
+### Layer 1: Identity
+
+Tell the model who it is — its name, role, domain, and hard limits. This is not just aesthetic. Models genuinely behave differently based on the persona they're given.
+
+> Tell a model it's a cautious auditor and it hedges. Tell it it's a senior engineer and it commits.
+
+```
+You are Atlas, an AI software engineering assistant built to help
+developers write, debug, review, and ship code. You operate within
+a sandboxed workspace. You do not access external networks, read
+files outside the workspace, or execute commands not on the
+approved list.
+```
+
+Keep this layer short and precise. It's not a biography — it's a role definition.
+
+### Layer 2: Instructions
+
+The operational manual. This is where you describe the workflow the agent should follow, how it handles errors, what it does when stuck, and when to escalate vs. continue.
+
+```
+When implementing a feature:
+1. Read relevant existing files before writing any code
+2. Write tests before writing the implementation
+3. Run the test suite after each change; report failures verbatim
+4. If a test fails three times with the same approach, stop and explain
+   why you're stuck instead of continuing to loop
+
+When you encounter an ambiguous requirement:
+- State the ambiguity explicitly
+- Propose two interpretations and ask which is intended
+- Do not guess and proceed silently
+```
+
+This is where most of the real work lives. A vague instructions layer produces an agent that kind of works. A precise instructions layer produces an agent you can trust.
+
+### Layer 3: Context Injection
+
+Dynamic data assembled at runtime: the user's profile, session history, retrieved documents, memories from past sessions. This layer changes with every request.
+
+```
+=== Current Session Context ===
+User: Senior backend engineer, works primarily in Python and Go
+Project: user-service, fixing authentication token refresh bug
+Relevant files loaded: auth/middleware.py, auth/tokens.py, tests/test_auth.py
+Past preference: prefers minimal diffs, avoids refactoring unrelated code
+```
+
+This layer is built programmatically — you pull from your memory store, your retrieval system, and the session state. The model never sees this construction process; it just receives the assembled text.
+
+### Layer 4: Output Constraints
+
+Tell the model exactly what format you expect. If you need JSON, specify the schema. If you need markdown with specific headers, show the template. If there's a token budget, state it.
+
+```
+Always respond in this JSON format:
+{
+  "analysis": "string — what you found",
+  "action": "string — what you plan to do next",
+  "confidence": float between 0 and 1,
+  "needs_clarification": boolean
+}
+
+Maximum response length: 600 tokens.
+Do not include explanatory prose outside the JSON object.
+```
+
+Explicit output constraints dramatically reduce the amount of output parsing you need to do downstream.
+
+---
+
+## A Fully Assembled Example
+
+Putting all four layers together for the Atlas agent:
+
+```
+[IDENTITY]
+You are Atlas, an AI software engineering assistant. Your job is to
+help engineers write, debug, and ship production-quality code. You
+operate within a sandboxed workspace with access to a defined set
+of tools: read_file, write_file, run_command, run_tests, search_docs.
+
+[INSTRUCTIONS]
+Workflow:
+1. Before writing any code, read the relevant files
+2. Write tests before writing implementation (TDD)
+3. After each code change, run the test suite
+4. If tests fail: analyze the failure, fix, retry up to 3 times
+5. If stuck after 3 attempts: report what you tried and why it failed
+
+Error handling:
+- Never silently ignore test failures
+- Report exact error messages, not paraphrases
+- Prefer small targeted fixes over large refactors
+
+[CONTEXT]
+User: {user.name}, {user.role}
+Session: {session.summary}
+Current task: {task.description}
+Loaded files: {', '.join(loaded_files)}
+Recent memory: {memory.recent_facts}
+
+[OUTPUT FORMAT]
+Respond as JSON:
+{
+  "thought": "your reasoning",
+  "action": "tool name or 'finish'",
+  "action_input": {...},
+  "result_summary": "one sentence for the user"
+}
+```
+
+---
+
+## Testing Prompt Variants
+
+The `atlas-agents/ch02_prompt_architecture/prompt_ab_test.py` file contains a harness for running controlled comparisons between prompt versions. Before shipping any significant change to a system prompt, run it against your eval set.
+
+A/B testing personas is especially important. Developer intuition about which persona works best is wrong surprisingly often. In the book's experiments, switching from "You are a helpful AI" to "You are a senior engineer who prizes correctness over speed" changed tool call counts, refusal rates, and response structure — measurably, across dozens of test cases.
+
+---
+
+## The Persona Design Insight
+
+The identity layer is not just a label. It activates different behavioral tendencies in the model.
+
+| Persona | Observed Behavior |
+|---------|------------------|
+| "Helpful assistant" | Agreeable, often overconfident |
+| "Cautious auditor" | Hedges, asks for confirmation, raises risks |
+| "Senior engineer" | Commits to decisions, writes code, fewer disclaimers |
+| "Strict reviewer" | Finds problems, proposes alternatives, rarely just approves |
+
+Choose your persona deliberately. Test it empirically. The right persona for a coding agent is different from the right persona for a financial risk analyzer.

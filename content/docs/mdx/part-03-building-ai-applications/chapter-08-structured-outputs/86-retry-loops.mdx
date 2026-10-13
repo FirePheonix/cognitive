@@ -5,5 +5,169 @@ lastUpdatedDate: '2026-08-05'
 
 # 8.6 Retry Loops
 
-This section covers the details of 8.6 Retry Loops.
+When repair fails, retry — but retry intelligently. The naive approach is to call the model again with the same prompt. Don't do that. The model will produce the same (or a similar) broken output.
 
+The key insight: **include the specific validation error in the retry prompt**. The model can fix its output when it knows what's wrong. It can't fix what it doesn't know is broken.
+
+## The Core Pattern
+
+```python
+from pydantic import BaseModel, ValidationError
+from openai import OpenAI
+import json
+
+client = OpenAI()
+
+def call_with_retry(
+    messages: list[dict],
+    response_model: type[BaseModel],
+    max_retries: int = 3,
+) -> BaseModel:
+    """
+    Call an LLM and retry on validation failure, feeding the error back each time.
+    """
+    current_messages = messages.copy()
+
+    for attempt in range(max_retries):
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=current_messages,
+            response_format={"type": "json_object"},
+        )
+        raw_output = response.choices[0].message.content
+
+        try:
+            return response_model.model_validate_json(raw_output)
+        except (ValidationError, json.JSONDecodeError) as e:
+            if attempt == max_retries - 1:
+                raise  # Out of retries — surface the error
+
+            # Feed the specific error back to the model
+            current_messages.append({
+                "role": "assistant",
+                "content": raw_output,
+            })
+            current_messages.append({
+                "role": "user",
+                "content": (
+                    f"Your output was invalid (attempt {attempt + 1}/{max_retries}).\n"
+                    f"Error: {e}\n\n"
+                    f"Please fix the JSON and return only the corrected object."
+                ),
+            })
+
+    raise RuntimeError("Max retries exceeded")  # Should not reach here
+```
+
+## Why the Error Message Matters
+
+Compare these two retry prompts:
+
+**Bad:**
+```
+Your output was invalid. Please try again.
+```
+
+**Good:**
+```
+Your output was invalid (attempt 1/3).
+Error: 1 validation error for ResearchReport
+confidence
+  Input should be 'high', 'medium' or 'low' [type=literal_error, input_value='very high']
+
+Please fix the JSON and return only the corrected object.
+```
+
+The second prompt tells the model exactly which field is wrong and what values are acceptable. Success rate on retry 1 goes from ~60% to ~95%.
+
+## Exponential Backoff for API Errors
+
+Validation failures need immediate retries (the model should try again right away). Transient API errors (rate limits, timeouts) need backoff:
+
+```python
+import time
+from openai import RateLimitError, APITimeoutError
+
+def call_with_retry(messages, response_model, max_retries=3):
+    current_messages = messages.copy()
+
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=current_messages,
+                response_format={"type": "json_object"},
+            )
+        except RateLimitError:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2 ** attempt  # 1s, 2s, 4s
+            time.sleep(wait)
+            continue
+        except APITimeoutError:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(1)
+            continue
+
+        raw_output = response.choices[0].message.content
+
+        try:
+            return response_model.model_validate_json(raw_output)
+        except (ValidationError, json.JSONDecodeError) as e:
+            if attempt == max_retries - 1:
+                raise
+            # No sleep for validation errors — retry immediately with error context
+            current_messages.append({"role": "assistant", "content": raw_output})
+            current_messages.append({
+                "role": "user",
+                "content": f"Your output was invalid (attempt {attempt + 1}/{max_retries}).\nError: {e}\n\nPlease fix the JSON.",
+            })
+```
+
+## Tracking Attempt Count
+
+Include the attempt number in the message. It gives the model context that it's been retrying and should try harder:
+
+```python
+f"Your output was invalid (attempt {attempt + 1}/{max_retries})."
+```
+
+On attempt 3 of 3, some models will shift to simpler outputs to ensure validity — which is the right behavior.
+
+## The Retry Budget
+
+Don't retry indefinitely. Set a clear budget:
+
+| Error type | Max retries | Backoff |
+|---|---|---|
+| Validation error | 3 | None |
+| Rate limit (429) | 5 | Exponential (1s → 16s) |
+| Timeout | 3 | 1s fixed |
+| Server error (5xx) | 3 | Exponential |
+
+After the retry budget is exhausted, the failure propagates to the [Fallback Chain](./87-fallback-chains).
+
+## Instrumentation
+
+Log every retry so you can see which schemas cause the most failures:
+
+```python
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Inside the retry loop:
+logger.warning(
+    "Structured output validation failed",
+    extra={
+        "attempt": attempt + 1,
+        "model": "gpt-4o",
+        "schema": response_model.__name__,
+        "error": str(e),
+        "raw_output_length": len(raw_output),
+    }
+)
+```
+
+If a particular schema is failing on >5% of calls, the schema itself is the problem — it's too complex for the model, or your prompt isn't showing it clearly enough.

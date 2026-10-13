@@ -5,5 +5,148 @@ lastUpdatedDate: '2026-08-05'
 
 # 10.8 Tool Budgets
 
-This section covers the details of 10.8 Tool Budgets.
+## Not All Tool Calls Are Equal
 
+Some tools are essentially free:
+
+```python
+# Fast, local, no external dependency
+def regex_search(pattern: str, text: str) -> list[str]:
+    return re.findall(pattern, text)
+```
+
+Others are expensive:
+
+```python
+# Spawns a subprocess, runs arbitrary code
+def execute_code(code: str) -> str:
+    result = subprocess.run(["python", "-c", code], capture_output=True)
+    return result.stdout.decode()
+
+# Makes an external API call with rate limits and per-call costs
+def call_payment_api(amount: float, recipient: str) -> dict:
+    return stripe.transfer.create(amount=amount, destination=recipient)
+```
+
+The difference is not just money — it's risk. A regex search can be called 100 times with no consequences. A payment API call can be called once wrong and cause real problems.
+
+Tool budgets let you constrain how many times each tool can be called per session, per user, or per agent run.
+
+## The Forbidden Tools Pattern
+
+From `atlas-agents/ch18_evaluation/eval_harness.py:330`, the evaluation harness uses a `forbidden_tools` pattern to verify that agents respect constraints:
+
+```python
+# From atlas-agents/ch18_evaluation/eval_harness.py
+class EvalCase:
+    goal: str
+    expected_outcome: str
+    forbidden_tools: list[str]   # Tools the agent must NOT call
+    required_tools: list[str]    # Tools the agent MUST call
+
+def evaluate_run(run: AgentRun, case: EvalCase) -> EvalResult:
+    tools_called = {tc.function.name for tc in run.all_tool_calls}
+
+    forbidden_violations = tools_called & set(case.forbidden_tools)
+    if forbidden_violations:
+        return EvalResult(
+            passed=False,
+            reason=f"Called forbidden tools: {forbidden_violations}"
+        )
+    # ... rest of evaluation
+```
+
+This principle: **an agent that gets the right answer while calling a forbidden tool is NOT passing.** Correctness alone is not enough — the path matters.
+
+In production, this translates to runtime enforcement:
+
+```python
+def call_tool(name: str, args: dict, session: Session) -> str:
+    if name in session.forbidden_tools:
+        raise ToolForbidden(f"Tool '{name}' is not permitted in this context")
+    if session.tool_call_counts[name] >= session.tool_limits.get(name, DEFAULT_LIMIT):
+        raise ToolBudgetExceeded(f"Tool '{name}' call limit reached")
+
+    session.tool_call_counts[name] += 1
+    return TOOLS[name](**args)
+```
+
+## Role-Based Tool Permissions
+
+From `atlas-agents/ch14_guardrails/online/tool_permission_enforcer.py:216`, permissions are role-based:
+
+| Role | Permitted tools |
+|---|---|
+| `viewer` | read-only: `read_file`, `search`, `list_directory` |
+| `analyst` | viewer + `execute_query`, `download_data` |
+| `developer` | analyst + `write_file`, `execute_code` |
+| `admin` | full access |
+
+```python
+# From atlas-agents/ch14_guardrails/online/tool_permission_enforcer.py
+ROLE_PERMISSIONS = {
+    "viewer":    {"read_file", "search", "list_directory"},
+    "analyst":   {"read_file", "search", "list_directory", "execute_query", "download_data"},
+    "developer": {"read_file", "search", "list_directory", "execute_query", "download_data",
+                  "write_file", "execute_code"},
+    "admin":     None,  # None means all tools permitted
+}
+
+def enforce_permissions(tool_name: str, user_role: str) -> None:
+    permitted = ROLE_PERMISSIONS.get(user_role)
+    if permitted is not None and tool_name not in permitted:
+        raise PermissionDenied(
+            f"Role '{user_role}' cannot call '{tool_name}'"
+        )
+```
+
+The design principle: **default deny, explicit grant**.
+
+An unrecognized role gets no tools. An unknown tool call raises an error. This is zero-trust applied to agent tooling — nothing is permitted unless it has been explicitly allowed.
+
+## Tool Call Rate Limits
+
+Beyond per-session limits, rate limits protect against burst usage:
+
+```python
+import time
+from collections import defaultdict
+
+class RateLimiter:
+    def __init__(self, calls_per_minute: int):
+        self.limit = calls_per_minute
+        self.window = 60  # seconds
+        self.calls: dict[str, list[float]] = defaultdict(list)
+
+    def check(self, key: str) -> bool:
+        now = time.time()
+        window_start = now - self.window
+        # Remove calls outside the window
+        self.calls[key] = [t for t in self.calls[key] if t > window_start]
+        if len(self.calls[key]) >= self.limit:
+            return False  # Rate limited
+        self.calls[key].append(now)
+        return True
+```
+
+Apply rate limits per tool + per user:
+
+```python
+rate_limiter = RateLimiter(calls_per_minute=10)
+
+if not rate_limiter.check(f"{user_id}:{tool_name}"):
+    raise RateLimitExceeded(f"Too many calls to '{tool_name}' — slow down")
+```
+
+## Budget Configuration Table
+
+| Tool category | Per-session limit | Per-minute limit | Notes |
+|---|---|---|---|
+| Read-only search | 50 | 20 | Low risk, high utility |
+| Write operations | 10 | 5 | Reversible writes: higher limit |
+| Execute code | 5 | 2 | Sandbox environment required |
+| External API (read) | 20 | 5 | Protect rate limits and costs |
+| External API (write) | 3 | 1 | High caution — hard to reverse |
+| Payment operations | 1 | 1 | Require explicit human confirmation |
+
+These are starting points. The right numbers depend on your specific tools and risk tolerance.

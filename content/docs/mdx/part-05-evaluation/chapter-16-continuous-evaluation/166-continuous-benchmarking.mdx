@@ -5,5 +5,115 @@ lastUpdatedDate: '2026-08-05'
 
 # 16.6 Continuous Benchmarking
 
-This section covers the details of 16.6 Continuous Benchmarking.
+Run benchmarks on a **schedule**, not just on deployments.
 
+Models drift. External APIs change. Data sources go stale. User behavior shifts. None of these are triggered by a deployment — they happen silently while your CI passes every green check.
+
+A scheduled benchmark catches what no PR check can.
+
+## Why Scheduled Benchmarks Are Necessary
+
+| Silent regression source | Deployment-triggered? | Schedule-triggered? |
+|---|---|---|
+| Model provider silent update | No | Yes |
+| External API data change | No | Yes |
+| Retrieved document staleness | No | Yes |
+| User behavior shift | No | Yes |
+| Gradual prompt drift (accumulated edits) | Partially | Yes |
+| Infrastructure performance degradation | No | Yes |
+
+## The Scheduled CI Runner
+
+From `atlas-agents/ch18_evaluation/online/ci_eval_runner.py`, the three pytest-based threshold checks that run on schedule:
+
+```python
+# atlas-agents/ch18_evaluation/online/ci_eval_runner.py
+
+PASS_RATE_THRESHOLD = 0.70
+HALLUCINATION_THRESHOLD = 0.10
+JUDGE_SCORE_THRESHOLD = 3.0
+REGRESSION_DELTA = 0.05
+
+def test_pass_rate(eval_results):
+    assert eval_results["pass_rate"] >= PASS_RATE_THRESHOLD, (
+        f"Pass rate {eval_results['pass_rate']:.1%} below threshold {PASS_RATE_THRESHOLD:.1%}"
+    )
+
+def test_hallucination_rate(eval_results):
+    assert eval_results["hallucination_rate"] <= HALLUCINATION_THRESHOLD, (
+        f"Hallucination rate {eval_results['hallucination_rate']:.1%} "
+        f"exceeds threshold {HALLUCINATION_THRESHOLD:.1%}"
+    )
+
+def test_judge_score(eval_results):
+    assert eval_results["avg_judge_score"] >= JUDGE_SCORE_THRESHOLD, (
+        f"Judge score {eval_results['avg_judge_score']:.2f} "
+        f"below threshold {JUDGE_SCORE_THRESHOLD:.2f}"
+    )
+
+def test_no_regression(eval_results):
+    baseline = load_baseline()
+    delta = eval_results["pass_rate"] - baseline["pass_rate"]
+    assert delta >= -REGRESSION_DELTA, (
+        f"Regression detected: {delta:.1%} drop from baseline "
+        f"(threshold: -{REGRESSION_DELTA:.1%})"
+    )
+```
+
+## Benchmark Schedule
+
+```yaml
+# .github/workflows/scheduled_eval.yml
+name: Scheduled Benchmark
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # Every Monday at 6am UTC — weekly full benchmark
+    - cron: '0 6 * * *'   # Every day at 6am UTC — daily smoke test (subset)
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run eval suite
+        run: pytest atlas-agents/ch18_evaluation/online/ci_eval_runner.py -v
+      - name: Alert on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: '{"text": "Scheduled benchmark FAILED — possible silent regression"}'
+```
+
+## Benchmark History
+
+Store every benchmark run. Track trends over time:
+
+```python
+def store_benchmark_run(results: dict, run_id: str):
+    record = {
+        "run_id": run_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "triggered_by": "schedule",  # or "pr", "deployment"
+        "pass_rate": results["pass_rate"],
+        "hallucination_rate": results["hallucination_rate"],
+        "avg_judge_score": results["avg_judge_score"],
+        "avg_latency_seconds": results["avg_latency_seconds"],
+        "cost_total_usd": results["cost_total_usd"],
+    }
+    # Append to time-series store (e.g., InfluxDB, Postgres, or just a JSON log)
+    append_to_benchmark_history(record)
+```
+
+A 12-week chart of pass rate is far more informative than a single current number. It shows whether you are improving, stable, or slowly degrading.
+
+## When Benchmarks Fail on Schedule
+
+A scheduled benchmark failure with no recent deployment means something **external** changed. Investigate in this order:
+
+1. **Model provider changelog** — did the underlying model receive a silent update?
+2. **External API changes** — did any tool's data source change?
+3. **Retrieved document staleness** — are top RAG results now outdated?
+4. **Infrastructure** — did latency increase? Are token counts higher?
+
+File an incident. Scheduled benchmark failures are production issues even when production is "up."

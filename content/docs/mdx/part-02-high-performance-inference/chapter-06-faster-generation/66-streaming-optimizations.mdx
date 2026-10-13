@@ -5,5 +5,197 @@ lastUpdatedDate: '2026-08-05'
 
 # 6.6 Streaming Optimizations
 
-This section covers the details of 6.6 Streaming Optimizations.
+When speculative decoding and streaming are combined, new considerations emerge. Tokens aren't generated one at a time — they're verified in batches. Understanding how streaming interacts with speculative decoding helps you build systems that feel fast without surprising the user.
 
+## Streaming Without Speculation: One Token at a Time
+
+Standard streaming is conceptually simple: each decode step produces one token, which is immediately sent to the client:
+
+```
+Decode step 1 → token "The" → send immediately
+Decode step 2 → token " quick" → send immediately  
+Decode step 3 → token " brown" → send immediately
+...
+```
+
+Inter-token latency = time per decode step ≈ constant.
+
+The client sees a smooth stream of tokens at regular intervals.
+
+## Streaming With Speculative Decoding: Token Bursts
+
+With speculative decoding, tokens arrive in variable-size batches:
+
+```
+Verification step 1: accept ["The", "quick", "brown"] → send 3 tokens at once
+Verification step 2: accept ["fox", "jumps"] → send 2 tokens at once
+Verification step 3: accept ["over"] (1 accepted before rejection) → send 1 token
+Verification step 4: accept ["the", "lazy", "dog", "."] → send 4 tokens at once
+```
+
+To the client, this appears as bursts. Between bursts, there's silence (during the next draft + verify cycle). Within a burst, all tokens appear simultaneously.
+
+This bursty behavior can cause:
+1. **UI jitter**: the text cursor jumps rather than flowing smoothly
+2. **Parsing complexity**: streaming parsers must handle batch arrivals
+3. **TTFT delta**: the first burst takes slightly longer than non-speculative TTFT (draft model adds overhead)
+
+## Buffering Strategy
+
+A small client-side buffer smooths out the bursty delivery by re-emitting tokens at a constant rate:
+
+```python
+import asyncio
+import time
+from collections import deque
+
+class TokenBuffer:
+    def __init__(self, emit_interval_ms=30):
+        self.buffer = deque()
+        self.emit_interval = emit_interval_ms / 1000.0
+    
+    async def receive_stream(self, stream):
+        """Receive tokens from the server (bursts OK)"""
+        async for chunk in stream:
+            tokens = self.parse_chunk(chunk)
+            self.buffer.extend(tokens)
+    
+    async def emit_stream(self):
+        """Emit tokens at a smooth, constant rate"""
+        while True:
+            if self.buffer:
+                token = self.buffer.popleft()
+                yield token
+            await asyncio.sleep(self.emit_interval)
+    
+    def parse_chunk(self, chunk):
+        # Handle either single token or multi-token chunk
+        content = chunk.choices[0].delta.content
+        if content:
+            return list(content)  # character-level smoothing, or token-level
+        return []
+```
+
+The buffer introduces a small additional delay (1–3 tokens worth), but makes the visual output smooth regardless of how tokens arrive from the server.
+
+## TTFT vs TPOT with Speculative Decoding
+
+The latency profile changes with speculative decoding:
+
+```
+Standard generation:
+  TTFT:  time for prefill + 1 decode step
+  TPOT:  constant per-step time
+
+Speculative decoding (batch size 1):
+  TTFT:  time for prefill + γ draft steps + 1 verification step
+         → SLIGHTLY HIGHER TTFT (draft overhead)
+  TPOT:  lower effective TPOT (multiple tokens per verification step)
+         → significantly faster total generation
+```
+
+The tradeoff: TTFT increases slightly (~5–20ms), but total generation time decreases significantly (2–4× faster).
+
+For user-facing chat interfaces, streaming hides this tradeoff — the user starts seeing text quickly and the overall response arrives faster.
+
+## Optimal Settings by Use Case
+
+| Use case | Streaming | Speculative decoding | Buffer | γ |
+|---|---|---|---|---|
+| User-facing chat | Yes | Yes (if compute allows) | Small (3–5 tokens) | 4–5 |
+| Code autocomplete | Yes | Yes (prompt lookup) | Minimal (1–2 tokens) | 3–5 |
+| Document generation | Optional | Yes | Larger OK | 5–10 |
+| Batch processing | No | Yes | N/A | 5–10 |
+| Real-time tool detection | Yes | Yes, but careful | No buffer | 3–4 |
+
+## Streaming and Tool Call Detection
+
+Tool call detection under speculative decoding needs special handling. The model might propose draft tokens that "look like" a tool call beginning, but the full call structure isn't confirmed until verification.
+
+Safe approach: accumulate tool call JSON until the structure is complete, then verify and execute. Don't execute based on draft tokens alone.
+
+```python
+import json
+from typing import Optional
+
+class SpeculativeToolCallAccumulator:
+    def __init__(self):
+        self.in_tool_call = False
+        self.json_buffer = ""
+        self.tool_name: Optional[str] = None
+    
+    def process_token_burst(self, tokens: list[str]):
+        """Process a burst of verified tokens from speculative decoding"""
+        for token in tokens:
+            if not self.in_tool_call:
+                # Check if this starts a tool call pattern
+                if self._starts_tool_call(token):
+                    self.in_tool_call = True
+                    self.json_buffer = token
+                else:
+                    yield ("text", token)
+            else:
+                self.json_buffer += token
+                if self._json_complete(self.json_buffer):
+                    tool_call = json.loads(self.json_buffer)
+                    yield ("tool_call", tool_call)
+                    self.in_tool_call = False
+                    self.json_buffer = ""
+    
+    def _json_complete(self, s: str) -> bool:
+        try:
+            json.loads(s)
+            return True
+        except json.JSONDecodeError:
+            return False
+```
+
+## Latency Measurement with Speculative Decoding
+
+Standard TTFT measurement still works — the first verified token is the first token:
+
+```python
+import time
+
+start = time.perf_counter()
+first_token_time = None
+
+async with client.chat.completions.stream(
+    model="...",
+    messages=messages,
+) as stream:
+    async for text in stream.text_stream:
+        if first_token_time is None:
+            first_token_time = time.perf_counter()
+            print(f"TTFT: {(first_token_time - start)*1000:.1f}ms")
+        
+        # Tokens may arrive in bursts — each 'text' might be multiple chars
+        print(text, end="", flush=True)
+
+end = time.perf_counter()
+print(f"\nTotal: {(end - start)*1000:.1f}ms")
+```
+
+Note: with speculative decoding, each `text` in the stream may contain multiple characters/tokens (the accepted burst). Your TTFT measurement is still accurate — it captures the first non-empty text event.
+
+## When NOT to Buffer
+
+For some use cases, buffering is counter-productive:
+
+**Real-time code completions**: IDEs want tokens as fast as possible to fill completions; buffering adds unwanted delay.
+
+**Structured output parsing**: if you're parsing JSON or structured output incrementally, you want tokens immediately to fail fast on invalid structure.
+
+**Low-latency monitoring applications**: if you're watching for specific patterns in the output stream, buffering delays detection.
+
+In these cases, accept the bursty delivery directly and write your parsing code to handle variable-size chunks.
+
+## Summary
+
+- Speculative decoding produces tokens in bursts (per verification step) rather than one at a time
+- Client-side buffering re-emits at a constant rate for smooth UI display
+- TTFT increases slightly with speculative decoding (draft overhead), but total generation time decreases 2–4×
+- For tool call detection: accumulate and verify the complete JSON before executing — don't act on draft tokens
+- Streaming measurement still works: first non-empty text event = TTFT
+- For most user-facing UIs: use streaming + speculative decoding + small buffer (3–5 tokens)
+- For code editors and structured parsers: skip buffering, handle burst delivery directly

@@ -5,5 +5,160 @@ lastUpdatedDate: '2026-08-05'
 
 # 19.7 Load Shedding
 
-This section covers the details of 19.7 Load Shedding.
+Under extreme load, attempting to serve all requests degrades all of them. Load shedding is the deliberate decision to reject some requests so that the accepted requests can be served well.
 
+> **It is better to explicitly reject 20% of requests than to fail 100% of them slowly.**
+
+## When to Shed Load
+
+Shed load when:
+- Queue depth exceeds a threshold (backlog indicates you can't keep up)
+- Worker CPU or memory is above a threshold (system is resource-constrained)
+- Downstream providers are degraded (additional load makes it worse)
+- Error rate spikes (a signal that the system is in a bad state)
+
+## Queue Depth-Based Shedding
+
+The simplest and most reliable signal: how deep is the task queue?
+
+```python
+from fastapi import FastAPI, HTTPException, Depends
+
+MAX_QUEUE_DEPTH = 100  # Reject new tasks when backlog exceeds this
+
+def check_queue_capacity():
+    """FastAPI dependency — raises 503 if queue is too deep."""
+    queue_depth = celery.control.inspect().reserved()
+    total_pending = sum(len(tasks) for tasks in (queue_depth or {}).values())
+
+    if total_pending >= MAX_QUEUE_DEPTH:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "service_overloaded",
+                "message": "The system is currently at capacity. Please try again in a moment.",
+                "retry_after": 30,
+            },
+        )
+
+# Apply to all task submission endpoints
+@app.post("/agent/async")
+async def submit_task(
+    request: AgentRequest,
+    _: None = Depends(check_queue_capacity),   # Load shedding check
+):
+    task = process_agent_task.delay({"message": request.message})
+    return {"task_id": task.id}
+```
+
+## Per-User Rate Limits
+
+Even when global capacity is available, prevent individual users from monopolizing it:
+
+```python
+USER_REQUEST_LIMIT_PER_MINUTE = 10
+
+def check_user_rate_limit(user_id: str):
+    key = f"user_rpm:{user_id}:{int(time.time() // 60)}"
+    pipe = redis.pipeline()
+    pipe.incr(key)
+    pipe.expire(key, 120)
+    count, _ = pipe.execute()
+
+    if count > USER_REQUEST_LIMIT_PER_MINUTE:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "rate_limited",
+                "message": "You've reached the request limit. Please slow down.",
+                "retry_after": 60 - int(time.time() % 60),
+            },
+        )
+```
+
+## Priority Queues
+
+When load is high, serve paying customers first:
+
+```python
+from enum import IntEnum
+
+class RequestPriority(IntEnum):
+    FREE    = 0
+    STARTER = 1
+    PRO     = 2
+    ENTERPRISE = 3
+
+def get_queue_for_user(user: User) -> str:
+    """Route users to different Celery queues based on their tier."""
+    priority_map = {
+        "free":       "standard",
+        "starter":    "priority",
+        "pro":        "priority",
+        "enterprise": "critical",
+    }
+    return priority_map.get(user.plan, "standard")
+
+@app.post("/agent/async")
+async def submit_task(request: AgentRequest, user: User = Depends(get_current_user)):
+    queue = get_queue_for_user(user)
+    task = process_agent_task.apply_async(
+        args=[{"message": request.message}],
+        queue=queue,
+    )
+    return {"task_id": task.id}
+```
+
+Worker configuration to prioritize queues:
+
+```bash
+# Critical queue gets dedicated workers
+celery worker -Q critical -c 10 --hostname=critical@%h
+
+# Priority queue shares workers with standard, but with more capacity
+celery worker -Q priority,standard -c 8 --hostname=priority@%h
+
+# Standard queue gets minimum workers
+celery worker -Q standard -c 4 --hostname=standard@%h
+```
+
+## Backpressure via 503 with Retry-After
+
+When shedding load, always tell the client when to try again:
+
+```python
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(ServiceOverloadedError)
+async def overload_handler(request, exc):
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": "service_overloaded",
+            "message": "The service is temporarily at capacity.",
+            "retry_after": 30,
+        },
+        headers={"Retry-After": "30"},
+    )
+```
+
+Well-behaved clients will respect `Retry-After` and not spam retries — reducing load further instead of amplifying it.
+
+## Shedding Metrics
+
+Track how often and why you're shedding load:
+
+```python
+metrics.increment("load_shedding.rejected", tags={
+    "reason": "queue_depth",
+    "user_plan": user.plan,
+})
+```
+
+High shedding frequency → capacity planning signal. Shedding concentrated on free tier → expected. Shedding on enterprise tier → urgent capacity issue.
+
+## Related Sections
+
+- [19.5 Queue Management](./195-queue-management) — the queue infrastructure that load shedding monitors
+- [19.4 Rate Limiting](./194-rate-limiting) — per-user limits complement load shedding
+- [19.6 Graceful Degradation](./196-graceful-degradation) — what to do for accepted requests when the system is struggling

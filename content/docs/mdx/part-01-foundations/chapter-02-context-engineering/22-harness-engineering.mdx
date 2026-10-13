@@ -5,5 +5,130 @@ lastUpdatedDate: '2026-08-05'
 
 # 2.2 Harness Engineering
 
-This section covers the details of 2.2 Harness Engineering.
+Here's something that surprises a lot of developers when they first build an AI agent: the most dangerous part of the system isn't the model. It's the code that executes what the model asks for.
 
+A language model can be jailbroken. It can be confused by a clever user input. It can hallucinate a command that sounds plausible but would do something destructive if run. What you cannot jailbreak is Python. If your harness checks `if base_cmd not in ALLOWED_COMMANDS: return error`, no prompt injection in the world can make that `if` statement disappear.
+
+That's the core idea behind harness engineering: **move enforcement from prompts into code**.
+
+![The Agent Harness architecture](/part-01/chapter-02/harness-architecture.jpeg)
+*Fig: The Agent Harness architecture: the model generates proposals, the harness validates before execution.*
+
+---
+
+## What Is the Harness?
+
+The harness is the Python wrapper around the LLM call. It's the layer that sits between what the model *wants to do* and what actually *gets executed*.
+
+```
+User Request
+     ↓
+Context Builder (assembles prompt)
+     ↓
+LLM Call (model generates a response or tool call)
+     ↓
+Harness (validates the tool call, decides whether to execute)
+     ↓
+Tool Execution (if approved)
+     ↓
+Result back to model
+```
+
+The model proposes. The harness decides whether to execute.
+
+Without a harness, you're trusting the model to always behave correctly. With a harness, you're trusting your own code — which is deterministic, testable, and auditable.
+
+---
+
+## What the Harness Enforces
+
+A well-built harness enforces four things:
+
+### 1. Command Allowlisting
+
+Only explicitly approved commands can run. Everything else gets a clean error message.
+
+```python
+# From atlas-agents/ch15_agent_harness/harness.py:244
+ALLOWED_COMMANDS = {"pytest", "ruff", "python", "git"}
+
+def run_command(command: str, cwd: Path) -> str:
+    base_cmd = command.strip().split()[0]
+    if base_cmd not in ALLOWED_COMMANDS:
+        return f"Error: '{base_cmd}' is not on the allowlist. Allowed: {ALLOWED_COMMANDS}"
+    result = subprocess.run(
+        command, shell=True, cwd=cwd,
+        capture_output=True, text=True, timeout=30
+    )
+    return result.stdout + result.stderr
+```
+
+If the model hallucinates `rm -rf ./` or tries to run `curl http://evil.com`, the harness stops it cold before anything executes.
+
+### 2. Path Sandboxing
+
+The agent can only read and write within its designated workspace. Any attempt to access files outside the sandbox returns an error.
+
+```python
+def safe_read(path: str, workspace: Path) -> str:
+    target = (workspace / path).resolve()
+    if not str(target).startswith(str(workspace.resolve())):
+        return f"Error: Path '{path}' is outside the workspace."
+    return target.read_text()
+```
+
+This prevents the model from accidentally (or maliciously) reading `/etc/passwd`, API keys in `~/.config`, or files from other projects.
+
+### 3. Verification Loops
+
+Before executing destructive actions, the harness runs a verification step. For example, before applying a code patch, it checks that the patch is well-formed. Before running tests, it confirms the test file exists.
+
+![The verification loop](/part-01/chapter-02/verification-loop.png)
+*Fig: The verification loop: harness checks syntax and linting errors, forcing the agent to retry if validation fails.*
+
+### 4. Trajectory Logging
+
+Every action the agent takes gets logged with timestamp, tool name, arguments, and result. This gives you a complete audit trail for debugging and evaluation.
+
+```python
+@dataclass
+class TrajectoryStep:
+    timestamp: str
+    tool: str
+    args: dict
+    result: str
+    success: bool
+```
+
+---
+
+## Why Not Just Use Prompt Instructions?
+
+You might wonder: why not just tell the model in the system prompt "never run dangerous commands"? 
+
+The answer is that prompts are suggestions. Code is law.
+
+Prompt-level safety can be undermined by:
+- **Prompt injection**: user input that overrides system instructions
+- **Jailbreaks**: creative phrasing that bypasses safety guidelines
+- **Model updates**: behavior changes across versions
+- **Edge cases**: inputs the original prompt author never anticipated
+
+Python code that checks `base_cmd not in ALLOWED_COMMANDS` will behave the same way on every call, every model version, forever. It doesn't hallucinate. It doesn't get confused.
+
+> The shift from "trust the prompt" to "enforce in code" is one of the most important maturity milestones in building production AI agents.
+
+---
+
+## The Harness as a System Property
+
+A good harness turns safety and reliability from *model properties* into *system properties*.
+
+| Without Harness | With Harness |
+|----------------|--------------|
+| Safety depends on the model behaving | Safety enforced by Python code |
+| Failures are silent or hard to trace | Every action is logged |
+| Errors require prompt debugging | Errors have clear, testable causes |
+| Behavior varies with model updates | Core constraints are stable |
+
+The full harness implementation in `atlas-agents/ch15_agent_harness/harness.py` handles all of this — command allowlisting, path sandboxing, verification, and trajectory logging in a single composable module. When you reach Chapter 15, you'll build it from scratch. For now, the key insight is that the harness is not optional infrastructure. It's what separates a demo from a production agent.

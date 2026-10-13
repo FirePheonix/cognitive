@@ -1,0 +1,269 @@
+---
+title: '20.6 Context Compaction for Long-Running Loops'
+lastUpdatedDate: '2026-08-05'
+---
+
+# 20.6 Context Compaction for Long-Running Loops
+
+Every failed attempt leaves residue. Stack traces, wrong code, contradictory reasoning — all of it sits in the context window of the next attempt. By attempt 4, the model may be reasoning about its own failed reasoning, locked in a loop of increasingly confused self-referential noise.
+
+Context compaction is the discipline of distilling each attempt into a clean, forward-looking lesson, then discarding the raw history. The model at attempt 6 should start with a fresh, high-signal brief — not a 20,000-token transcript of everything that went wrong.
+
+## The Problem with Naive History
+
+Consider a 4-attempt loop where each attempt produces:
+- ~200 lines of edited code
+- ~50 lines of error output  
+- ~300 tokens of LLM reasoning
+
+Naive approach — passing full history to each attempt:
+
+```
+Attempt 1 sees: [goal]
+Attempt 2 sees: [goal] + [attempt 1 code] + [attempt 1 errors] + [reasoning 1]
+Attempt 3 sees: [goal] + [attempt 1 code] + [attempt 1 errors] + [reasoning 1]
+                       + [attempt 2 code] + [attempt 2 errors] + [reasoning 2]
+Attempt 4 sees: [goal] + all of the above + [attempt 3 code] + ...
+```
+
+By attempt 4, the context is dominated by failed code and wrong reasoning. The useful signal — what went wrong and what to avoid — is buried.
+
+Typical token counts with naive approach:
+
+| Attempt | Context Tokens | Useful Signal Tokens | Signal Ratio |
+|---|---|---|---|
+| 1 | 800 | 800 | 100% |
+| 2 | 2,400 | 800 | 33% |
+| 3 | 4,800 | 800 | 17% |
+| 4 | 7,200 | 800 | 11% |
+| 5 | 9,600 | 800 | 8% |
+| 6 | 12,000 | 800 | 7% |
+
+By attempt 6, 93% of the context is noise from failed attempts.
+
+## The Compaction Pattern
+
+Instead of accumulating raw history, each attempt's failure is distilled into a single structured lesson:
+
+```python
+def distill_lesson(attempt: int, evidence: str, approach_taken: str) -> str:
+    """
+    Convert a failed attempt into a compact, actionable lesson.
+    
+    Target: ~30 tokens per lesson, not 600+.
+    """
+    # Extract the key error (first meaningful failure line)
+    key_errors = []
+    for line in evidence.splitlines():
+        stripped = line.strip()
+        if stripped and any(kw in stripped for kw in ["FAILED", "Error:", "assert", "TypeError", "ValueError", "ImportError"]):
+            key_errors.append(stripped)
+        if len(key_errors) >= 2:
+            break
+    
+    error_summary = "; ".join(key_errors)[:150] if key_errors else evidence[:100]
+    
+    # Include a brief note on the approach that failed
+    approach_note = f" Approach tried: {approach_taken[:80]}." if approach_taken else ""
+    
+    return f"Attempt {attempt}: {error_summary}.{approach_note}"
+```
+
+The same 4-attempt sequence with compaction:
+
+```
+Attempt 1 lesson: "Attempt 1: TypeError in utils.py:47 — column rename breaks downstream selects. Approach tried: pd.DataFrame.rename()."
+Attempt 2 lesson: "Attempt 2: ImportError — pyarrow not installed. Approach tried: Added to requirements.txt but didn't reinstall."
+Attempt 3 lesson: "Attempt 3: AssertionError in test_transform.py:23 — expected float, got string. Approach tried: Type cast at read time."
+Attempt 4 sees: [goal] + 3 compact lessons (~90 tokens total) + current state
+```
+
+Token counts with compaction:
+
+| Attempt | Context Tokens | Signal Ratio |
+|---|---|---|
+| 1 | 800 | 100% |
+| 2 | 830 | 96% |
+| 3 | 860 | 93% |
+| 4 | 890 | 90% |
+| 5 | 920 | 87% |
+| 6 | 950 | 84% |
+
+The context grows at ~30 tokens per attempt instead of 2,400. Attempt 6 starts nearly as clean as attempt 1.
+
+## The Full Compaction Implementation
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class AttemptRecord:
+    attempt: int
+    approach: str        # Brief description of what the agent tried
+    key_errors: list[str]
+    fingerprint: str
+    tokens_used: int
+
+class CompactingLoop:
+    """
+    A loop that maintains a compact lesson history instead of raw transcript.
+    """
+    
+    def __init__(self, goal: str, max_attempts: int = 6):
+        self.goal = goal
+        self.max_attempts = max_attempts
+        self.lessons: list[str] = []
+        self.records: list[AttemptRecord] = []
+    
+    def run(self) -> dict:
+        evidence = ""
+        last_fp = None
+        stall_count = 0
+        
+        for attempt in range(1, self.max_attempts + 1):
+            # Build clean context
+            context = self._build_context(attempt, evidence)
+            
+            # Agent acts — returns a brief description of what it did
+            approach = agent_act_with_description(self.goal, context)
+            
+            # Verify
+            done, evidence = verify()
+            if done:
+                return {"status": "success", "attempts": attempt}
+            
+            # Fingerprint and stall detection
+            fp = failure_fingerprint(evidence)
+            stall_count = (stall_count + 1) if fp == last_fp else 0
+            last_fp = fp
+            
+            if stall_count >= 2:
+                return escalate(self.goal, self.lessons, 
+                              reason=f"Stall detected (fp={fp})", 
+                              evidence=evidence)
+            
+            # Compact: distill to lesson, don't store raw output
+            lesson = distill_lesson(attempt, evidence, approach)
+            self.lessons.append(lesson)
+            
+            # Store structured record for debugging
+            self.records.append(AttemptRecord(
+                attempt=attempt,
+                approach=approach,
+                key_errors=[l for l in evidence.splitlines() if "Error" in l][:3],
+                fingerprint=fp,
+                tokens_used=estimate_tokens(context)
+            ))
+        
+        return escalate(self.goal, self.lessons, 
+                       reason="Max attempts exhausted", 
+                       evidence=evidence)
+    
+    def _build_context(self, attempt: int, current_evidence: str) -> str:
+        """Build a clean context from distilled lessons, not raw history."""
+        parts = [
+            f"TASK: {self.goal}",
+            f"ATTEMPT: {attempt} of {self.max_attempts}",
+            ""
+        ]
+        
+        if self.lessons:
+            parts.append("LESSONS FROM PREVIOUS ATTEMPTS (do not repeat these approaches):")
+            for lesson in self.lessons:
+                parts.append(f"  • {lesson}")
+            parts.append("")
+        
+        if current_evidence:
+            parts.extend([
+                "CURRENT FAILURE OUTPUT:",
+                current_evidence[:600],
+                ""
+            ])
+        
+        parts.append("Make a fresh approach that avoids all failed patterns above.")
+        
+        return "\n".join(parts)
+```
+
+## Compacting Across Very Long Runs
+
+For loops that might run 10–20 attempts (e.g., a multi-day background improvement task), even compact lessons can accumulate. Apply a second level of compaction: summarize the lessons themselves.
+
+```python
+def summarize_lessons(lessons: list[str], llm_client) -> str:
+    """
+    When lessons list grows beyond 8 entries, summarize them into a compact block.
+    Uses a cheap, fast model for the summarization.
+    """
+    if len(lessons) <= 8:
+        return "\n".join(f"  • {l}" for l in lessons)
+    
+    lessons_text = "\n".join(lessons)
+    
+    response = llm_client.chat.completions.create(
+        model="gpt-4o-mini",  # Cheap summarization
+        messages=[
+            {
+                "role": "user",
+                "content": f"""Summarize these lessons from failed attempts into 3-5 bullet points.
+Focus on: what approaches failed, what errors keep appearing, what NOT to try again.
+Be very concise — 1 sentence per bullet.
+
+Lessons:
+{lessons_text}"""
+            }
+        ],
+        max_tokens=200
+    )
+    
+    return response.choices[0].message.content
+
+
+def _build_context_with_mega_compact(
+    goal: str,
+    attempt: int,
+    lessons: list[str],
+    evidence: str,
+    llm_client
+) -> str:
+    """Context builder with two-level compaction for very long runs."""
+    
+    if len(lessons) <= 8:
+        lessons_block = "\n".join(f"  • {l}" for l in lessons)
+    else:
+        lessons_block = summarize_lessons(lessons, llm_client)
+    
+    return f"""TASK: {goal}
+ATTEMPT: {attempt}
+
+LESSONS FROM ALL PREVIOUS ATTEMPTS:
+{lessons_block}
+
+CURRENT FAILURE:
+{evidence[:500]}
+
+Approach this differently from everything that has been tried before."""
+```
+
+## What to Keep vs. What to Discard
+
+When compacting each failed attempt, apply this filter:
+
+| Information | Keep | Why |
+|---|---|---|
+| Which test(s) failed | ✅ | Agent needs to know what to fix |
+| Error type and message | ✅ | Tells agent what went wrong |
+| File name and line number | ✅ (briefly) | Localizes the problem |
+| Full stack trace | ❌ | Too much noise; error message is enough |
+| The code changes from the failed attempt | ❌ | Agent shouldn't be anchored to failed code |
+| The agent's reasoning from the failed attempt | ❌ | Avoids self-referential confusion |
+| "Do not try approach X" note | ✅ | Prevents looping back to known failures |
+| Environment info (timing, paths) | ❌ | Usually irrelevant to the fix |
+
+## Key Takeaways
+
+- Naive context accumulation degrades signal ratio from 100% on attempt 1 to under 10% by attempt 6
+- Compaction distills each failure into a single ~30-token lesson rather than carrying 600+ tokens of raw output
+- Build context from lessons, not transcripts — the agent should see "what not to try" not "what was tried and failed in detail"
+- For very long runs, apply two-level compaction: summarize the lessons themselves with a cheap model
+- Keep: error type, location, and "don't repeat this approach." Discard: stack traces, failed code, and agent reasoning

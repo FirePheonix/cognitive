@@ -1,9 +1,147 @@
 ---
-title: 13.5 Long Context Retrieval
+title: 13.5 Long-Context Retrieval
 lastUpdatedDate: '2026-08-05'
 ---
 
-# 13.5 Long Context Retrieval
+# 13.5 Long-Context Retrieval
 
-This section covers the details of 13.5 Long Context Retrieval.
+Modern LLMs now support context windows of 128K to 1M tokens. This raises a legitimate question: instead of building a retrieval pipeline, can you just put the entire document corpus directly into context? Sometimes, yes. Here is when it works, when it doesn't, and how to think about the tradeoff.
 
+## What Long Context Makes Possible
+
+A 128K context window holds approximately:
+- ~200 pages of dense text
+- ~500 pages of standard prose
+- An entire mid-sized codebase
+
+A 1M token window (Gemini 1.5 Pro) holds roughly:
+- ~2,500 pages of text
+- The complete works of Shakespeare (~4× over)
+- A large monorepo
+
+For many real-world tasks, this is genuinely sufficient to eliminate the need for retrieval entirely.
+
+## When to Choose Long Context Over RAG
+
+| Scenario | Use long context | Use RAG |
+|---|---|---|
+| Fewer than 50 pages of documents | ✓ | Either |
+| All documents always relevant | ✓ | |
+| Simplicity is a priority | ✓ | |
+| Hundreds or thousands of documents | | ✓ |
+| Documents change frequently | | ✓ |
+| Cost is a primary constraint | | ✓ |
+| Need sub-document precision | | ✓ |
+| Latency must be minimal | | ✓ |
+
+The core decision rule: **if your entire corpus fits comfortably in context and is always relevant to the query, long context is simpler and often better. Otherwise, use RAG.**
+
+## The "Lost in the Middle" Problem
+
+Long context is not a free lunch. Research from Stanford (Liu et al., 2023) demonstrated a consistent pattern: **LLMs recall information from the beginning and end of the context window significantly better than information placed in the middle.**
+
+In experiments with 20 documents in context, model accuracy on questions answered by the most relevant document was:
+
+| Document position | Accuracy |
+|---|---|
+| Position 1 (beginning) | ~74% |
+| Position 5 (middle) | ~52% |
+| Position 10 (middle) | ~48% |
+| Position 20 (end) | ~71% |
+
+This means if you dump 500 pages into context and the answer is on page 250, the model is substantially less likely to retrieve it correctly than if it were on page 1 or page 500.
+
+### Mitigating Lost in the Middle
+
+When using long context, order matters:
+
+```python
+def build_long_context(documents: list[str], query: str, relevance_scores: list[float]) -> str:
+    """
+    Order documents to exploit primacy and recency effects.
+    Most relevant → first position
+    Second most relevant → last position
+    Least relevant → middle
+    """
+    ranked = sorted(zip(relevance_scores, documents), reverse=True)
+
+    if len(ranked) == 0:
+        return ""
+    if len(ranked) == 1:
+        return ranked[0][1]
+
+    # Best doc first, second-best last, rest in the middle
+    ordered = [ranked[0][1]]
+    ordered += [doc for _, doc in ranked[2:]]  # middle positions
+    ordered.append(ranked[1][1])               # second-best at end
+
+    return "\n\n---\n\n".join(ordered)
+```
+
+## Long Context + RAG: The Hybrid
+
+The most powerful pattern combines both techniques:
+
+1. Use RAG to retrieve the most relevant 10–20 chunks (filtering out the 99% of documents that are irrelevant).
+2. Place those chunks into a 128K context window alongside the full conversation history.
+
+This gives you:
+- The filtering precision of RAG (only relevant content enters context)
+- The full context awareness of long-context models (no hard truncation)
+
+```python
+def hybrid_long_context_retrieval(
+    query: str,
+    conversation_history: list[dict],
+    vector_store,
+    context_budget_tokens: int = 60_000
+) -> str:
+    # Step 1: RAG retrieval
+    top_chunks = vector_store.similarity_search(query, k=20)
+
+    # Step 2: Score and order chunks
+    scores = reranker.predict([(query, c.page_content) for c in top_chunks])
+    ordered = build_long_context(
+        [c.page_content for c in top_chunks],
+        query,
+        scores
+    )
+
+    # Step 3: Build full prompt within budget
+    history_tokens = count_tokens(conversation_history)
+    available_for_context = context_budget_tokens - history_tokens - 500  # reserve for answer
+
+    context = truncate_to_tokens(ordered, available_for_context)
+
+    return llm.invoke(
+        messages=conversation_history + [
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"}
+        ]
+    ).content
+```
+
+## Cost Considerations
+
+Long context has a real cost. Token pricing is roughly proportional to context length:
+
+| Approach | Tokens per query | Cost per 1,000 queries |
+|---|---|---|
+| RAG (5 chunks × 500 tokens) | ~2,500 | ~$0.008 |
+| Long context (100 pages) | ~50,000 | ~$0.15 |
+| Long context (500 pages) | ~250,000 | ~$0.75 |
+
+At scale, these differences are significant. A system serving 100,000 daily queries with 500 pages of context costs ~$75,000/month in input tokens alone. The same system with good RAG costs ~$800/month.
+
+## Practical Recommendation
+
+The pragmatic decision tree:
+
+```
+Do you have fewer than ~30 pages of documents total?
+├─ Yes → Are they always all relevant?
+│         ├─ Yes → Use long context. Simpler, no retrieval pipeline.
+│         └─ No → Use RAG or hybrid.
+└─ No → Use RAG. Long context becomes expensive and impractical.
+```
+
+When in doubt, start with long context for its simplicity, measure quality and cost, then migrate to RAG if cost or quality becomes a problem.

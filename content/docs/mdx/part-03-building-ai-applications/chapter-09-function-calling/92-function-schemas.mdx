@@ -5,5 +5,247 @@ lastUpdatedDate: '2026-08-05'
 
 # 9.2 Function Schemas
 
-This section covers the details of 9.2 Function Schemas.
+The schema is the contract between your code and the model. The model reads the schema to understand what the tool does, what arguments it expects, and what format those arguments should be in. The quality of your schema directly determines the quality of the model's tool calls.
 
+> "The model can only call your tools as well as you've described them."
+
+## What Makes a Good Schema
+
+**Rule 1 — Describe what it does, not what it is.**
+
+```python
+# Bad — describes the tool mechanically
+"description": "A function that takes a query string and returns search results"
+
+# Good — describes what calling it accomplishes
+"description": "Search the web for current information. Use this when the user asks about recent events, current prices, or anything that changes over time."
+```
+
+**Rule 2 — Describe each parameter's constraints and format.**
+
+```python
+# Bad
+"query": {"type": "string", "description": "The query"}
+
+# Good
+"query": {
+    "type": "string",
+    "description": "The search query. Use specific, targeted queries rather than vague questions. Example: 'OpenAI GPT-4o release date' not 'what did OpenAI release'"
+}
+```
+
+**Rule 3 — Give examples for non-obvious parameters.**
+
+For parameters with specific format requirements, show an example in the description rather than expecting the model to infer the format.
+
+## Provider Schema Formats
+
+### OpenAI
+
+```python
+tool = {
+    "type": "function",
+    "function": {
+        "name": "search_web",
+        "description": "Search the web for current information on any topic.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Specific search query. Be precise."
+                },
+                "num_results": {
+                    "type": "integer",
+                    "description": "Number of results to return (1-10)",
+                    "default": 5
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+    }
+}
+```
+
+### Anthropic
+
+Same structure but `input_schema` instead of `parameters`:
+
+```python
+tool = {
+    "name": "search_web",
+    "description": "Search the web for current information on any topic.",
+    "input_schema": {           # <-- key difference
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Specific search query."}
+        },
+        "required": ["query"]
+    }
+}
+```
+
+### Gemini
+
+```python
+from google.genai import types
+
+tool = types.Tool(
+    function_declarations=[
+        types.FunctionDeclaration(
+            name="search_web",
+            description="Search the web for current information on any topic.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "query": types.Schema(
+                        type=types.Type.STRING,
+                        description="Specific search query."
+                    )
+                },
+                required=["query"]
+            )
+        )
+    ]
+)
+```
+
+## The Skill Class Pattern
+
+From `atlas-agents/ch03_tools_and_skills/atlas_v03.py`, the `Skill` abstraction encapsulates both the schema and the execution logic:
+
+```python
+from abc import ABC, abstractmethod
+
+class Skill(ABC):
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Unique identifier for this skill."""
+        ...
+
+    @abstractmethod
+    def get_tools(self) -> list[dict]:
+        """Returns OpenAI-compatible tool schema(s) for this skill."""
+        ...
+
+    @abstractmethod
+    def execute(self, tool_name: str, args: dict) -> str:
+        """Execute a tool call and return the result as a string."""
+        ...
+
+
+class WebSearchSkill(Skill):
+    @property
+    def name(self) -> str:
+        return "web_search"
+
+    def get_tools(self) -> list[dict]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_web",
+                    "description": (
+                        "Search the web for current information. Use for recent events, "
+                        "current prices, documentation, or anything that changes over time."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Precise search query. Example: 'Python 3.12 release date' not 'python news'"
+                            }
+                        },
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    }
+                }
+            }
+        ]
+
+    def execute(self, tool_name: str, args: dict) -> str:
+        if tool_name == "search_web":
+            return self._search(args["query"])
+        raise ValueError(f"Unknown tool: {tool_name}")
+
+    def _search(self, query: str) -> str:
+        # Implementation
+        ...
+```
+
+The registry collects skills and exposes a flat list of tool schemas to the model:
+
+```python
+class SkillRegistry:
+    def __init__(self, skills: list[Skill]):
+        self._skills = {s.name: s for s in skills}
+        # Map tool name → skill for dispatch
+        self._tool_to_skill = {}
+        for skill in skills:
+            for tool in skill.get_tools():
+                self._tool_to_skill[tool["function"]["name"]] = skill
+
+    def get_all_tools(self) -> list[dict]:
+        """All tool schemas, flattened — pass this to the model."""
+        tools = []
+        for skill in self._skills.values():
+            tools.extend(skill.get_tools())
+        return tools
+
+    def execute(self, tool_name: str, args: dict) -> str:
+        skill = self._tool_to_skill.get(tool_name)
+        if not skill:
+            return f"Error: Unknown tool '{tool_name}'"
+        return skill.execute(tool_name, args)
+```
+
+Reference: `atlas-agents/ch03_tools_and_skills/atlas_v03.py:106`
+
+## Schema Design Patterns
+
+### Enum constraints
+
+```python
+"status": {
+    "type": "string",
+    "enum": ["active", "inactive", "pending"],
+    "description": "Filter by account status"
+}
+```
+
+### Nested objects
+
+```python
+"date_range": {
+    "type": "object",
+    "properties": {
+        "start": {"type": "string", "description": "ISO 8601 date, e.g. '2026-01-01'"},
+        "end":   {"type": "string", "description": "ISO 8601 date, e.g. '2026-12-31'"}
+    },
+    "required": ["start", "end"]
+}
+```
+
+### Arrays
+
+```python
+"tags": {
+    "type": "array",
+    "items": {"type": "string"},
+    "description": "Filter by these tags. Empty array means no filter.",
+    "maxItems": 10
+}
+```
+
+## Common Mistakes
+
+| Mistake | Better approach |
+|---|---|
+| Vague description: "A useful tool" | Specific: "Reads a file and returns its contents as text" |
+| No format guidance for strings | State format: "ISO 8601 date string, e.g. '2026-01-01'" |
+| Optional parameters with no default described | State: "Defaults to 10 if not provided" |
+| Too many tools (>10) | Group into higher-level tools; the model gets confused with large tool sets |
+| Overlapping tool descriptions | Each tool should have a clearly unique purpose |

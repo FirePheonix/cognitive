@@ -5,5 +5,138 @@ lastUpdatedDate: '2026-08-05'
 
 # 17.3 Spans
 
-This section covers the details of 17.3 Spans.
+A span is one unit of work within a trace — one LLM call, one tool execution, one database query. Spans are the atomic building blocks from which traces are assembled.
 
+## Span Anatomy
+
+Every span has:
+
+```python
+@dataclass
+class Span:
+    span_id: str           # Unique ID for this span
+    trace_id: str          # Which trace this belongs to
+    parent_id: str | None  # Parent span (None = root span)
+    name: str              # Human-readable name
+    kind: str              # "llm", "tool", "http", "db", "agent"
+
+    start_time: datetime
+    end_time: datetime
+
+    input: dict            # What went in
+    output: dict           # What came out
+
+    status: str            # "ok" | "error"
+    error_message: str | None
+
+    # LLM-specific
+    model: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    cost_usd: float | None
+
+    # Computed
+    @property
+    def duration_ms(self) -> float:
+        return (self.end_time - self.start_time).total_seconds() * 1000
+```
+
+## The Nested Structure
+
+The nesting shows cause-and-effect relationships between units of work:
+
+```
+[agent_run: 2,885ms]
+├── [llm_call: 142ms]           ← LLM decided to call search_web
+│   └── triggered →
+├── [tool: search_web: 891ms]   ← search_web ran
+│   └── result injected into →
+├── [llm_call: 203ms]           ← LLM processed results, called fetch_url
+│   └── triggered →
+├── [tool: fetch_url: 1,204ms]  ← fetch_url ran
+│   └── result injected into →
+└── [llm_call: 445ms]           ← LLM generated final answer
+```
+
+Without spans, you know the total latency was 2,885ms. With spans, you know:
+- 142 + 203 + 445 = 790ms was LLM inference
+- 891 + 1,204 = 2,095ms was tool execution
+- The bottleneck is `fetch_url`, not the model
+
+## Creating Spans
+
+### Manual span creation:
+
+```python
+import time
+from contextlib import contextmanager
+
+@contextmanager
+def span(name: str, kind: str, trace_id: str, parent_id: str | None = None):
+    span_obj = Span(
+        span_id=str(uuid4()),
+        trace_id=trace_id,
+        parent_id=parent_id,
+        name=name,
+        kind=kind,
+        start_time=datetime.utcnow(),
+        end_time=None,
+        status="ok",
+    )
+    try:
+        yield span_obj
+        span_obj.end_time = datetime.utcnow()
+        span_obj.status = "ok"
+    except Exception as e:
+        span_obj.end_time = datetime.utcnow()
+        span_obj.status = "error"
+        span_obj.error_message = str(e)
+        raise
+    finally:
+        telemetry.record_span(span_obj)
+```
+
+### Using the span:
+
+```python
+with span("search_web", kind="tool", trace_id=current_trace_id, parent_id=current_span_id) as s:
+    s.input = {"query": query}
+    results = web_search(query)
+    s.output = {"result_count": len(results)}
+```
+
+## Span Kinds
+
+| Kind | What It Covers |
+|------|----------------|
+| `llm` | One call to a language model |
+| `tool` | One tool execution (web search, file read, etc.) |
+| `http` | An outbound HTTP request |
+| `db` | A database query |
+| `agent` | The full agent run (root span) |
+| `eval` | An evaluation run |
+
+## Using Spans for Latency Analysis
+
+The span tree makes latency sources immediately apparent:
+
+```python
+def find_latency_bottleneck(trace: Trace) -> list[Span]:
+    """Return spans that account for >20% of total trace duration."""
+    total = trace.root_span.duration_ms
+    return [
+        span for span in trace.all_spans
+        if span.duration_ms / total > 0.20
+    ]
+```
+
+Common findings:
+- A single slow `fetch_url` call dominating total latency
+- The first LLM call (tool selection) being slower than expected
+- Sequential tool calls that could be parallelized
+
+## Related Sections
+
+- [17.2 Traces](./172-traces) — how spans assemble into a complete run record
+- [17.5 Latency Analysis](./175-latency-analysis) — using span data to find bottlenecks
+- [17.4 Token Metrics](./174-token-metrics) — token and cost data in LLM spans

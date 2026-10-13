@@ -5,5 +5,203 @@ lastUpdatedDate: '2026-08-05'
 
 # 7.4 GPTQ
 
-This section covers the details of 7.4 GPTQ.
+GPTQ is the algorithm that made high-quality int4 quantization of large language models practical. Before GPTQ, naive int4 quantization degraded model quality significantly. GPTQ uses a calibration dataset and a clever per-layer optimization to find int4 weights that minimize reconstruction error — achieving quality within ~5% of the fp16 baseline.
 
+## The Problem With Naive Quantization
+
+Naive per-group int4 quantization rounds each weight independently to the nearest representable value. This ignores correlations between weights and the actual input distributions the model sees:
+
+```
+Original weights: [0.85, 0.23, 0.91, -0.44, ...]
+
+Naive int4 rounding error:
+  Each weight rounded independently
+  Total layer output error = sum of all individual rounding errors
+  No compensation for errors in one weight by adjusting others
+```
+
+The result is compounding quantization error across 32 layers — noticeable degradation on complex tasks.
+
+## GPTQ's Approach: Layer-Wise Reconstruction
+
+GPTQ (Frantar et al., 2022) frames quantization as an optimization problem at the layer level:
+
+**Goal**: find int4 weights W_q that minimize the reconstruction error on a calibration set:
+
+```
+argmin ||W_q × X - W × X||²_F
+
+Where:
+  W   = original fp16 weights (what we're quantizing)
+  W_q = quantized int4 weights (what we want)
+  X   = calibration inputs to this layer (from real data)
+  ||·||_F = Frobenius norm (sum of squared errors)
+```
+
+Instead of minimizing individual weight errors, GPTQ minimizes the error in the **layer's actual output** on representative inputs.
+
+## The Algorithm: Sequential Column Quantization
+
+GPTQ processes the weight matrix column by column. For each column:
+
+1. Quantize the column to int4
+2. Compute the error introduced by this quantization
+3. Propagate the error to remaining columns using the Hessian of the loss
+
+The Hessian matrix (second derivatives of the loss with respect to weights) tells you how much each weight affects the output error. By propagating error corrections forward, GPTQ partially compensates for quantization errors using later weights.
+
+```python
+# Conceptual GPTQ algorithm (simplified)
+def gptq_quantize(W, X, n_bits=4, group_size=128):
+    """
+    W: weight matrix [out, in]
+    X: calibration inputs [in, n_samples]
+    """
+    H = X @ X.T  # Hessian approximation
+    H_inv = inverse(H + damping)  # Cholesky inverse for numerical stability
+    
+    W_q = W.clone()
+    
+    for col in range(W.shape[1]):
+        # Quantize column col
+        w = W_q[:, col]
+        w_q = quantize_to_int4(w, group_scale=compute_scale(w, group_size))
+        
+        # Compute error
+        error = (w_q - w) / H_inv[col, col]
+        
+        # Propagate error to remaining columns
+        W_q[:, col+1:] -= error.unsqueeze(1) * H_inv[col, col+1:].unsqueeze(0)
+        
+        W_q[:, col] = w_q
+    
+    return W_q
+```
+
+## Calibration Dataset
+
+GPTQ requires a small calibration dataset — typically 128–512 samples of text that represent typical use cases. The calibration data is used to:
+
+1. Compute the Hessian matrix (which weights are important for which inputs)
+2. Generate realistic layer inputs (X in the optimization)
+
+```python
+from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
+from datasets import load_dataset
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+
+# Load calibration data
+calibration_data = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+calibration_texts = [d["text"] for d in calibration_data.select(range(128))]
+calibration_tokens = [
+    tokenizer.encode(text, return_tensors="pt")
+    for text in calibration_texts
+    if len(text) > 100
+][:128]
+
+# Configure quantization
+quantize_config = BaseQuantizeConfig(
+    bits=4,              # int4
+    group_size=128,      # per-group scale
+    desc_act=False,      # activation ordering (slower but better quality)
+)
+
+# Quantize
+model = AutoGPTQForCausalLM.from_pretrained(
+    "meta-llama/Meta-Llama-3-8B-Instruct",
+    quantize_config=quantize_config,
+)
+
+model.quantize(calibration_tokens)
+
+# Save quantized model
+model.save_quantized("./llama-3-8b-gptq", use_safetensors=True)
+```
+
+> **Important**: the calibration dataset should be representative of your actual use case. Code-heavy calibration data produces better quantizations for code tasks; general text produces better general-purpose models.
+
+## Using Pre-Quantized GPTQ Models
+
+Most popular models have pre-quantized GPTQ versions on HuggingFace (many uploaded by "TheBloke"):
+
+```python
+from auto_gptq import AutoGPTQForCausalLM
+from transformers import AutoTokenizer
+
+model_name = "TheBloke/Llama-2-7B-GPTQ"
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoGPTQForCausalLM.from_quantized(
+    model_name,
+    device_map="auto",
+    use_triton=True,     # faster inference kernel
+)
+
+# Use like a normal HuggingFace model
+inputs = tokenizer("Hello, I'm a language model", return_tensors="pt").to("cuda")
+output = model.generate(**inputs, max_new_tokens=50)
+print(tokenizer.decode(output[0]))
+```
+
+Or with vLLM (preferred for serving):
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model TheBloke/Llama-2-7B-GPTQ \
+    --quantization gptq \
+    --dtype float16
+```
+
+## GPTQ Quality Benchmarks
+
+Typical quality retention on common benchmarks (4-bit, group_size=128):
+
+| Model | Benchmark | fp16 | GPTQ int4 | Quality retained |
+|---|---|---|---|---|
+| Llama-2-7B | MMLU (5-shot) | 45.3% | 43.1% | 95% |
+| Llama-2-13B | MMLU | 54.8% | 52.4% | 96% |
+| Llama-2-70B | MMLU | 68.9% | 65.7% | 95% |
+| Llama-2-7B | GSM8K | 14.3% | 11.8% | 83% |
+
+GSM8K (math) shows the largest quality drop — consistent with quantization being most harmful to numerical reasoning.
+
+## GPTQ vs Naive int4
+
+The difference between naive int4 and GPTQ int4 is significant:
+
+```
+Naive int4 (independent weight rounding):
+  Llama-2-7B MMLU: ~35–38%  (−7–10% from baseline)
+  Many inference failures on complex tasks
+
+GPTQ int4 (calibrated layer reconstruction):
+  Llama-2-7B MMLU: ~43%  (−2% from baseline)
+  Normal inference quality
+```
+
+GPTQ's calibration step recovers ~5–8% quality that naive quantization loses.
+
+## Time and Compute to Quantize
+
+GPTQ quantization time (on a single A100 or high-end CPU):
+
+| Model size | Time on A100 GPU | Time on CPU (32 cores) |
+|---|---|---|
+| 7B | ~30 minutes | ~4 hours |
+| 13B | ~1 hour | ~8 hours |
+| 70B | ~8 hours | ~40 hours |
+
+This is a one-time cost — you quantize once and use the result forever. The calibration dataset (~128 samples) is tiny.
+
+## Summary
+
+- GPTQ: post-training quantization via layer-wise reconstruction on a calibration dataset
+- Unlike naive quantization, GPTQ optimizes layer output error (not individual weight error)
+- Algorithm: sequential column quantization with Hessian-based error propagation
+- Calibration dataset: 128–512 text samples, representative of your use case
+- Quality: ~95% of fp16 on MMLU, ~83–90% on math/reasoning tasks
+- Pre-quantized models available on HuggingFace (TheBloke, etc.)
+- Supported in vLLM (`--quantization gptq`) and AutoGPTQ library
+- Quantization takes 30 min to 8 hours depending on model size — one-time cost

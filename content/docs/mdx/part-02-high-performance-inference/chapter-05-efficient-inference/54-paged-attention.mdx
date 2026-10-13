@@ -1,9 +1,197 @@
 ---
-title: 5.4 Paged Attention
+title: 5.4 PagedAttention
 lastUpdatedDate: '2026-08-05'
 ---
 
-# 5.4 Paged Attention
+# 5.4 PagedAttention
 
-This section covers the details of 5.4 Paged Attention.
+PagedAttention is the memory management innovation that made continuous batching practical at scale. Without it, even the best batching strategy is limited by memory fragmentation. With it, you can run dozens of concurrent sequences on a single GPU without wasting memory on pre-allocated buffers.
 
+## The Memory Problem That PagedAttention Solves
+
+Traditional LLM serving systems pre-allocate a contiguous block of GPU memory for each request's KV cache. This is simple — but it creates two problems:
+
+**Problem 1: You don't know output length in advance**
+
+If you set `max_tokens=2048`, you must allocate space for 2048 tokens per request, even if the actual output is 50 tokens. For a batch of 32 requests, you've pre-allocated 32 × 2048 tokens of KV cache, but the actual usage might be 32 × 100 = just 5% of what you reserved.
+
+**Problem 2: Contiguous memory requirement causes external fragmentation**
+
+As requests of varying lengths complete, they leave gaps in GPU memory. A new large request might not fit in any single gap even though the total free space is sufficient:
+
+```
+After mixed requests complete:
+[FREE: 200MB][USED][FREE: 150MB][USED][FREE: 300MB]
+
+New request needs 400MB contiguous → REJECTED
+Total free: 650MB → plenty of space, but not contiguous
+```
+
+## The OS Virtual Memory Analogy
+
+PagedAttention's design is directly inspired by virtual memory in operating systems. In a modern OS:
+
+- **Virtual address space**: programs think they have contiguous memory
+- **Physical pages**: actual RAM is divided into 4KB pages
+- **Page table**: maps virtual page numbers to physical page numbers
+- Programs can use non-contiguous physical pages without knowing it
+
+PagedAttention applies the same concept to KV cache:
+
+- **Logical blocks**: the sequence thinks it has contiguous KV cache
+- **Physical blocks**: GPU memory is divided into fixed-size blocks (16 tokens)
+- **Block table**: maps logical block indices to physical GPU memory locations
+
+```
+Sequence A's logical view:
+  Block 0 (tokens 0–15): contiguous
+  Block 1 (tokens 16–31): contiguous
+  Block 2 (tokens 32–47): contiguous
+
+Physical GPU memory reality:
+  Block 0 → physical page 7
+  Block 1 → physical page 2
+  Block 2 → physical page 15
+  (non-contiguous — scattered around GPU memory)
+```
+
+The attention kernel uses the block table to translate logical positions to physical addresses on every access.
+
+## Block Allocation and Deallocation
+
+The block manager maintains a pool of free physical blocks:
+
+```python
+# Conceptual block manager
+class KVCacheBlockManager:
+    def __init__(self, total_gpu_memory, block_size=16):
+        n_blocks = total_gpu_memory // (block_size * bytes_per_token)
+        self.free_blocks = deque(range(n_blocks))  # initially all free
+        self.sequence_tables = {}  # seq_id → [physical_block_ids]
+    
+    def allocate_block(self, seq_id):
+        if not self.free_blocks:
+            raise OutOfMemoryError("No free KV cache blocks")
+        
+        physical_block = self.free_blocks.popleft()
+        self.sequence_tables[seq_id].append(physical_block)
+        return physical_block
+    
+    def free_sequence(self, seq_id):
+        for block in self.sequence_tables.pop(seq_id):
+            self.free_blocks.append(block)  # return to pool
+```
+
+- **Allocation**: on demand, as a sequence generates new tokens
+- **Deallocation**: immediately when a sequence completes
+- **No pre-allocation**: you only use what you need
+
+## Block Size Tradeoffs
+
+The block size (number of tokens per physical block) is a key parameter:
+
+| Block size | Pros | Cons |
+|---|---|---|
+| 4 tokens | <50% waste per sequence | High block table overhead |
+| 16 tokens | ~12.5% average waste | vLLM default — good balance |
+| 32 tokens | Lower metadata overhead | ~25% waste on average |
+| 128 tokens | Minimal overhead | Approaches traditional allocation |
+
+vLLM's default of 16 tokens per block means at most 15 tokens of waste per sequence (the partial last block). Average waste is ~8 tokens = 8/16 = 50% of the last block, which across all sequences averages to ~8 tokens wasted.
+
+For typical production workloads, this translates to <4% total memory waste — compared to 50–90% with pre-allocation.
+
+## The Modified Attention Kernel
+
+Standard FlashAttention assumes contiguous KV cache storage. The PagedAttention kernel modifies this to perform block table lookups during computation:
+
+```
+Standard attention access pattern:
+  K[layer][head][position] → contiguous memory address
+
+PagedAttention access pattern:
+  logical_block = position // block_size
+  offset        = position % block_size
+  physical_block = block_table[seq_id][logical_block]
+  address = kv_cache_base + physical_block * block_bytes + offset * element_bytes
+```
+
+This indirection adds a small overhead per attention access, but it's negligible compared to the memory bandwidth savings from eliminating fragmentation and pre-allocation waste.
+
+## Copy-on-Write for Prefix Sharing
+
+PagedAttention enables an important optimization: multiple sequences can **share the same physical blocks** for identical prefixes:
+
+```
+Request A and B share a 2000-token system prompt.
+
+Physical block allocation:
+  Shared blocks 0–124 (tokens 0–1999):
+    Sequence A block table: [7, 2, 15, 8, ...] (125 blocks)
+    Sequence B block table: [7, 2, 15, 8, ...] (same 125 physical blocks!)
+    Reference count: 2
+  
+  Divergent blocks (tokens 2000+):
+    Sequence A block 125: physical block 31 (A's unique output)
+    Sequence B block 125: physical block 44 (B's unique output)
+```
+
+When either sequence would write to a shared block (only happens during prefill of the divergent suffix), copy-on-write creates a private copy first.
+
+This means 100 requests sharing a 2000-token system prompt use the same GPU memory as 1 request — not 100×.
+
+## vLLM Configuration
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="meta-llama/Meta-Llama-3-8B-Instruct",
+    
+    # Memory allocation
+    gpu_memory_utilization=0.90,    # use 90% of GPU memory for KV cache
+    
+    # Block management
+    # block_size=16 is the default (16 tokens per block)
+    
+    # Prefix caching (copy-on-write blocks)
+    enable_prefix_caching=True,
+    
+    # Context length cap (limits max blocks per sequence)
+    max_model_len=8192,
+)
+```
+
+```bash
+# Equivalent command-line configuration
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-8B-Instruct \
+    --gpu-memory-utilization 0.90 \
+    --enable-prefix-caching \
+    --max-model-len 8192
+```
+
+## Performance Impact
+
+From the original vLLM paper benchmarks:
+
+| System | Throughput (tokens/s) | Latency (P99) |
+|---|---|---|
+| Hugging Face Transformers | ~100 | High |
+| ORCA (static batching) | ~800 | High for short requests |
+| vLLM (PagedAttention + continuous batching) | ~2,400 | Lower for all |
+
+The 24× throughput improvement over HuggingFace comes from the combination of:
+- PagedAttention eliminating memory waste → more concurrent sequences
+- Continuous batching eliminating idle GPU time → higher utilization
+
+## Summary
+
+- PagedAttention solves two problems: pre-allocation waste and external memory fragmentation
+- Inspired by OS virtual memory: physical KV cache is divided into fixed 16-token blocks
+- A block table maps each sequence's logical token positions to physical GPU block addresses
+- Allocation is on-demand; deallocation is immediate on sequence completion
+- Memory waste drops from 50–90% (pre-allocation) to <4% (PagedAttention)
+- Copy-on-write enables physical block sharing for identical prefixes — 100 requests with the same system prompt use the same physical blocks
+- The modified attention kernel adds negligible overhead for the block table lookup
+- Combined with continuous batching, PagedAttention delivers 24× throughput improvement over naive serving

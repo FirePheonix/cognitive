@@ -186,3 +186,34 @@ None of these were explicitly programmed. They all emerged from the single objec
 - **Cross-entropy loss** = `-log(P(correct_token))`. High probability on the correct token → low loss.
 - A random model starts at loss `log(vocab_size)`. For GPT-2's vocab: `log(50257) ≈ 10.8`.
 - After training, a good model achieves loss ~2-3, meaning it has learned genuine preferences about what comes next.
+
+---
+
+## Scaling Laws: Why Bigger Usually Means Better
+
+One of the most important empirical findings in modern ML: model performance (measured as loss) scales predictably with model size, data size, and compute — following power laws.
+
+**The Chinchilla scaling laws:**
+$$L(N) \approx L_\infty + aN^{-\alpha}$$
+$$L(D) \approx L_\infty + bD^{-\beta}$$
+Where $N$ is parameter count, $D$ is token count, $L_\infty$ is the irreducible loss, and $\alpha, \beta$ are fitted exponents (empirically around 0.3–0.5).
+
+What this says: doubling model size reduces loss by a predictable, consistent amount. So does doubling training data.
+
+**The compute-optimal insight (Chinchilla):**
+The crucial finding from DeepMind's "Chinchilla" paper: previous models were undertrained. The optimal tradeoff is roughly: for every 10× increase in compute, you should scale both parameters and training tokens by about 3.16× each (roughly equal in log space).
+
+GPT-3 (175B parameters, 300B tokens) was trained with too many parameters for too few tokens. A compute-matched model with fewer parameters and more data would have been better.
+
+**What the data pipeline actually does:**
+Modern pretraining data isn't "just the internet." It goes through:
+```
+Web crawl
+→ Language identification (keep English, etc.)
+→ Quality filtering (remove spam, adult content, boilerplate)
+→ Deduplication (exact and near-duplicate removal)
+→ Safety/privacy filtering
+→ Mixture weighting (weight Wikipedia more than random forum posts)
+→ Tokenization
+```
+Data quality is arguably more important than quantity. A model trained on carefully curated 1T tokens will outperform one trained on noisy 2T tokens.

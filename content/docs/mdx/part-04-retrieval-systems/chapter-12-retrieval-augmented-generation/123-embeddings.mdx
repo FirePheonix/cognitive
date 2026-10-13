@@ -5,5 +5,105 @@ lastUpdatedDate: '2026-08-05'
 
 # 12.3 Embeddings
 
-This section covers the details of 12.3 Embeddings.
+An embedding is a vector — a list of numbers — that represents the **semantic meaning** of text. Two texts with similar meanings have similar vectors, even if they share no words.
 
+This is the mathematical foundation that makes RAG work.
+
+## The Semantic Similarity Insight
+
+```
+"The dog barked loudly."           → [0.21, -0.43, 0.87, 0.12, ...]
+"The canine made a noise."         → [0.19, -0.41, 0.85, 0.14, ...]
+"Quarterly earnings increased."    → [-0.34, 0.67, -0.21, 0.53, ...]
+
+Distance("dog barked", "canine noise")  = 0.05  ← very similar
+Distance("dog barked", "earnings")      = 0.89  ← very different
+```
+
+Traditional keyword search would find zero overlap between "dog barked" and "canine made a noise." Embedding-based search captures their equivalence.
+
+## The Embedding Pipeline
+
+```python
+from openai import OpenAI
+
+client = OpenAI()
+
+def embed(text: str) -> list[float]:
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text,
+    )
+    return response.data[0].embedding
+    # Returns a list of 1,536 floats
+```
+
+At **index time** (one-time):
+1. Chunk documents into pieces
+2. Embed each chunk
+3. Store vectors in the vector database
+
+At **query time** (every search):
+1. Embed the user's query (one API call)
+2. Search the vector database for the nearest vectors
+3. Return the corresponding document chunks
+
+## Model Choices
+
+| Model | Dimensions | Quality | Cost | Use case |
+|---|---|---|---|---|
+| `text-embedding-3-small` | 1,536 | Good | ~$0.00002/1K tokens | Production default |
+| `text-embedding-3-large` | 3,072 | Best | ~$0.00013/1K tokens | When quality matters most |
+| `sentence-transformers/all-MiniLM-L6-v2` | 384 | Good | Free (local) | Privacy-sensitive / offline |
+| `sentence-transformers/all-mpnet-base-v2` | 768 | Better | Free (local) | Higher quality local option |
+
+```python
+# Local sentence-transformers (no API cost, runs on CPU)
+from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+def embed_local(text: str) -> list[float]:
+    return model.encode(text).tolist()
+```
+
+**OpenAI `text-embedding-3-small`** is the practical default for most applications — good quality, cheap, fast, no hardware required.
+
+**Local sentence-transformers** make sense when: data cannot leave your infrastructure, embedding cost is a concern at extreme scale, or you need offline operation.
+
+## Batch Embedding at Index Time
+
+Embed in batches — not one document at a time:
+
+```python
+def embed_chunks_batch(chunks: list[str], batch_size: int = 100) -> list[list[float]]:
+    all_embeddings = []
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i + batch_size]
+        response = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=batch,
+        )
+        all_embeddings.extend([item.embedding for item in response.data])
+    return all_embeddings
+```
+
+Batching is 10–50× faster than one-at-a-time embedding for large document collections.
+
+## Embedding Consistency
+
+**Always use the same model for indexing and querying.** If you index with `text-embedding-3-small` and query with `text-embedding-3-large`, the vectors are incompatible — the similarity scores will be meaningless.
+
+Store the embedding model name alongside your index:
+
+```python
+INDEX_METADATA = {
+    "embedding_model": "text-embedding-3-small",
+    "embedding_dimensions": 1536,
+    "created_at": "2026-08-05",
+    "chunk_size": 1000,
+    "chunk_overlap": 150,
+}
+```
+
+When you upgrade embedding models, you must re-embed and re-index everything. Track this like a schema migration.

@@ -5,5 +5,96 @@ lastUpdatedDate: '2026-08-05'
 
 # 18.2 Cost Attribution
 
-This section covers the details of 18.2 Cost Attribution.
+Knowing your total LLM bill is not cost attribution. Attribution is knowing **which feature, user, and session** generated each dollar of that bill.
 
+Without attribution, you cannot answer "why did our API bill increase 3× this month?" With attribution, you know within minutes.
+
+## Attribution Dimensions
+
+Attribute every LLM call along at least these three dimensions:
+
+| Dimension | Why it matters |
+|---|---|
+| **Feature** | Which product feature is expensive? Where to optimize? |
+| **Tenant/User** | Which customer is burning most of your budget? |
+| **Session** | Which specific conversation was unusually expensive? |
+
+Optional dimensions: agent type, model, environment (production vs. staging), workflow stage.
+
+## The Redis Tracking Pattern
+
+```python
+import litellm
+import redis
+
+redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
+
+def track_costs(response, session_id: str, feature: str, tenant_id: str):
+    cost = litellm.completion_cost(completion_response=response)
+    tokens = response.usage.total_tokens
+
+    # Atomic increments — safe for concurrent writes
+    pipe = redis_client.pipeline()
+    pipe.incrbyfloat(f"costs:feature:{feature}", cost)
+    pipe.incrbyfloat(f"costs:session:{session_id}", cost)
+    pipe.incrbyfloat(f"costs:tenant:{tenant_id}", cost)
+    pipe.incrbyfloat(f"costs:daily:{datetime.utcnow().date()}", cost)
+    pipe.incrby(f"tokens:feature:{feature}", tokens)
+    pipe.execute()
+
+    return cost
+```
+
+Add this call to your LLM wrapper — every agent call goes through it.
+
+## Usage in Practice
+
+```python
+class CostAwareAgent:
+    def run(self, user_input: str, session_id: str, tenant_id: str, feature: str) -> str:
+        response = litellm.completion(
+            model=self.model,
+            messages=self.build_messages(user_input),
+        )
+        cost = track_costs(response, session_id, feature, tenant_id)
+        logger.info(f"Call cost: ${cost:.6f} | session={session_id} | feature={feature}")
+        return response.choices[0].message.content
+```
+
+## Querying Attribution Data
+
+```python
+def get_feature_costs(date: str = None) -> dict:
+    """Get cost breakdown by feature."""
+    pattern = "costs:feature:*"
+    keys = redis_client.keys(pattern)
+    return {
+        key.replace("costs:feature:", ""): float(redis_client.get(key) or 0)
+        for key in keys
+    }
+
+def get_top_tenants_by_cost(n: int = 10) -> list[tuple[str, float]]:
+    """Get the N most expensive tenants."""
+    pattern = "costs:tenant:*"
+    keys = redis_client.keys(pattern)
+    costs = [(key.replace("costs:tenant:", ""), float(redis_client.get(key) or 0)) for key in keys]
+    return sorted(costs, key=lambda x: x[1], reverse=True)[:n]
+
+# Example output:
+# get_feature_costs() → {"code_review": 45.23, "research": 12.67, "summarization": 3.11}
+# get_top_tenants_by_cost() → [("acme_corp", 28.50), ("startup_xyz", 15.20), ...]
+```
+
+## When the Bill Spikes
+
+With attribution in place, a 3× bill spike becomes a 5-minute investigation:
+
+```
+1. Check daily cost trend → spike started Tuesday
+2. Check feature breakdown → "research_agent" up 400%
+3. Check top sessions by cost → session xyz cost $4.20 (vs $0.04 average)
+4. Inspect session xyz → user triggered a loop by asking "keep searching until you find it"
+5. Fix → add max_iterations guard to research_agent
+```
+
+Without attribution, step 2 alone could take days.

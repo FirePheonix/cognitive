@@ -5,5 +5,103 @@ lastUpdatedDate: '2026-08-05'
 
 # 16.5 Prompt Regression
 
-This section covers the details of 16.5 Prompt Regression.
+A prompt change is a code change. It can introduce regressions. It must be tested before shipping.
 
+> **The rule:** no prompt change ships without a passing eval run.
+
+This is not bureaucracy — it is the minimum viable safety net. Prompt changes are the most common source of silent regressions in AI systems.
+
+## The Three-Step Process
+
+### Step 1: Run the eval suite against the current prompt, save baseline
+
+```python
+# Run current prompt — this becomes the baseline
+baseline_results = run_offline_eval(
+    agent=agent_with_prompt(CURRENT_PROMPT),
+    dataset=GOLDEN_DATASET,
+)
+save_baseline(baseline_results, path="prompt_baseline.json")
+
+print(f"Baseline: pass_rate={baseline_results.pass_rate:.1%}, "
+      f"judge_score={baseline_results.avg_judge_score:.2f}")
+```
+
+### Step 2: Make your prompt change
+
+```python
+# New prompt — whatever change you're proposing
+NEW_PROMPT = """
+You are a senior software engineer...
+[your changes here]
+"""
+```
+
+### Step 3: Run the eval suite again, compare to baseline
+
+```python
+new_results = run_offline_eval(
+    agent=agent_with_prompt(NEW_PROMPT),
+    dataset=GOLDEN_DATASET,
+)
+
+baseline = load_baseline("prompt_baseline.json")
+delta = new_results.pass_rate - baseline["pass_rate"]
+
+print(f"New:      pass_rate={new_results.pass_rate:.1%}, "
+      f"judge_score={new_results.avg_judge_score:.2f}")
+print(f"Delta:    {delta:+.1%}")
+
+if delta < -0.05:
+    print("REGRESSION DETECTED — do not ship this change")
+elif delta >= 0.0:
+    print("IMPROVEMENT — safe to ship")
+else:
+    print("MINOR REGRESSION — review before shipping")
+```
+
+## The Full A/B Harness
+
+From `atlas-agents/ch02_prompt_architecture/prompt_ab_test.py` — the harness runs both prompts against all eval cases and produces a side-by-side comparison:
+
+```
+Prompt A/B Test Results
+─────────────────────────────────────────────────────────
+Metric              Prompt A (current)   Prompt B (new)
+─────────────────────────────────────────────────────────
+Pass rate           76.0%                82.0%   ✓ +6.0%
+Avg judge score     3.6                  3.9     ✓ +0.3
+Hallucination rate  6.0%                 4.0%    ✓ -2.0%
+Refusal rate        95.0%                97.0%   ✓ +2.0%
+Avg tool calls      2.3                  2.1     ✓ -0.2
+Avg latency         4.2s                 3.8s    ✓ -0.4s
+─────────────────────────────────────────────────────────
+Winner: Prompt B — ship it
+```
+
+## What Commonly Causes Prompt Regressions
+
+| Change | Common regression |
+|---|---|
+| Added instructions | New instructions conflict with existing ones, causing confusion |
+| Reordered sections | Critical instructions near the end get ignored in long prompts |
+| Changed persona | Agent refuses tasks it previously handled ("as a [new persona], I can't...") |
+| Added examples | Few-shot examples over-anchor the agent to example patterns |
+| Tightened safety | Over-refusal — agent now refuses legitimate requests |
+| Loosened safety | Under-refusal — agent now handles things it should decline |
+
+## Category-Level Regression Analysis
+
+Always check regression at the category level, not just overall:
+
+```python
+def category_delta(new_results, baseline):
+    for category in CATEGORIES:
+        new_rate = new_results.pass_rate_by_category[category]
+        base_rate = baseline["pass_rate_by_category"][category]
+        delta = new_rate - base_rate
+        status = "✓" if delta >= -0.03 else "✗ REGRESSION"
+        print(f"  {category:15s}: {base_rate:.0%} → {new_rate:.0%}  ({delta:+.0%}) {status}")
+```
+
+A prompt change that improves research by 10% but breaks safety by 15% is a net negative. Never report only the aggregate.

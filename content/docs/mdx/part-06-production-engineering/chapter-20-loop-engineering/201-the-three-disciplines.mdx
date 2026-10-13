@@ -1,0 +1,115 @@
+---
+title: '20.1 The Three Disciplines of AI Development'
+lastUpdatedDate: '2026-08-05'
+---
+
+# 20.1 The Three Disciplines of AI Development
+
+The practice of building useful things with LLMs has evolved through three distinct disciplines in roughly four years. Each one unlocks a capability that the previous one could not reach. Understanding this progression is not just history — it tells you which problems belong to which discipline and why mixing them up causes frustration.
+
+## Discipline 1: Prompt Engineering (2022–2024)
+
+**Core idea:** write better instructions, get better outputs.
+
+In the early days, the entire craft was in the prompt. You learned to use few-shot examples, chain-of-thought reasoning, role assignments, and careful formatting. A skilled prompt engineer could coax dramatically better results from the same model by rearranging a few sentences.
+
+The loop was entirely human:
+
+```
+Write prompt → Model responds → Human reads → Human decides quality
+     ↑                                                    |
+     └────────────────── Human re-prompts ───────────────┘
+```
+
+This scales with the skill of the prompt engineer and the quality of the model. It does not scale with volume. If you have 10 outputs to review, fine. If you have 10,000, you are the bottleneck.
+
+**Ceiling:** human reading speed. One senior engineer reviewing outputs can cover perhaps 50–100 meaningful LLM responses per day before quality suffers.
+
+## Discipline 2: Context / Harness Engineering (2025)
+
+**Core idea:** the right environment makes the model dramatically more capable.
+
+As models got better and tool use became reliable, the focus shifted from "what do I tell the model?" to "what environment do I put the model in?" The harness engineer's job was to curate context: the right files in the context window, the right tools available, the right verification steps built into the scaffolding.
+
+```
+Set up harness → Trigger agent → Agent uses tools → Harness verifies
+      ↑                                                       |
+      └──────────── Human reviews exceptions ────────────────┘
+```
+
+This is much more scalable. The human reviews exceptions, not every output. But it still requires a human to review and decide on failures — and when failure rates are non-trivial (say, 20%), that's still a lot of human attention.
+
+**Ceiling:** human exception-handling bandwidth. If 1 in 5 runs needs human judgment, and you run 500 times per day, that's 100 human decisions per day. You're still the bottleneck, just at higher throughput.
+
+## Discipline 3: Loop Engineering (2026)
+
+![The loop engineering cycle](/part-06/chapter-20/loop-engineering-cycle.png)
+*Fig: The loop engineering cycle: the system observes outcomes, learns from failures, and iterates — without human intervention on each step.*
+
+**Core idea:** the system runs itself, grades itself, and only escalates when genuinely stuck.
+
+Loop engineering encodes the human judgment that was previously the bottleneck. Instead of "I'll decide whether this is correct," you define: what does correct look like? How does the machine check it? When does the machine conclude it's stuck and hand off to a human?
+
+```
+Define termination condition
+Define escalation rule
+                │
+                ▼
+         System runs itself
+                │
+         System verifies
+                │
+         System detects stalls
+                │
+    ┌────── Pass? ──────┐
+    │                   │
+    ▼                   ▼
+  Done          Escalate (rare)
+```
+
+The human now reviews only genuine escalations — cases where the machine truly cannot make progress. If you've built the system well, this is 5–10% of runs instead of 100%.
+
+**Ceiling:** the quality of your termination conditions, fingerprinting, and escalation logic. Poorly defined success criteria produce infinite loops or false completions. Well-defined ones run reliably for months without intervention.
+
+## The Uncomfortable Inversion
+
+Each discipline requires giving up something comfortable:
+
+| Discipline | What You Give Up | What You Gain |
+|---|---|---|
+| Prompt Engineering | Nothing (you're in full control) | Better per-call quality |
+| Context Engineering | Reviewing every output | Throughput (review exceptions only) |
+| Loop Engineering | Making every judgment call | Scale (the system makes routine calls) |
+
+The transition from context engineering to loop engineering is psychologically difficult for many engineers. It feels like losing control. The model is making decisions you used to make. It is — and that's the point. If you've encoded your judgment accurately into the termination conditions and escalation rules, the machine makes those decisions exactly as you would. If you haven't, it makes them badly, and you fix the encoding.
+
+> "Your eyeballs are the bottleneck, and the way out is not reading faster. It's encoding your judgment into machinery that scales."
+
+## The Three Disciplines Are Not Stages
+
+You don't graduate from prompt engineering and never do it again. All three disciplines are active simultaneously in any mature system:
+
+- **Prompt engineering**: still happens at the individual-call level — system prompts, tool descriptions, output format instructions
+- **Context engineering**: still happens at the session level — what files are in context, what tools are available, what the memory contains
+- **Loop engineering**: happens at the system level — the harness that connects calls, evaluates results, and drives retry and escalation logic
+
+The discipline that dominates changes depending on the problem:
+
+```
+Single-call task (classify this email)     → Prompt engineering
+Multi-step task (refactor this module)     → Context engineering
+Autonomous task (fix all failing tests)    → Loop engineering
+```
+
+## Recognizing Which Discipline You Need
+
+A practical heuristic: how long does the work take, and how many attempts might be needed?
+
+| Task Duration | Typical Attempts | Right Discipline |
+|---|---|---|
+| < 10 seconds | 1 | Prompt engineering |
+| 10s – 5 minutes | 1–3 | Context engineering |
+| 5 – 60 minutes | 3–10+ | Loop engineering |
+| Hours to days | Many | Loop engineering + monitoring |
+
+If you find yourself manually retrying an agent because the first attempt failed — that's the signal. You need loop engineering.

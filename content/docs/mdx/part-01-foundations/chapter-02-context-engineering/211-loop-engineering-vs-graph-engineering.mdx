@@ -1,9 +1,168 @@
 ---
-title: 2.11 Loop Engineering v/s Graph Engineering
+title: 2.11 Loop Engineering vs Graph Engineering
 lastUpdatedDate: '2026-08-05'
 ---
 
-# 2.10 Prompt Versioning
+# 2.11 Loop Engineering vs Graph Engineering
 
-This section covers the details of 2.1 Loop v/s Graph Engineering
+There are two ways to give an AI agent control flow: a loop or a graph.
 
+The loop is simple: while the task isn't done, call the model, execute the result, repeat. The graph is explicit: define nodes (states), edges (transitions), and conditions, then let a framework like LangGraph route execution between them.
+
+Neither is universally better. They solve different problems, and knowing when to reach for each one is one of the more practical judgment calls in agent engineering.
+
+---
+
+## Loop Engineering
+
+A loop-engineered agent is, at its core, a `while` loop with a termination condition:
+
+```python
+def run_agent(task: str, max_iterations: int = 20) -> str:
+    messages = [build_system_prompt(task)]
+    
+    for iteration in range(max_iterations):
+        response = call_model(messages)
+        action = parse_action(response)
+        
+        # Termination condition
+        if action.type == "finish":
+            return action.result
+        
+        # Execute the action
+        result = execute_tool(action)
+        
+        # Structured feedback back into context
+        messages.append({"role": "assistant", "content": response})
+        messages.append({"role": "tool", "content": result})
+        
+        # Compact context before next cycle
+        if should_compress(messages):
+            messages = compress_history(messages)
+    
+    # Escalation: couldn't finish in max_iterations
+    return escalate("Max iterations reached", messages)
+```
+
+That's the whole structure. The model decides what to do, the loop executes it and feeds the result back, and this continues until either the model says "finish" or the iteration limit is hit.
+
+Loop engineering is the **third discipline** in the book's arc:
+1. Prompt engineering (2022–2024): human reads every output
+2. Context/harness engineering (2025): the environment does the heavy lifting
+3. Loop engineering (2026): the system runs itself
+
+In loop engineering, the agent is genuinely autonomous for the duration of a task. It only escalates when it's genuinely stuck, not every time it wants confirmation.
+
+---
+
+## The Five Parts of an Engineered Loop
+
+A well-built agentic loop has five components:
+
+### 1. Trigger
+What starts the loop. Could be a user request, a scheduled job, a webhook, or another agent.
+
+### 2. Termination Condition
+What ends the loop. Multiple conditions, in priority order:
+- Model returns `action: "finish"` — success path
+- Max iterations reached — safety limit
+- Error rate exceeds threshold — circuit breaker
+- Human override — escalation trigger
+
+Without explicit termination conditions, loops can run indefinitely and rack up costs.
+
+### 3. Structured Feedback
+Each iteration must produce feedback that the next iteration can act on. Tool results, test outputs, error messages — all fed back as structured data, not prose summaries.
+
+```python
+# ✅ Structured feedback — model can parse and react
+{"tool": "run_tests", "result": {"passed": 12, "failed": 2, "errors": ["AssertionError in test_auth.py:88"]}}
+
+# ❌ Unstructured feedback — model gets vague information
+"The tests had some issues with the auth module."
+```
+
+### 4. Context Compaction
+Before each iteration, prune the history. Failed attempts that were retried become one-line lessons. Successful steps get summarized. Only the current state and recent actions stay in full detail.
+
+From `atlas-agents/ch20_loop_engineering`:
+> "Prune history before each cycle; failed attempts become one-line lessons."
+
+### 5. Escalation Logic
+When to stop trying and ask a human. The agent should escalate when:
+- It has tried the same approach more than N times
+- It encounters an action outside its tool authorization
+- The task requires information it cannot retrieve
+- A risk threshold is exceeded
+
+```python
+def should_escalate(trajectory: list[TrajectoryStep]) -> bool:
+    recent = trajectory[-5:]
+    
+    # Same tool called with same args 3+ times = stuck
+    if len({(s.tool, str(s.args)) for s in recent}) <= 2 and len(recent) >= 3:
+        return True
+    
+    # Error rate too high
+    error_rate = sum(1 for s in recent if not s.success) / len(recent)
+    if error_rate > 0.6:
+        return True
+    
+    return False
+```
+
+---
+
+## Graph Engineering
+
+Graph-engineered agents use explicit state machines — nodes represent states or actions, edges represent transitions, and the framework routes between them based on conditions.
+
+```python
+# LangGraph example
+from langgraph.graph import StateGraph
+
+graph = StateGraph(AgentState)
+
+graph.add_node("plan", plan_step)
+graph.add_node("execute", execute_step)
+graph.add_node("review", review_step)
+graph.add_node("human_approval", human_approval_step)
+
+graph.add_edge("plan", "execute")
+graph.add_conditional_edges("execute", route_after_execute, {
+    "success": "review",
+    "needs_approval": "human_approval",
+    "failure": "plan",  # retry
+})
+graph.add_edge("review", END)
+graph.add_edge("human_approval", "execute")
+```
+
+This structure makes the control flow *explicit and visualizable*. You can draw it as a diagram. Every possible path through the agent is defined in advance.
+
+---
+
+## When to Use Which
+
+| Use Loop Engineering when... | Use Graph Engineering when... |
+|------------------------------|-------------------------------|
+| The next step depends on the previous result | You need guaranteed human-in-the-loop at specific points |
+| The workflow is open-ended or exploratory | You have parallel execution branches |
+| You want to move fast and iterate | Compliance requires auditable, explicit control flow |
+| The task is single-threaded | You need visualization of agent state |
+| You're building a new agent from scratch | You're integrating into an existing LangGraph ecosystem |
+
+The loop is simpler, faster to build, and easier to debug. The graph is more explicit, more controllable, and better suited for regulated environments or complex multi-agent coordination.
+
+---
+
+## The Practical Starting Point
+
+Start with a loop. It covers 80% of agent use cases. If you find yourself needing:
+- Hard checkpoints where a human must approve before proceeding
+- True parallel execution (not just sequential tool calls)
+- Complex branching that a termination condition can't capture
+
+...then migrate the relevant parts to a graph.
+
+The book's `atlas-agents/ch20_loop_engineering` implementation is a fully developed loop-engineered agent. By the time you reach Chapter 20, you'll have built every component from scratch — the harness, the memory, the compression, the escalation logic — and you'll understand exactly why the loop is structured the way it is.

@@ -306,3 +306,30 @@ Without `W_O`, the heads' outputs would remain in incompatible subspaces — hea
 - Implementation: project into `(batch, num_heads, seq, d_k)`, compute attention for all heads in one batch operation, merge back via concatenation, then apply the output projection `W_O`.
 - `W_O` synthesizes the diverse head perspectives into one coherent representation.
 - The original transformer used 8 heads with d_k=64. GPT-2 uses 12 heads with d_k=64. The pattern scales up consistently.
+
+---
+
+## Multi-Head Attention: The Formal Equations
+
+**Why multiple heads?**
+Single-head attention computes one set of attention patterns — one "perspective" on the sequence. But language has many types of relationships happening simultaneously: syntactic (subject-verb agreement), semantic (pronoun reference), positional (is this word near the start?), and more. Multiple heads let the model attend to all of these at once, in parallel.
+
+**The math:**
+Each head $i$ gets its own set of projection matrices and computes attention independently:
+$$\text{head}_i = \text{Attention}(XW_i^Q, XW_i^K, XW_i^V)$$
+Where each $W_i^Q, W_i^K, W_i^V$ is a different learned projection — head $i$ learns to "look for" a different kind of pattern.
+
+The outputs of all heads are concatenated and projected back:
+$$\text{MHA}(X) = \text{Concat}(\text{head}_1, \dots, \text{head}_h) W_O$$
+
+**The parameter cost:**
+With $h$ heads each of dimension $d_k = d_{\text{model}} / h$, the total parameter count stays the same as single-head attention with dimension $d_{\text{model}}$. You get multiple perspectives for free — no added parameters.
+
+**Empirically, different heads specialize:**
+Research has shown that different attention heads do learn to specialize:
+- Some heads track syntactic dependencies (subject-verb)
+- Some track coreference (linking "it" back to "the cat")
+- Some focus on positional patterns (attending to the previous token)
+- Some track rare, specific patterns for specific token types
+
+This is emergent — not programmed. The model discovers these specializations through training.

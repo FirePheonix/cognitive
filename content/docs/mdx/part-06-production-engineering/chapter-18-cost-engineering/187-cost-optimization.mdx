@@ -5,5 +5,146 @@ lastUpdatedDate: '2026-08-05'
 
 # 18.7 Cost Optimization
 
-This section covers the details of 18.7 Cost Optimization.
+Cost optimization has a hierarchy. Work through it from top to bottom — cheapest interventions first, architectural changes last.
 
+## The Optimization Hierarchy
+
+### 1. Cache Responses
+
+Identical or near-identical inputs should get cached outputs. This is the highest-leverage optimization.
+
+```python
+import hashlib
+import redis
+
+cache = redis.Redis(host="localhost", port=6379, decode_responses=True)
+
+def cached_llm_call(prompt: str, model: str, ttl_seconds: int = 3600) -> str:
+    cache_key = f"llm:{model}:{hashlib.sha256(prompt.encode()).hexdigest()}"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached  # Free — no API call
+
+    response = litellm.completion(model=model, messages=[{"role": "user", "content": prompt}])
+    result = response.choices[0].message.content
+    cache.setex(cache_key, ttl_seconds, result)
+    return result
+```
+
+For semantic caching (cache on similar, not just identical inputs), use **GPT Cache** or Redis with vector similarity. A query for "What is Python?" and "What is the Python programming language?" should hit the same cache entry.
+
+### 2. Route to Cheaper Models
+
+Use the benchmark (from [18.3 Per-Feature Cost](/docs/part-06-production-engineering/chapter-18-cost-engineering/183-per-feature-cost)) to find the cheapest model that meets your quality threshold.
+
+```python
+MODEL_ROUTING = {
+    "simple_qa":       "claude-haiku-4-5",      # Quality threshold: 3.5 → Haiku passes
+    "code_review":     "claude-sonnet-4-6",      # Quality threshold: 4.0 → need Sonnet
+    "summarization":   "claude-haiku-4-5",       # Quality threshold: 3.5 → Haiku passes
+    "architecture":    "claude-sonnet-4-6",      # Quality threshold: 4.5 → need Sonnet
+}
+
+def get_model_for_task(task_type: str) -> str:
+    return MODEL_ROUTING.get(task_type, "claude-haiku-4-5")
+```
+
+### 3. Reduce Context
+
+Only pass what the agent actually needs. The three main context traps:
+
+```python
+# TRAP 1: Full conversation history
+# Bad:
+messages = full_conversation_history    # 50 turns, 40,000 tokens
+
+# Better: Rolling window
+messages = conversation_history[-6:]    # Last 3 turns only
+
+# Best: Rolling summary
+messages = [
+    {"role": "system", "content": SYSTEM_PROMPT},
+    {"role": "assistant", "content": f"Summary of prior conversation: {summary}"},
+    *conversation_history[-2:],         # Only most recent exchange
+]
+
+# TRAP 2: Full document retrieval
+# Bad:
+context = "\n\n".join(all_retrieved_docs)    # 20 chunks, 8,000 tokens
+
+# Better: Re-rank and truncate
+top_3 = reranker.rerank(query, retrieved_docs, top_n=3)
+context = "\n\n".join(top_3)                 # 3 chunks, 1,200 tokens
+
+# TRAP 3: Unnecessary tool schemas
+# Bad:
+tools = ALL_TOOLS    # 15 tools, 2,000 tokens of schemas
+
+# Better: Task-specific tool subsets
+tools = get_tools_for_task(task_type)    # 3 relevant tools, 400 tokens
+```
+
+### 4. Batch Requests
+
+Group similar requests together. If you're processing 100 documents, batch them rather than making 100 serial calls:
+
+```python
+async def batch_summarize(documents: list[str]) -> list[str]:
+    tasks = [summarize_document(doc) for doc in documents]
+    return await asyncio.gather(*tasks)  # Parallel, not serial
+```
+
+Note: batching reduces wall time and connection overhead, but each call still costs the same. True cost savings come from batched prompt patterns (one call that processes multiple inputs).
+
+### 5. Compress History
+
+A rolling summary is far cheaper than full conversation history:
+
+```python
+async def compress_history(history: list[dict], max_tokens: int = 500) -> str:
+    if count_tokens(history) < max_tokens:
+        return None  # No compression needed
+
+    history_text = format_history(history)
+    summary = await llm_call(
+        model="claude-haiku-4-5",   # Cheap model for summarization
+        prompt=f"Summarize this conversation in 3–5 sentences:\n\n{history_text}",
+    )
+    return summary
+```
+
+## The Haiku-First Guardrail Strategy
+
+The most impactful single optimization for adversarial traffic:
+
+```python
+async def guarded_agent(user_input: str) -> str:
+    # Step 1: Classify with Haiku — fast and cheap ($0.001)
+    classification = await classify_intent(
+        model="claude-haiku-4-5",
+        input=user_input,
+    )
+
+    if classification.is_harmful:
+        return "I can't help with that."   # Never reaches Sonnet
+
+    if classification.is_simple_qa:
+        # Simple questions don't need Sonnet
+        return await answer_with_haiku(user_input)
+
+    # Step 2: Only call Sonnet ($0.003–$0.015) for complex, safe requests
+    return await answer_with_sonnet(user_input)
+```
+
+On a system with 20% adversarial or trivial traffic, this pattern delivers **10–30× cost savings** on that fraction of requests — because bad requests are blocked before reaching the expensive model.
+
+## Cost Optimization Impact Summary
+
+| Technique | Typical savings | Effort |
+|---|---|---|
+| Response caching (exact) | 20–40% for repetitive workloads | Low |
+| Model routing (Haiku for simple tasks) | 30–60% | Medium |
+| Context reduction (history, retrieval) | 20–40% | Medium |
+| Haiku-first guardrail | 10–30× on adversarial traffic | Low |
+| Semantic caching | 10–30% | High |
+| History compression | 20–50% on long conversations | Medium |

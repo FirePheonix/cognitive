@@ -5,5 +5,134 @@ lastUpdatedDate: '2026-08-05'
 
 # 12.7 Context Packing
 
-This section covers the details of 12.7 Context Packing.
+You've retrieved 20 chunks. The context window fits 5. How you select and arrange those 5 chunks determines whether the LLM has the information it needs to answer correctly.
 
+Context packing is the final step between retrieval and generation.
+
+## The Re-Ranking Step
+
+Before packing, re-rank. The vector similarity score is a good first filter, but it measures how similar two vectors are — not how relevant a chunk is to the specific question.
+
+**Cross-encoders** are more accurate: they read the query and document together in a single forward pass, producing a relevance score that accounts for their interaction.
+
+From `atlas-agents/ch11_memory` — the Cohere Rerank integration:
+
+```python
+import cohere
+
+co = cohere.Client(api_key="...")
+
+def rerank_chunks(query: str, chunks: list[str], top_n: int = 3) -> list[str]:
+    """
+    Retrieve top 20 with hybrid search, then re-rank to top 3.
+    Cross-encoder is too slow to run on thousands of documents,
+    but fine for the top 20 candidates.
+    """
+    response = co.rerank(
+        query=query,
+        documents=chunks,
+        model="rerank-english-v3.0",
+        top_n=top_n,
+    )
+    return [chunks[result.index] for result in response.results]
+```
+
+The two-stage pattern:
+1. **Stage 1**: Hybrid search retrieves top 20 candidates (fast — vector lookup)
+2. **Stage 2**: Cross-encoder re-ranks to top 3 (accurate — reads query + document together)
+
+This is far more accurate than single-stage vector retrieval, at acceptable latency.
+
+## Context Packing Strategy
+
+Once you have the top N re-ranked chunks, pack them efficiently:
+
+```python
+def pack_context(
+    chunks: list[str],
+    max_tokens: int = 4000,
+    include_sources: bool = True,
+) -> str:
+    packed = []
+    current_tokens = 0
+
+    for i, chunk in enumerate(chunks):
+        chunk_tokens = count_tokens(chunk)
+        if current_tokens + chunk_tokens > max_tokens:
+            break  # Context window full
+
+        if include_sources and hasattr(chunk, "metadata"):
+            source_line = f"[Source: {chunk.metadata.get('source', 'unknown')}]\n"
+            packed.append(source_line + chunk)
+        else:
+            packed.append(chunk)
+
+        current_tokens += chunk_tokens
+
+    return "\n\n---\n\n".join(packed)
+```
+
+## Deduplication
+
+Re-ranked chunks from hybrid search may overlap. A parent chunk and a child chunk from the same section may both appear in the top results:
+
+```python
+def deduplicate_chunks(chunks: list[str], similarity_threshold: float = 0.85) -> list[str]:
+    """Remove chunks that are too similar to a higher-ranked chunk."""
+    deduplicated = [chunks[0]]
+
+    for candidate in chunks[1:]:
+        is_duplicate = False
+        for kept in deduplicated:
+            # Simple overlap check — use embedding similarity for better accuracy
+            overlap = len(set(candidate.split()) & set(kept.split()))
+            union = len(set(candidate.split()) | set(kept.split()))
+            if overlap / union > similarity_threshold:
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            deduplicated.append(candidate)
+
+    return deduplicated
+```
+
+## "Lost in the Middle" Problem
+
+LLMs pay more attention to content at the **beginning and end** of the context window. Content in the middle is more likely to be ignored.
+
+Packing strategy: place the most relevant chunk **first**, the second most relevant **last**, and fill the middle with supporting chunks:
+
+```python
+def lost_in_middle_order(chunks: list[str]) -> list[str]:
+    """
+    Optimal ordering for LLM attention:
+    Position 0 (highest attention):   most relevant chunk
+    Position -1 (second attention):   second most relevant
+    Positions 1..-2 (lower attention): supporting chunks
+    """
+    if len(chunks) <= 2:
+        return chunks
+    return [chunks[0]] + chunks[2:] + [chunks[1]]
+```
+
+## The Full Pipeline
+
+```python
+def rag_retrieve_and_pack(query: str, max_context_tokens: int = 4000) -> str:
+    # 1. Hybrid search: top 20 candidates
+    candidates = hybrid_search(query, k=20)
+
+    # 2. Re-rank: top 5 using cross-encoder
+    reranked = rerank_chunks(query, candidates, top_n=5)
+
+    # 3. Deduplicate
+    unique = deduplicate_chunks(reranked)
+
+    # 4. Order for attention (lost-in-middle mitigation)
+    ordered = lost_in_middle_order(unique)
+
+    # 5. Pack into context window
+    context = pack_context(ordered, max_tokens=max_context_tokens)
+
+    return context
+```

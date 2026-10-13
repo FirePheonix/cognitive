@@ -289,3 +289,69 @@ Both started from the same initial vector. The Transformer layers made them cont
 - The embedding matrix is a substantial fraction of a model's total parameters — vocabulary size is a genuine design tradeoff.
 
 With tokenization and embeddings in place, you now have the full picture of how raw text becomes a form a neural network can process. Everything that follows — attention, transformer blocks, generation — operates on these floating-point vectors. The foundation is set.
+
+---
+
+## Word2Vec: Learning Embeddings from Context
+
+The static embeddings described above need to be *learned* from data somehow. The most influential method for doing this — Word2Vec (Mikolov et al., 2013) — is worth understanding in detail, because it makes concrete what "learning from text" actually means mathematically.
+
+The core intuition is called the **Distributional Hypothesis**: a word's meaning is defined by the company it keeps. Words that appear in similar contexts — "doctor" and "physician," "fast" and "quick" — should end up with similar vector representations. You don't need to label what any word means; you just need to observe which words tend to appear near each other.
+
+### The Skip-gram Model
+
+Word2Vec's Skip-gram variant learns embeddings by training on a simple prediction task: given a center word, predict the surrounding words within a context window.
+
+For a center word $c$ and a context word $o$, the model defines the probability of seeing $o$ near $c$ as:
+
+$$P(o \mid c) = \frac{\exp(u_o^\top v_c)}{\sum_{w \in V} \exp(u_w^\top v_c)}$$
+
+Where $v_c$ is the embedding vector for the center word and $u_o$ is the embedding vector for the context word. (Each word gets *two* vectors — one for when it acts as a center word, one for when it acts as a context word.) The numerator measures how well $o$ and $c$ "match" via dot product. The denominator normalizes over the entire vocabulary $V$ so the result is a valid probability.
+
+The training objective over a corpus with window size $m$ is to maximize the log-probability of all observed context pairs:
+
+$$J = -\sum_t \sum_{-m \le j \le m,\ j \neq 0} \log P(w_{t+j} \mid w_t)$$
+
+The negative sign turns maximization into minimization — standard convention for gradient descent. Intuitively: pull center-word vectors toward their actual context words; push them away from everything else.
+
+### The Negative Sampling Shortcut
+
+There's a computational problem. That denominator sums over the entire vocabulary — 50,000 items or more — for every single training example. Computing it is slow.
+
+Negative Sampling solves this by turning the problem into binary classification. Instead of "predict the right word from all words," train the model to distinguish real context pairs from randomly sampled "negative" pairs. The objective becomes:
+
+$$\log\sigma(u_o^\top v_c) + \sum_{k=1}^{K} \mathbb{E}_{w_k \sim P_n}\!\left[\log\sigma(-u_{w_k}^\top v_c)\right]$$
+
+The first term rewards the model for scoring a real context pair $(o, c)$ highly. The second term penalizes it for scoring random noise pairs highly. You only need to evaluate $K$ noise words per step instead of 50,000 — typically $K = 5$ to $20$.
+
+The noise distribution uses a 3/4 power smoothing to prevent ultra-frequent words (like "the" or "a") from dominating the negatives:
+
+$$P_n(w) \propto f(w)^{3/4}$$
+
+This raises the sampling probability of rare words and lowers it for common ones — giving the model more informative negatives to learn from.
+
+### GloVe: Global Vectors for Word Representation
+
+GloVe (Pennington et al., 2014) takes a different angle. Word2Vec learns from local context windows one example at a time. GloVe asks: why not use the *global* co-occurrence statistics of the entire corpus directly?
+
+Let $X_{ij}$ be the number of times word $j$ appears in the context of word $i$ across the whole corpus. GloVe's training objective is:
+
+$$J = \sum_{i,j} f(X_{ij}) \left( w_i^\top \tilde{w}_j + b_i + \tilde{b}_j - \log X_{ij} \right)^2$$
+
+The goal: make the dot product of two word vectors predict their log co-occurrence count. The weighting function $f(X_{ij})$ down-weights very frequent pairs (so "the the" doesn't dominate) and ignores zero-count pairs. The result combines the efficiency of local window methods with the statistical richness of the full corpus.
+
+In practice, Word2Vec and GloVe produce embeddings with similar properties — both capture analogies, both cluster by meaning. The differences are mostly engineering tradeoffs.
+
+### The Geometry of Meaning, Revisited
+
+Both methods produce the famous word analogy results. The vector arithmetic works because relationships get encoded as consistent *directions*:
+
+$$v_{\text{king}} - v_{\text{man}} + v_{\text{woman}} \approx v_{\text{queen}}$$
+
+The vector $v_{\text{king}} - v_{\text{man}}$ captures a "royalty" direction, independent of gender. Adding $v_{\text{woman}}$ shifts along the gender axis to land near "queen." You can find the best matching word by searching for the nearest neighbor using cosine similarity:
+
+$$d^* = \arg\max_d \cos(v_d,\ v_b - v_a + v_c)$$
+
+This works for country–capital pairs (France–Paris, Germany–Berlin), grammatical relationships (walk–walking, swim–swimming), and many semantic relationships. None of this was programmed in — it emerged purely from which words appeared near which other words.
+
+> **The fundamental limitation:** A word like "bank" gets one vector — it can't simultaneously represent "financial institution" and "riverbank." Whatever the training data's balance of usages is, that's what the single vector reflects. This is the key weakness of static embeddings. The fix — contextual representations where the same word gets a *different* vector depending on the surrounding text — is exactly what Transformers provide. Word2Vec was the stepping stone that made the path visible: it proved that meaning could be geometry, and that geometry could be learned from raw text.

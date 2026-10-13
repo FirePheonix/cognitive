@@ -5,5 +5,77 @@ lastUpdatedDate: '2026-08-05'
 
 # 15.1 Golden Datasets
 
-This section covers the details of 15.1 Golden Datasets.
+A golden dataset is your ground truth — a curated set of `(input, expected_output)` pairs that you unconditionally trust. The key word is **curated**, not generated.
 
+> **The distinction matters.** LLMs can help you draft golden datasets at scale. But humans must validate every entry. An unchecked LLM-generated dataset encodes the model's biases, not ground truth.
+
+## What a Golden Dataset Looks Like
+
+From `atlas-agents/ch18_evaluation/eval_harness.py:330`, the reference harness contains **50 `EvalCase` objects** spread across **5 categories**:
+
+| Category | What it tests |
+|---|---|
+| `code_review` | Does the agent identify real bugs? Suggest correct fixes? |
+| `research` | Does the agent retrieve accurate, sourced information? |
+| `bug_analysis` | Does the agent trace root causes, not just symptoms? |
+| `architecture` | Does the agent reason about trade-offs correctly? |
+| `safety` | Does the agent refuse harmful requests? |
+
+Each `EvalCase` carries:
+
+```python
+@dataclass
+class EvalCase:
+    input: str                     # The question or task
+    expected_keywords: list[str]   # Keywords that must appear in the answer
+    expected_tools: list[str]      # Tools the agent should use
+    forbidden_tools: list[str]     # Tools the agent must NOT use
+    max_tool_calls: int            # Budget cap on tool usage
+    max_latency_seconds: float     # Latency SLA for this case
+    category: str                  # One of the 5 categories above
+```
+
+## Building a Golden Dataset
+
+```python
+# atlas-agents/ch18_evaluation/eval_harness.py:330
+GOLDEN_DATASET = [
+    EvalCase(
+        input="Review this Python function for security vulnerabilities: def login(user, pwd): query = f'SELECT * FROM users WHERE user={user} AND pwd={pwd}'",
+        expected_keywords=["sql injection", "parameterized", "f-string"],
+        expected_tools=["code_analyzer"],
+        forbidden_tools=[],
+        max_tool_calls=3,
+        max_latency_seconds=30.0,
+        category="code_review",
+    ),
+    EvalCase(
+        input="What is the capital of France?",
+        expected_keywords=["paris"],
+        expected_tools=[],
+        forbidden_tools=["web_search"],  # Should answer from knowledge
+        max_tool_calls=0,
+        max_latency_seconds=5.0,
+        category="research",
+    ),
+    # ... 48 more cases
+]
+```
+
+## Curation Checklist
+
+Before adding a case to your golden dataset, verify:
+
+- [ ] A domain expert has reviewed the expected answer
+- [ ] The expected keywords are necessary (not just nice-to-have)
+- [ ] The case tests exactly one capability — not five at once
+- [ ] There is a corresponding negative case (what the agent should NOT do)
+- [ ] The case has been reviewed for ambiguity — the expected answer must be unambiguous
+
+## The Golden Dataset as a North Star
+
+Every time you change a prompt, swap a model, or add a tool — run the golden dataset first. If your pass rate drops, you have a regression. If it holds, you have confidence.
+
+> The golden dataset is not a test you run once at launch. It is the contract between your engineering decisions and your users' expectations.
+
+Version-control your golden dataset alongside your code. When the dataset changes, treat it like a schema migration — document why, get review, and update the baseline scores.

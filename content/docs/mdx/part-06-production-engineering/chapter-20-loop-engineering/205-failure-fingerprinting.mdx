@@ -1,0 +1,206 @@
+---
+title: '20.5 Failure Fingerprinting and Stall Detection'
+lastUpdatedDate: '2026-08-05'
+---
+
+# 20.5 Failure Fingerprinting and Stall Detection
+
+The most expensive mistake in loop engineering is an agent that's alive and billing but making zero progress. Without stall detection, an agent that's hit an impossible failure will run all six attempts, each one failing in exactly the same way, before the loop finally gives up.
+
+That's 5 wasted LLM calls, 5 wasted verify cycles, and 5× the cost of detecting the stall at attempt 2.
+
+## The Failure Fingerprint
+
+A failure fingerprint is a short hash of the current failure state. If the hash is the same between two consecutive attempts, the agent didn't meaningfully change anything that affects the failure. If it's the same for three attempts in a row, the agent is stuck.
+
+```python
+import hashlib
+
+def failure_fingerprint(output: str) -> str:
+    """
+    Generate a short fingerprint of the current failure state.
+    
+    Extracts the meaningful failure signals (failing test names, error types)
+    and hashes their sorted set. Sorting makes the hash order-independent —
+    the same 3 failing tests produce the same fingerprint regardless of
+    the order pytest reports them.
+    """
+    failures = [
+        line.strip()
+        for line in output.splitlines()
+        if "FAILED" in line or "Error" in line or "assert" in line
+    ]
+    
+    # Sort so order doesn't matter, deduplicate
+    canonical = "\n".join(sorted(set(failures)))
+    
+    # Short hash — 12 chars is plenty for comparison, readable in logs
+    return hashlib.sha256(canonical.encode()).hexdigest()[:12]
+```
+
+Why sort? Pytest doesn't guarantee test execution order. If tests A and B both fail, pytest might report A then B on attempt 1 and B then A on attempt 2. Without sorting, these would produce different fingerprints and the stall would go undetected.
+
+Why deduplicate? Some error types print once per test that hits them. If 5 tests all throw `ImportError: No module named 'jose'`, the raw output has 5 copies of the same line. Deduplication collapses those into one and produces a stable fingerprint.
+
+## Stall Detection Logic
+
+```python
+def run_with_stall_detection(goal: str, max_attempts: int = 6) -> dict:
+    """
+    Run a fix loop with stall detection.
+    Escalates early if the same failure appears 3 times in a row.
+    """
+    lessons: list[str] = []
+    last_fp: str | None = None
+    stall_count: int = 0
+    evidence: str = ""
+    
+    for attempt in range(1, max_attempts + 1):
+        context = build_agent_context(goal, lessons, evidence)
+        agent_act(goal, context=context)
+        
+        done, evidence = verify()
+        if done:
+            return {"status": "success", "attempts": attempt}
+        
+        # ── Stall detection ──────────────────────────────────────
+        fp = failure_fingerprint(evidence)
+        
+        if fp == last_fp:
+            stall_count += 1
+            print(f"  ⚠ Same fingerprint {fp} for {stall_count + 1} consecutive attempts")
+        else:
+            stall_count = 0  # Progress! New fingerprint.
+            print(f"  → New fingerprint {fp} (previous: {last_fp})")
+        
+        last_fp = fp
+        
+        # 3 consecutive identical fingerprints = stuck
+        # (1 repeated = stall_count of 1, 2 repeated = stall_count of 2)
+        if stall_count >= 2:
+            return escalate(
+                goal,
+                lessons,
+                reason=f"Fingerprint '{fp}' unchanged for 3 consecutive attempts.",
+                evidence=evidence
+            )
+        # ── End stall detection ──────────────────────────────────
+        
+        key_errors = extract_key_errors(evidence)
+        lessons.append(f"Attempt {attempt}: {'; '.join(key_errors[:2])}")
+    
+    return escalate(goal, lessons, reason="Max attempts exhausted.", evidence=evidence)
+```
+
+## What "Progress" Looks Like
+
+A changing fingerprint means the agent is making real changes, even if it hasn't reached success yet. Here's a typical progression through a difficult bug:
+
+```
+Attempt 1: fp=a7f3c1d9  ← Initial failure: ImportError
+Attempt 2: fp=8b2e5f7a  ← Import fixed, new failure: TypeError
+Attempt 3: fp=4c9d1e3f  ← Type fixed, new failure: AssertionError  
+Attempt 4: fp=4c9d1e3f  ← Same AssertionError! stall_count = 1
+Attempt 5: fp=4c9d1e3f  ← Still same! stall_count = 2 → ESCALATE
+```
+
+Attempts 1–3 all failed, but the fingerprint changed each time — the agent was making meaningful progress. The stall on attempt 4 is detected, and the loop escalates after attempt 5 instead of burning attempt 6. One attempt saved; the human gets the situation report while the context is still fresh.
+
+## Tuning the Stall Threshold
+
+The threshold of 3 consecutive identical fingerprints (stall_count >= 2) is a reasonable default, but you can tune it based on task type:
+
+| Task Type | Recommended Threshold | Reasoning |
+|---|---|---|
+| Unit test fixes | 3 | Low transient noise |
+| Integration tests | 4–5 | Network flakiness can cause false stalls |
+| UI test fixes | 4 | Timing-dependent tests may repeat errors transiently |
+| Build fixes | 2–3 | Build failures are usually deterministic |
+| Data generation | 3 | Content failures are usually stable |
+
+```python
+STALL_THRESHOLDS = {
+    "unit_tests": 2,        # stall_count >= 2 (3 consecutive)
+    "integration_tests": 3, # stall_count >= 3 (4 consecutive)
+    "ui_tests": 3,
+    "build": 1,             # stall_count >= 1 (2 consecutive) — builds are deterministic
+}
+```
+
+## Fingerprinting for Non-Test Loops
+
+The fingerprint concept generalizes beyond pytest output. Any failure output can be fingerprinted:
+
+```python
+def lint_fingerprint(output: str) -> str:
+    """Fingerprint for ruff/flake8 output."""
+    error_lines = [
+        line.strip() for line in output.splitlines()
+        if ".py:" in line and ("E" in line or "F" in line or "W" in line)
+    ]
+    return hashlib.sha256("\n".join(sorted(set(error_lines))).encode()).hexdigest()[:12]
+
+def build_error_fingerprint(output: str) -> str:
+    """Fingerprint for build/compilation errors."""
+    error_lines = [
+        line.strip() for line in output.splitlines()
+        if "error:" in line.lower() or "Error" in line
+    ]
+    return hashlib.sha256("\n".join(sorted(set(error_lines))).encode()).hexdigest()[:12]
+
+def api_error_fingerprint(response_data: dict) -> str:
+    """Fingerprint for API validation failures."""
+    errors = response_data.get("errors", [])
+    error_messages = sorted(set(str(e) for e in errors))
+    return hashlib.sha256("\n".join(error_messages).encode()).hexdigest()[:12]
+```
+
+The same stall detection loop works with any of these fingerprint functions.
+
+## Logging Fingerprints for Debugging
+
+Fingerprints are short enough to log in every attempt record. When you review a run later, you can immediately see where progress stalled:
+
+```python
+import json
+from datetime import datetime
+
+def log_attempt(attempt: int, fp: str, stall_count: int, passed: bool, evidence: str):
+    """Write a structured log entry for each loop attempt."""
+    entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "attempt": attempt,
+        "fingerprint": fp,
+        "stall_count": stall_count,
+        "passed": passed,
+        "evidence_preview": evidence[:200]
+    }
+    
+    # Append to JSONL log
+    with open("loop_run.jsonl", "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    
+    # Also print concise summary
+    status = "✅" if passed else f"❌ fp={fp} stall={stall_count}"
+    print(f"  Attempt {attempt}: {status}")
+```
+
+A typical log file for a 4-attempt run:
+
+```jsonl
+{"timestamp":"2026-08-05T14:23:01","attempt":1,"fingerprint":"a7f3c1d9","stall_count":0,"passed":false,"evidence_preview":"FAILED test_utils.py::test_parse - TypeError..."}
+{"timestamp":"2026-08-05T14:24:12","attempt":2,"fingerprint":"8b2e5f7a","stall_count":0,"passed":false,"evidence_preview":"FAILED test_utils.py::test_parse - ValueError..."}
+{"timestamp":"2026-08-05T14:25:03","attempt":3,"fingerprint":"8b2e5f7a","stall_count":1,"passed":false,"evidence_preview":"FAILED test_utils.py::test_parse - ValueError..."}
+{"timestamp":"2026-08-05T14:25:58","attempt":4,"fingerprint":"8b2e5f7a","stall_count":2,"passed":false,"evidence_preview":"FAILED test_utils.py::test_parse - ValueError..."}
+```
+
+At attempt 4, `stall_count=2` triggers escalation. You can see exactly when the agent stopped making progress.
+
+## Key Takeaways
+
+- Without stall detection, a stuck agent runs to max attempts before escalating — wasting budget on identical failures
+- The failure fingerprint hashes the sorted, deduplicated set of failing tests and error messages
+- Sort and deduplicate to make the fingerprint stable against output order variations
+- Escalate when the fingerprint is unchanged for N consecutive attempts (default: 3)
+- Tune the stall threshold higher for flaky tests (integration, UI) where transient failures can produce false positives
+- Log fingerprints with every attempt — they're the fastest way to diagnose stuck loops after the fact

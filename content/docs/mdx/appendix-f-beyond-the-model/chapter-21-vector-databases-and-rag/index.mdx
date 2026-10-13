@@ -215,3 +215,37 @@ This two-stage approach gets you the speed of ANN at scale, with the precision o
 - The RAG pipeline: index (embed + store) offline, retrieve (embed query + ANN search) + generate online.
 - **Rerankers** are a second-stage precision layer — retrieve a broad set with fast ANN, then rerank the candidates with a heavier cross-encoder model.
 - RAG and fine-tuning complement each other. RAG for facts; fine-tuning for behaviour and style.
+
+---
+
+## RAG: The Formal Probability Model
+
+**Why parametric knowledge is insufficient:**
+Language model weights are fixed at training time. They can't access yesterday's news, your company's internal documents, or any fact that wasn't in the pretraining corpus. Even facts that were in training can be misremembered — "hallucinated" with confidence.
+
+**The RAG probability model:**
+RAG formalizes retrieval-augmented generation as:
+
+$$P(y \mid x) \approx \sum_{z \in \mathcal{Z}_k(x)} P_\eta(z \mid x) \cdot P_\theta(y \mid x, z)$$
+
+Where: $x$ is the query, $\mathcal{Z}_k(x)$ is the top-$k$ retrieved documents, $P_\eta(z \mid x)$ is the retrieval probability, and $P_\theta(y \mid x, z)$ is the generation probability given the retrieved evidence.
+
+In practice, with approximate retrieval (dense embeddings), this simplifies to: retrieve top-$k$ documents, concatenate them with the query, generate.
+
+**Dense vs sparse retrieval:**
+Dense retrieval encodes both query and document as vectors:
+
+$$q = f_q(x), \quad d = f_d(z)$$
+
+$$s(x, z) = q^\top d$$
+
+Similarity is cosine or dot product in the embedding space — semantically similar documents score high even if they use different words.
+
+Sparse retrieval (BM25) uses exact keyword matching with TF-IDF-like scoring. It misses paraphrases but never misses exact matches.
+
+**RAG failure decomposition:**
+When RAG gives a wrong answer, the failure comes from one of:
+
+$$P(\text{correct}) \approx P(\text{retrieve evidence}) \times P(\text{use evidence} \mid \text{retrieved})$$
+
+Retrieve the wrong documents → even perfect generation fails. Retrieve the right documents but ignore them → the model hallucinates anyway. This decomposition tells you where to fix the system.

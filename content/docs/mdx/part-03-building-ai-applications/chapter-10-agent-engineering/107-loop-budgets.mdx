@@ -5,5 +5,128 @@ lastUpdatedDate: '2026-08-05'
 
 # 10.7 Loop Budgets
 
-This section covers the details of 10.7 Loop Budgets.
+## Every Loop Needs a Ceiling
 
+An agent that runs forever is not a feature — it's a liability. Two kinds of ceilings matter in production:
+
+1. **Iteration budget**: maximum number of agent turns
+2. **Cost budget**: maximum dollar spend per request or session
+
+Both are mandatory. One without the other leaves a gap.
+
+## Iteration Budget
+
+`MAX_ITERATIONS` is the simplest and most important guard you can add:
+
+```python
+MAX_ITERATIONS = 6  # sensible default for most tasks
+
+for iteration in range(MAX_ITERATIONS):
+    response = call_llm(messages)
+    # ... handle response
+    if is_final_answer(response):
+        return response
+
+return "Agent reached maximum iterations without a final answer."
+```
+
+Why 6? Most tasks that an agent can complete at all complete within 3-4 iterations. 6 gives a comfortable margin without letting a stuck agent run indefinitely. For complex research tasks, 10-15 is reasonable. For simple lookups, 3 is enough.
+
+The iteration limit is not just about cost — it's about detecting failure. If an agent needs more than 10 iterations on a task that should take 3, something has gone wrong. The limit forces the failure to surface rather than letting it burn silently.
+
+## Cost Budget
+
+From `atlas-agents/ch19_deployment`, litellm provides cost tracking with hard caps:
+
+```python
+import litellm
+litellm.max_budget = 0.10  # $0.10 hard cap per request
+
+def track_costs(response):
+    cost = litellm.completion_cost(response)
+    session_total = redis.incrbyfloat(f"costs:{session_id}", cost)
+    if session_total > MAX_SESSION_BUDGET:
+        raise BudgetExceeded(f"Session budget exceeded: ${session_total:.4f}")
+    return cost
+```
+
+Track at two levels:
+
+| Level | What it protects | Storage |
+|---|---|---|
+| **Per-request** | A single runaway loop | In-memory / litellm |
+| **Per-session** | A user who keeps retrying | Redis with TTL |
+| **Per-day** | Global API spend | Your billing dashboard |
+
+Set alerts before hard limits, not at them. If your daily budget is $10, alert at $8 so you can investigate before hitting the wall.
+
+## Stall Detection: The Smarter Budget
+
+Spending the full budget on a stuck problem is wasteful. From the book (Chapter 20), the insight is:
+
+> *"When the same failure fingerprint appears 3 times in a row, the agent is 'alive, billing, getting nowhere.' That's when you escalate — don't let it burn the full budget on a stuck problem."*
+
+A failure fingerprint is a hash of the current error state. If it hasn't changed across multiple iterations, the agent is looping:
+
+```python
+import hashlib
+
+def failure_fingerprint(output: str) -> str:
+    failures = [l for l in output.splitlines() if "FAILED" in l or "Error" in l]
+    return hashlib.sha256("\n".join(sorted(failures)).encode()).hexdigest()[:12]
+
+# In the agent loop:
+last_fp = None
+stall_count = 0
+
+for iteration in range(MAX_ITERATIONS):
+    result = run_iteration()
+    fp = failure_fingerprint(result)
+
+    if fp == last_fp:
+        stall_count += 1
+    else:
+        stall_count = 0  # New failure pattern — reset
+        last_fp = fp
+
+    if stall_count >= 2:
+        return escalate(goal, reason=f"Same failure 3x ({fp})")
+```
+
+This exits early — before `MAX_ITERATIONS` — when continuing would be pointless. The full budget is preserved for cases where progress is actually being made.
+
+## Escalation vs. Failure
+
+When a budget is hit or a stall is detected, you have two options:
+
+| Response | When to use |
+|---|---|
+| **Return error** | Simple tools, automated pipelines, when no human is available |
+| **Escalate to human** | High-stakes tasks, when the agent has made partial progress worth reviewing |
+
+Escalation means handing off state — what was attempted, what failed, what was learned — so a human (or a more capable agent) can continue without starting over.
+
+```python
+def escalate(goal: str, lessons: list[str], reason: str) -> dict:
+    return {
+        "status": "escalated",
+        "reason": reason,
+        "goal": goal,
+        "lessons_learned": lessons,      # What the agent tried
+        "recommended_next_steps": ...,   # Suggestions for the human
+    }
+```
+
+The lessons list is important. An escalation that just says "I failed" is unhelpful. An escalation that says "I tried X, Y, Z, all failed with error E, you should try approach W instead" gives the human a head start.
+
+## Budget Configuration by Task Type
+
+| Task type | MAX_ITERATIONS | Cost budget |
+|---|---|---|
+| Simple lookup | 3 | $0.01 |
+| Code generation | 6-8 | $0.05 |
+| Research report | 10-15 | $0.25 |
+| Complex multi-step | 20 | $0.50 |
+| Long-running background | Unlimited (but with stall detection) | $2.00 |
+
+These are starting points. Tune them based on observed behavior, not theory.

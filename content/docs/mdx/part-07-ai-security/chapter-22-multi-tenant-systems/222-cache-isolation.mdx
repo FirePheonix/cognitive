@@ -5,5 +5,216 @@ lastUpdatedDate: '2026-08-05'
 
 # 22.2 Cache Isolation
 
-This section covers the details of 22.2 Cache Isolation.
+Caches are one of the most overlooked cross-tenant leakage vectors in multi-tenant AI systems. The attack surface is subtle: a caching system that returns "equivalent" responses without verifying tenant context can serve one tenant's data directly to another.
 
+## The Leakage Scenario
+
+1. **Tenant A** asks: "What are my Q3 revenue figures?"
+2. The system retrieves Tenant A's financial data, generates an answer, and caches it.
+3. **Tenant B** (at a competitor company) asks: "What are my Q3 revenue figures?"
+4. A naive semantic cache sees the query as highly similar to Tenant A's query and returns the cached response — which contains Tenant A's confidential revenue data.
+
+This is not a theoretical concern. Any semantic caching implementation that doesn't scope cache keys by tenant is vulnerable to this exact failure mode.
+
+## The Defense: Tenant-Scoped Cache Keys
+
+The rule: `tenant_id` must always be a component of the cache key. This makes cross-tenant cache hits structurally impossible.
+
+```python
+import hashlib
+import json
+import redis
+from typing import Optional
+
+cache = redis.Redis(host="localhost", port=6379, decode_responses=True)
+
+def get_tenant_cache_key(tenant_id: str, query: str) -> str:
+    """
+    Cache key includes tenant_id. A query from Tenant A will never
+    hit a cached entry from Tenant B, regardless of query similarity.
+    """
+    query_hash = hashlib.sha256(query.strip().lower().encode()).hexdigest()
+    return f"cache:v1:tenant:{tenant_id}:query:{query_hash}"
+
+
+def get_cached_response(tenant_id: str, query: str) -> Optional[str]:
+    key = get_tenant_cache_key(tenant_id, query)
+    cached = cache.get(key)
+    return cached  # None if cache miss
+
+
+def set_cached_response(
+    tenant_id: str,
+    query: str,
+    response: str,
+    ttl_seconds: int = 3600
+) -> None:
+    key = get_tenant_cache_key(tenant_id, query)
+    cache.setex(key, ttl_seconds, response)
+```
+
+## Semantic Cache with Tenant Isolation
+
+Exact-match caching (hash of query string) is easy to isolate. **Semantic caching** — which returns cached responses for *similar* (not identical) queries — requires extra care:
+
+```python
+import numpy as np
+
+class TenantIsolatedSemanticCache:
+    """
+    Semantic cache that is strictly scoped per tenant.
+    A semantic match from a different tenant is not a cache hit.
+    """
+
+    def __init__(self, embedding_model, redis_client, similarity_threshold=0.95):
+        self.embed = embedding_model
+        self.cache = redis_client
+        self.threshold = similarity_threshold
+
+    def _get_tenant_index_key(self, tenant_id: str) -> str:
+        return f"semantic_cache:index:{tenant_id}"
+
+    def get(self, tenant_id: str, query: str) -> Optional[str]:
+        query_embedding = self.embed(query)
+
+        # Retrieve only this tenant's cached embeddings
+        index_key = self._get_tenant_index_key(tenant_id)
+        cached_entries = self.cache.hgetall(index_key)
+
+        for entry_hash, entry_json in cached_entries.items():
+            entry = json.loads(entry_json)
+            cached_embedding = np.array(entry["embedding"])
+
+            similarity = np.dot(query_embedding, cached_embedding)
+
+            if similarity >= self.threshold:
+                # Verify tenant_id matches — belt-and-suspenders check
+                assert entry["tenant_id"] == tenant_id, \
+                    f"SECURITY: tenant mismatch in semantic cache! " \
+                    f"Expected {tenant_id}, got {entry['tenant_id']}"
+                return entry["response"]
+
+        return None
+
+    def set(
+        self,
+        tenant_id: str,
+        query: str,
+        response: str,
+        ttl_seconds: int = 3600
+    ) -> None:
+        query_embedding = self.embed(query)
+        entry_hash = hashlib.sha256(query.encode()).hexdigest()
+
+        entry = {
+            "tenant_id": tenant_id,  # always stored, always verified on read
+            "query": query,
+            "embedding": query_embedding.tolist(),
+            "response": response,
+        }
+
+        index_key = self._get_tenant_index_key(tenant_id)
+        self.cache.hset(index_key, entry_hash, json.dumps(entry))
+        self.cache.expire(index_key, ttl_seconds)
+```
+
+The tenant's cache index is a separate key from all other tenants. There is no code path that allows queries across tenant boundaries.
+
+## Cache Invalidation per Tenant
+
+When a tenant's data changes, invalidate only their cache:
+
+```python
+def invalidate_tenant_cache(tenant_id: str) -> int:
+    """
+    Clear all cached entries for a specific tenant.
+    Does not affect any other tenant's cache.
+    Returns number of keys deleted.
+    """
+    pattern = f"cache:*:tenant:{tenant_id}:*"
+    keys = cache.keys(pattern)
+
+    if keys:
+        return cache.delete(*keys)
+    return 0
+
+
+def invalidate_tenant_on_data_update(tenant_id: str, updated_doc_ids: list[str]) -> None:
+    """
+    Called when tenant documents are updated or re-indexed.
+    Cached responses referencing stale data must be cleared.
+    """
+    # Simple approach: invalidate entire tenant cache on any document update
+    # More sophisticated: track which cached responses used which documents
+    count = invalidate_tenant_cache(tenant_id)
+    logger.info(f"Invalidated {count} cached entries for tenant {tenant_id} after document update")
+```
+
+## Provider-Level Prompt Caching
+
+OpenAI and Anthropic both offer prompt caching at the API level — where a stable prompt prefix is cached in the KV store on their infrastructure. This is a per-**account** cache (tied to your API key), not shared across accounts or tenants.
+
+```python
+# Anthropic prompt caching — safe to use in multi-tenant systems
+# The KV cache is scoped to your Anthropic account, not shared with other accounts
+
+response = anthropic_client.messages.create(
+    model="claude-3-5-sonnet-20241022",
+    max_tokens=1024,
+    system=[
+        {
+            "type": "text",
+            "text": stable_system_prompt,
+            "cache_control": {"type": "ephemeral"}  # cache this prefix
+        }
+    ],
+    messages=[{"role": "user", "content": tenant_specific_query}]
+)
+```
+
+The tenant-specific query is never cached — only the stable system prompt prefix is. Cross-tenant KV leakage is not a concern for provider-level prompt caching.
+
+## The Cache Isolation Tradeoff
+
+Scoping caches per tenant reduces cache hit rates. A tenant with 100 users has a much smaller cache population than a single shared cache serving all tenants. This is the correct tradeoff:
+
+| Configuration | Cache hit rate | Cross-tenant risk |
+|---|---|---|
+| Shared cache, no tenant scoping | Highest | Critical |
+| Shared cache, tenant-scoped keys | Good | None |
+| Per-tenant cache instances | Lower | None |
+
+Never sacrifice isolation for cache efficiency. A cache miss costs money (one extra LLM call). A cross-tenant leak costs everything.
+
+## Cache Audit
+
+Add periodic validation that cached entries are correctly isolated:
+
+```python
+def audit_cache_isolation(sample_size: int = 100) -> dict:
+    """Verify no cached entry is accessible by the wrong tenant."""
+    issues = []
+
+    # Sample random cache entries
+    all_keys = cache.keys("cache:*:tenant:*")
+    sample_keys = random.sample(all_keys, min(sample_size, len(all_keys)))
+
+    for key in sample_keys:
+        # Extract tenant_id from key structure
+        parts = key.split(":")
+        key_tenant_id = parts[parts.index("tenant") + 1]
+
+        # Retrieve entry and verify tenant_id stored in value matches key
+        entry_json = cache.get(key)
+        if entry_json:
+            entry = json.loads(entry_json)
+            stored_tenant = entry.get("tenant_id")
+            if stored_tenant and stored_tenant != key_tenant_id:
+                issues.append({
+                    "key": key,
+                    "key_tenant": key_tenant_id,
+                    "stored_tenant": stored_tenant
+                })
+
+    return {"issues_found": len(issues), "details": issues}
+```

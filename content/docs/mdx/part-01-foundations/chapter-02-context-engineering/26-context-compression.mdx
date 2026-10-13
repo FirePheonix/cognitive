@@ -5,5 +5,141 @@ lastUpdatedDate: '2026-08-05'
 
 # 2.6 Context Compression
 
-This section covers the details of 2.6 Context Compression.
+Every conversation gets longer over time. The model produces a response, the user replies, the agent calls a tool, the tool returns results, and the cycle repeats. After ten or twenty turns, the raw message history alone can exceed the context window.
 
+Context compression is how you keep long-running agents alive — summarizing, pruning, and restructuring the history so the model always has what it needs without running out of space.
+
+---
+
+## Three Compression Strategies
+
+### Strategy 1: Rolling Summary
+
+Replace old messages with a compressed summary of what happened. The summary travels forward; the raw messages do not.
+
+```python
+def compress_history(
+    messages: list[dict],
+    keep_recent: int = 4,
+    summarizer_model: str = "claude-haiku-3-5",
+) -> tuple[str, list[dict]]:
+    """
+    Summarize messages[:-keep_recent], keep messages[-keep_recent:] raw.
+    Returns (summary_text, recent_messages).
+    """
+    if len(messages) <= keep_recent:
+        return "", messages
+    
+    to_summarize = messages[:-keep_recent]
+    recent = messages[-keep_recent:]
+    
+    summary_prompt = (
+        "Summarize the following conversation turns into a compact paragraph "
+        "that preserves key decisions, facts established, and current task state. "
+        "Be precise — this summary will replace the full history.\n\n"
+        + format_messages(to_summarize)
+    )
+    summary = call_model(summarizer_model, summary_prompt)
+    return summary, recent
+```
+
+The summary gets injected into the system prompt's context layer: "Conversation so far: [summary]". The recent messages stay as raw turns.
+
+### Strategy 2: Selective Retention
+
+Not every turn is worth keeping. Tool calls that succeeded can be reduced to their result. Failed attempts that were retried can be dropped entirely. Routine confirmations ("Got it, proceeding...") add nothing.
+
+```python
+def select_relevant_turns(
+    messages: list[dict],
+    max_turns: int = 8,
+) -> list[dict]:
+    scored = []
+    for msg in messages:
+        score = 0
+        content = msg.get("content", "")
+        # Keep: error messages, decisions, user corrections
+        if "error" in content.lower(): score += 3
+        if "instead" in content.lower(): score += 2  # user correction
+        if msg["role"] == "user": score += 1  # user turns are high signal
+        scored.append((score, msg))
+    
+    # Sort by score, keep top max_turns
+    scored.sort(key=lambda x: -x[0])
+    kept = [msg for _, msg in scored[:max_turns]]
+    # Restore chronological order
+    return [m for m in messages if m in kept]
+```
+
+### Strategy 3: Structured Compaction — The Scratchpad
+
+Instead of summarizing prose into more prose, extract the key facts into a structured scratchpad. This is the most durable approach for long-running agents.
+
+The scratchpad pattern from `atlas-agents/ch11_memory/memory_agent.py`:
+
+```python
+# Persistent scratchpad — key facts survive across turns
+SCRATCHPAD = Path("scratchpad.md")
+
+def update_scratchpad(new_fact: str, category: str):
+    """Append a structured fact to the persistent scratchpad."""
+    entry = f"\n## {category}\n- {new_fact} (added: {datetime.now().isoformat()})\n"
+    with open(SCRATCHPAD, "a") as f:
+        f.write(entry)
+
+def load_scratchpad() -> str:
+    if SCRATCHPAD.exists():
+        return SCRATCHPAD.read_text()
+    return "No scratchpad yet."
+```
+
+The scratchpad accumulates facts across the entire session. Instead of keeping a full message history, you keep a growing document of established truths:
+
+```markdown
+## Task State
+- Goal: fix authentication token refresh bug in user-service
+- Files examined: auth/middleware.py, auth/tokens.py
+- Root cause identified: Redis key expiry set to 0 (never expires)
+
+## Decisions Made
+- Using EXPIRE instead of PERSIST for refresh token keys
+- Setting TTL to 604800 seconds (7 days)
+- Not changing JWT signing logic
+
+## Failed Approaches
+- Tried increasing JWT expiry — didn't fix refresh bug
+- Tried clearing Redis cache — symptom reappeared
+```
+
+This scratchpad costs ~400 tokens but replaces 3,000 tokens of raw history. And crucially, it contains *more* useful information than the raw history — the history includes all the false starts and filler; the scratchpad only has what matters.
+
+---
+
+## When to Compress
+
+Compression should be triggered automatically when approaching the token limit, not reactively after you've already overflowed:
+
+```python
+def should_compress(messages: list[dict], tokenizer, threshold: float = 0.7) -> bool:
+    """Return True if history is using more than 70% of the available budget."""
+    history_tokens = sum(
+        len(tokenizer.encode(m.get("content", "")))
+        for m in messages
+    )
+    return history_tokens > CONTEXT_BUDGET * threshold
+```
+
+The loop engineering chapter reinforces this: "Prune history before each cycle; failed attempts become one-line lessons." Don't let compression become an emergency operation — make it a routine part of each iteration.
+
+---
+
+## The Cost of Not Compressing
+
+Without compression, a long-running agent will eventually either:
+1. **Hit the context limit** and throw an error mid-task
+2. **Slow down progressively** as longer prompts take more time to process
+3. **Degrade in quality** as the model's attention gets diluted across hundreds of low-signal turns
+
+A ten-turn conversation with no compression might cost $0.05. A hundred-turn conversation with no compression might cost $2.00. The same hundred-turn conversation with rolling summaries might cost $0.20, with better performance because the model isn't wading through stale history.
+
+Compression is not just a token-saving optimization. It's what makes the agent more focused.

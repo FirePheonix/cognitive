@@ -5,5 +5,188 @@ lastUpdatedDate: '2026-08-05'
 
 # 5.3 Static vs Continuous Batching
 
-This section covers the details of 5.3 Static vs Continuous Batching.
+Now that we've covered both approaches, let's put them side by side. The right choice depends on your workload, latency requirements, and operational complexity tolerance.
 
+## Side-by-Side Comparison
+
+| Property | Static Batching | Continuous Batching |
+|---|---|---|
+| **When generation starts** | After full batch is collected | Immediately on arrival |
+| **Batch composition** | Fixed at batch start | Changes every decode step |
+| **GPU utilization** | 25–40% | 60–80%+ |
+| **Short request latency** | High — waits for long requests in batch | Low — finishes independently |
+| **Long request latency** | Better — runs uninterrupted | Similar or better |
+| **Head-of-line blocking** | Yes — long requests block short ones | No |
+| **Throughput** | Moderate | 3–8× better for mixed workloads |
+| **Memory management** | Simple — allocate per request | Complex — PagedAttention required |
+| **Implementation complexity** | Low | High |
+| **Good for** | Offline batch jobs | Online serving / user-facing APIs |
+
+## Execution Model Comparison
+
+**Static Batching:**
+
+```
+Queue: [A, B, C, D, E, ...]
+           ↓ wait for N=3 or timeout
+Batch: {A, B, C}
+           ↓ run together until all complete
+Results: {A, B, C} returned together
+           ↓ next batch begins
+Batch: {D, E, ...}
+```
+
+The entire batch is a unit. You wait for the slowest.
+
+**Continuous Batching:**
+
+```
+t=0: Queue: [A, B, C, D]
+     Active batch: {A, B, C}  ← all start immediately
+     D waits for a slot
+
+t=10: B finishes
+      Active batch: {A, C, D}  ← D fills B's slot immediately
+
+t=15: D finishes
+      E arrives from queue
+      Active batch: {A, C, E}
+
+t=20: C, A finish
+      Active batch: {E, F, G}  ← new requests fill all slots
+```
+
+No wasted cycles. The GPU always has a full or near-full batch.
+
+## Latency Distribution
+
+The most important difference shows up in latency percentiles:
+
+```
+Workload: 50% short requests (100 tokens), 50% long requests (1000 tokens)
+Batch size: 8
+
+Static batching latency distribution:
+  Short requests: p50=3s, p99=12s  ← short requests wait for long ones
+  Long requests:  p50=12s, p99=15s
+
+Continuous batching latency distribution:
+  Short requests: p50=0.5s, p99=2s   ← short requests finish quickly
+  Long requests:  p50=5s, p99=12s    ← long requests still take time, but unblocked
+```
+
+The p99 for short requests is dramatically better under continuous batching. This is what matters for interactive applications.
+
+## When Static Batching Is Still the Right Choice
+
+Static batching isn't obsolete — it's the correct choice for specific scenarios:
+
+### Offline Batch Processing
+
+```python
+# Scoring 1 million documents overnight
+# Static batching is simpler and throughput is what matters, not latency
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("...").cuda()
+tokenizer = AutoTokenizer.from_pretrained("...")
+
+BATCH_SIZE = 32
+results = []
+
+for i in range(0, len(documents), BATCH_SIZE):
+    batch = documents[i:i+BATCH_SIZE]
+    inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
+    inputs = {k: v.cuda() for k, v in inputs.items()}
+    
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=128)
+    
+    decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    results.extend(decoded)
+```
+
+For offline jobs:
+- No user waiting → latency doesn't matter
+- Throughput is everything
+- Simpler code = fewer bugs
+- No need for a long-running server
+
+### Evaluation Runs
+
+When running benchmarks or model evaluations (e.g., MMLU, HumanEval), static batching is standard:
+
+```python
+# lm-evaluation-harness uses static batching
+lm_eval --model hf \
+    --model_args pretrained=meta-llama/Meta-Llama-3-8B \
+    --tasks mmlu \
+    --batch_size 16    # static batch size
+```
+
+### Controlled Experiments
+
+When you want deterministic, reproducible results, static batching removes variables. Continuous batching's dynamic composition can make timing measurements noisier.
+
+## When Continuous Batching Is Essential
+
+Continuous batching is necessary when:
+
+### Interactive / User-Facing APIs
+
+```python
+# FastAPI + vLLM — user is waiting for response
+# Continuous batching ensures short queries aren't blocked by long ones
+
+from vllm.entrypoints.openai.api_server import app
+# vLLM uses continuous batching internally — no extra config needed
+```
+
+### Mixed Workload Services
+
+Applications where different users/features generate very different output lengths:
+
+```
+Feature A: "Summarize this article" → 150 tokens
+Feature B: "Write a full blog post" → 2000 tokens
+Feature C: "Extract JSON from this text" → 50 tokens
+```
+
+With static batching, Feature C (50 tokens) waits for Feature B (2000 tokens) to finish. With continuous batching, Feature C completes in milliseconds regardless of what else is running.
+
+### High-Traffic Production Systems
+
+At scale (100+ requests per second), continuous batching's efficiency advantage compounds. The alternative — static batching with large batches — requires artificial queuing delays to collect batches, adding latency for every user.
+
+## Hybrid Approach: Prioritized Queues
+
+Some production systems use a hybrid: continuous batching with priority queues for different workload classes:
+
+```
+Queue 1 (high priority): Interactive requests — continuous batching, low latency
+Queue 2 (low priority):  Batch jobs — static batching, high throughput, run during off-peak
+```
+
+vLLM supports priority scheduling with its `priority` parameter in the `SamplingParams`.
+
+## Migration Path
+
+If you're currently using static batching and considering switching:
+
+1. **Profile your current system** — measure p50/p95/p99 latency and GPU utilization
+2. **Identify head-of-line blocking** — are short requests waiting for long ones?
+3. **Deploy vLLM or TGI** — both implement continuous batching out of the box
+4. **Compare metrics** — throughput should improve, short-request latency should drop significantly
+5. **Tune `max_num_seqs` and `max_num_batched_tokens`** — find the right batch size for your workload
+
+## Summary
+
+- Static batching: simple, good for offline jobs and batch processing; poor for interactive use
+- Continuous batching: complex, essential for user-facing APIs; dramatically better latency and throughput
+- Key differences: when generation starts, how slots are managed, head-of-line blocking behavior
+- Short requests suffer most under static batching — they wait for long ones in the same batch
+- Throughput improvement from continuous batching: 3–8× for mixed workloads
+- Use static batching for: overnight scoring jobs, evaluations, experiments
+- Use continuous batching for: all user-facing APIs, mixed-length workloads, high-throughput serving

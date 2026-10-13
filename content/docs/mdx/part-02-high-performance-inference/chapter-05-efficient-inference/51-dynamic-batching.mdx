@@ -5,5 +5,189 @@ lastUpdatedDate: '2026-08-05'
 
 # 5.1 Dynamic Batching
 
-This section covers the details of 5.1 Dynamic Batching.
+A GPU is most efficient when it has lots of work to do simultaneously. Running one sequence at a time is like running one thread on a 1000-core processor — you're wasting most of the hardware. Batching solves this by processing multiple sequences together, but the naive approach has its own problems.
 
+## Why Batch at All?
+
+The GPU executes operations on matrices. A single sequence's decode step involves multiplying a vector (the single token embedding) against the weight matrices. A batch of 32 sequences multiplies a 32×d matrix against the same weights — **the same number of memory reads, but 32× more useful work done**.
+
+```
+Batch size 1:
+  Read 14 GB of weights → produce 1 token
+  GPU utilization: ~3%
+
+Batch size 32:
+  Read 14 GB of weights → produce 32 tokens (one per sequence)
+  GPU utilization: ~60%
+  Throughput: 32× better
+```
+
+Batching is the single most impactful variable for GPU throughput.
+
+## Static Batching: The Naive Approach
+
+Static batching (also called request-level batching) works like this:
+
+1. Collect N requests in a queue
+2. Wait for the batch to fill (or a timeout)
+3. Process all N sequences together
+4. Wait for all N to finish generating
+5. Return all results at once
+
+```
+Time →
+
+Request A: ██████████████████████████████ (long)
+Request B: ████ (short, finishes early)
+Request C: ██████████████████ (medium)
+Request D: ██ (very short)
+Batch:     ████████████████████████████████ (wait for longest = A)
+
+GPU idle while A finishes: B, C, D done but GPU still occupied with A
+Next batch can't start until EVERYONE in current batch is done
+```
+
+The problems are clear:
+
+1. **Head-of-line blocking**: short requests must wait for the longest in the batch
+2. **Underutilization at the end**: as shorter sequences finish, the batch shrinks, but the GPU is still running at reduced capacity
+3. **Queuing delay**: new requests wait in queue while a batch completes, even if there's available GPU capacity
+4. **Variable batch size**: if you wait for a full batch, latency spikes during low traffic
+
+## Dynamic Batching: Fill the Gaps
+
+Dynamic batching improves on static batching by allowing **variable batch composition over time**. Instead of waiting for a full batch to arrive before starting, you:
+
+1. Start processing requests as they arrive
+2. Group requests together opportunistically based on current queue and capacity
+3. Handle partial batches when traffic is low
+4. Use padding to align sequences to the same length within a batch
+
+```
+Dynamic batching timeline:
+
+t=0:  [A, B] arrive → batch {A, B}, start processing
+t=1:  [C] arrives → add to next batch slot
+t=2:  B finishes → batch now {A, C}, new request D → batch {A, C, D}
+t=3:  A, C finish → D continues alone
+```
+
+This reduces average queuing time at the cost of slightly suboptimal batch fill rates at low traffic.
+
+## The Padding Problem
+
+For GPU execution, all sequences in a batch must be the same length (SIMD — Single Instruction Multiple Data architecture requires uniform operation counts). Shorter sequences are **padded** with a special padding token to match the longest sequence:
+
+```
+Batch sequences:
+  Seq A: [t1, t2, t3, t4, t5, t6, t7, t8]   (length 8)
+  Seq B: [t1, t2, PAD, PAD, PAD, PAD, PAD, PAD]  (length 2, padded to 8)
+  Seq C: [t1, t2, t3, t4, t5, PAD, PAD, PAD]     (length 5, padded to 8)
+
+GPU computes over all 8 positions for all sequences
+Work done for B's PAD tokens: wasted computation
+```
+
+In the worst case — one very long sequence in a batch with many short ones — most of the GPU work is wasted on padding tokens. This is the padding problem.
+
+Dynamic batching mitigates this by trying to group sequences of similar length together:
+
+```python
+# Pseudo-code: length-aware batching
+def form_batch(request_queue, max_batch_size=32):
+    if not request_queue:
+        return []
+    
+    # Sort by sequence length, group similar lengths
+    sorted_requests = sorted(request_queue, key=lambda r: len(r.tokens))
+    
+    batch = []
+    target_length = len(sorted_requests[0].tokens)
+    
+    for req in sorted_requests:
+        if len(req.tokens) <= target_length * 1.2:  # within 20% of target length
+            batch.append(req)
+        if len(batch) >= max_batch_size:
+            break
+    
+    return batch
+```
+
+## Padding vs. Packing
+
+An alternative to padding is **sequence packing**: concatenate multiple short sequences into a single "packed" sequence that fills the context window. Each token knows which sequence it belongs to via a sequence ID attention mask.
+
+```
+Context window: 2048 tokens
+
+Packed sequence:
+[Seq A: 512 tokens][Seq B: 300 tokens][Seq C: 700 tokens][Seq D: 536 tokens]
+
+vs Padded batching with 512 token max:
+[Seq A: 512][PAD×0]
+[Seq B: 300][PAD×212]
+[Seq C: 512][PAD×0]
+[Seq D: 512][PAD×0]
+```
+
+Packing maximizes utilization but adds complexity — the attention mask must prevent cross-contamination between packed sequences. Used primarily for training and prefill-heavy workloads (like offline scoring), less common for online serving.
+
+## Dynamic Batching vs Static: The Numbers
+
+| Metric | Static Batching | Dynamic Batching |
+|---|---|---|
+| Batch wait time | High (wait for N requests) | Low (start immediately) |
+| Short request latency | High (blocked by long ones) | Lower |
+| GPU utilization | 30–50% | 50–70% |
+| Implementation complexity | Low | Medium |
+| Memory predictability | Predictable | Variable |
+
+Dynamic batching is a significant improvement over static, but it still suffers from the end-of-batch slowdown problem. The full solution is continuous batching — covered in Chapter 5.2.
+
+## When to Use Dynamic Batching
+
+Dynamic batching is appropriate when:
+
+- You have a high-throughput serving scenario
+- Requests arrive in bursts with occasional quiet periods
+- You need better latency than static batching without the complexity of continuous batching
+- Your sequences have fairly uniform lengths
+
+## Implementation: TensorFlow Serving / Triton
+
+Popular inference servers expose dynamic batching configuration:
+
+```yaml
+# Triton Inference Server configuration
+dynamic_batching {
+  preferred_batch_size: [1, 2, 4, 8, 16, 32]
+  max_queue_delay_microseconds: 5000   # max wait before sending partial batch
+  default_queue_policy {
+    max_queue_size: 256
+    timeout_action: REJECT
+    default_timeout_microseconds: 30000
+  }
+}
+```
+
+```python
+# vLLM handles dynamic batching internally
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="meta-llama/Meta-Llama-3-8B-Instruct",
+    max_num_seqs=256,     # max sequences in flight simultaneously
+    max_num_batched_tokens=8192,  # max tokens per forward pass
+)
+```
+
+## Summary
+
+- Batching is essential for GPU efficiency — single-sequence decode wastes 95%+ of GPU capacity
+- Static batching: wait for a full batch, run together, return all results; simple but inefficient
+- Static batching problems: queuing delay, head-of-line blocking, end-of-batch underutilization
+- Dynamic batching: start processing sooner, fill gaps opportunistically, handle partial batches
+- Padding problem: all sequences in a batch must be padded to the same length — wastes compute on short sequences
+- Length-aware grouping reduces padding waste by batching similarly-sized sequences
+- Dynamic batching improves GPU utilization from 30–50% (static) to 50–70%
+- For the full solution to batch inefficiency, see Chapter 5.2: Continuous Batching

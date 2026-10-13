@@ -5,5 +5,189 @@ lastUpdatedDate: '2026-08-05'
 
 # 7.6 SmoothQuant
 
-This section covers the details of 7.6 SmoothQuant.
+SmoothQuant addresses a different quantization challenge than GPTQ or AWQ. While those focus on quantizing weights, SmoothQuant targets **activation quantization** — making both weights and activations representable in int8 simultaneously. This enables true int8 matrix multiplication, not just int8 weight storage with fp16 compute.
 
+## Why Activation Quantization Is Hard
+
+Quantizing weights alone is relatively straightforward — weights are static, you measure their range offline, and apply the optimal scale. Activations are dynamic: they change with every input, and their ranges can vary wildly.
+
+The specific problem: activations in LLMs contain **outliers** — a small number of channels with dramatically higher magnitudes than the rest.
+
+```
+Example activation vector (1024 dimensions):
+  dim 0:   0.12
+  dim 1:  -0.31
+  ...
+  dim 127: 0.08
+  dim 128: 156.7   ← OUTLIER (1000× larger than typical values)
+  ...
+  dim 1023: -0.14
+
+With outliers, the int8 range is dominated by the outlier:
+  scale = 156.7 / 127 = 1.234
+  
+  Quantizing dim 0: round(0.12 / 1.234) = round(0.097) = 0 → dequant: 0.0
+  Error: 0.12 (100% relative error!)
+  
+  Most activations quantize to 0 or 1 — extreme precision loss.
+```
+
+Activation outliers appear in roughly 0.1% of channels but grow with model scale. GPT-3 and larger models show severe outlier patterns that make naive int8 activation quantization essentially unusable.
+
+## SmoothQuant's Solution: Migrate the Difficulty
+
+SmoothQuant's key insight: you can **transfer the quantization challenge** from activations to weights using a simple per-channel rescaling:
+
+```
+Original computation (matrix multiplication):
+  Y = X × W
+
+SmoothQuant applies diagonal scaling matrix S:
+  Y = X × W 
+    = (X · s) × (W / s)    ← insert s and 1/s, product unchanged
+    = X̂ × Ŵ               ← both X̂ and Ŵ are easier to quantize
+
+Where s = per-channel scale vector (one value per input channel)
+```
+
+The mathematical output is identical: `(X · s) × (W / s) = X × W`.
+
+But by choosing `s` carefully:
+- `X · s`: scaling down the activation outlier channels → activations become quantization-friendly
+- `W / s`: scaling up the corresponding weight channels → weights become slightly harder to quantize, but they're static and can be handled with GPTQ/AWQ
+
+## Choosing the Scale Factor s
+
+The optimal `s` balances difficulty between X and W:
+
+```
+Too much in X:  activations are smooth, but weights become hard to quantize
+Too much in W:  weights are smooth, but activations still have outliers
+
+The formula: s_j = max(|X_j|)^α / max(|W_j|)^(1-α)
+
+Where:
+  j = channel index
+  α = migration strength (0.5 is balanced, typical default)
+  max(|X_j|) = peak activation magnitude for channel j (from calibration data)
+  max(|W_j|) = peak weight magnitude for channel j
+```
+
+With α=0.5, half the quantization difficulty goes to X (activations) and half to W (weights). The result: both X and W can be quantized to int8 with acceptable error.
+
+## Implementation and Usage
+
+SmoothQuant is integrated into TensorRT-LLM, vLLM (via model preparation), and the MIT Han Lab's official implementation:
+
+```bash
+pip install smoothquant
+```
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from smoothquant import smooth_lm, quantize
+
+# Step 1: Load the model
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Meta-Llama-3-8B-Instruct",
+    torch_dtype=torch.float16,
+)
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+
+# Step 2: Collect activation statistics from calibration data
+act_scales = get_act_scales(model, tokenizer, calibration_dataset)
+
+# Step 3: Apply SmoothQuant transformation
+smooth_lm(model, act_scales, alpha=0.5)
+
+# Step 4: Quantize to int8 (both weights and activations)
+model_int8 = quantize(model, weight_quant="per_channel", act_quant="per_token")
+
+# The resulting model uses true int8 matrix multiplication
+# (not just int8 weight storage)
+```
+
+### With vLLM
+
+For vLLM, SmoothQuant-prepared models can be served with int8 compute:
+
+```bash
+# Convert model to SmoothQuant format first (offline)
+python smoothquant/export.py \
+    --model-path meta-llama/Meta-Llama-3-8B \
+    --output-path llama-3-8b-smoothquant
+
+# Serve with vLLM
+python -m vllm.entrypoints.openai.api_server \
+    --model ./llama-3-8b-smoothquant \
+    --quantization smoothquant \
+    --dtype int8
+```
+
+### With TensorRT-LLM
+
+TensorRT-LLM has native SmoothQuant support for production deployment:
+
+```python
+# TensorRT-LLM compilation with SmoothQuant
+import tensorrt_llm
+
+# Build int8 engine with SmoothQuant
+build_cmd = [
+    "trtllm-build",
+    "--model-dir", "llama-3-8b",
+    "--output-dir", "llama-3-8b-trt",
+    "--use-smooth-quant",   # enable SmoothQuant
+    "--per-token",
+    "--per-channel",
+    "--dtype", "float16",
+]
+```
+
+## SmoothQuant vs Weight-Only Quantization
+
+| Aspect | Weight-only (GPTQ/AWQ) | SmoothQuant |
+|---|---|---|
+| What's quantized | Weights only | Weights + activations |
+| Compute | fp16 (dequantized weights) | int8 matrix multiply |
+| Memory savings | 2× (int8) or 4× (int4) weights | 2× weights + activations |
+| Compute savings | Memory-bandwidth improvement only | ~1.5–2× on int8 hardware |
+| Quality | Excellent at int8 | Excellent at int8 |
+| Hardware requirement | Any GPU | A100/H100 for int8 GEMM speedup |
+| Complexity | Moderate | Higher |
+
+The key advantage of SmoothQuant over weight-only quantization: **true int8 matrix multiplication**. On A100 and H100 GPUs, int8 GEMM throughput is roughly 2× the fp16 GEMM throughput. This means SmoothQuant can improve throughput both through memory savings (smaller model) and compute savings (int8 ops).
+
+## Quality Results
+
+SmoothQuant int8 typically matches fp16 quality:
+
+| Model | MMLU fp16 | MMLU W8A8 (SmoothQuant) | Quality retained |
+|---|---|---|---|
+| LLaMA-2-7B | 45.3% | 44.8% | 99% |
+| LLaMA-2-13B | 54.8% | 54.5% | 99.5% |
+| LLaMA-2-70B | 68.9% | 68.7% | 99.7% |
+
+W8A8 = 8-bit weights, 8-bit activations. Near-zero quality loss with 2× memory reduction and up to 1.5× compute throughput on int8 hardware.
+
+## When to Use SmoothQuant
+
+SmoothQuant is the right choice when:
+
+1. **You need weight + activation quantization** for maximum throughput
+2. **You're deploying on A100 or H100** with native int8 GEMM support
+3. **int8 quality is sufficient** (nearly always true — ~99% quality retention)
+4. **You're using TensorRT-LLM** (best-in-class SmoothQuant support)
+
+For serving on non-A100/H100 hardware: use weight-only quantization (GPTQ or AWQ) instead — the int8 compute savings don't apply.
+
+## Summary
+
+- SmoothQuant solves activation quantization, which is hard due to outliers in LLM activations
+- Key idea: migrate quantization difficulty from activations to weights via per-channel scaling
+- Math: `Y = (X·s) × (W/s)` — identical output, but both X·s and W/s are int8-friendly
+- Scale factor α=0.5 balances difficulty equally between activations and weights
+- Result: true int8 matrix multiplication (W8A8), not just int8 weight storage
+- Quality: ~99% of fp16 — near-zero degradation
+- Compute benefit: up to 2× throughput on A100/H100 with native int8 GEMM
+- Best used with TensorRT-LLM for production deployment

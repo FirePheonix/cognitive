@@ -5,5 +5,189 @@ lastUpdatedDate: '2026-08-05'
 
 # 5.5 Flash Attention
 
-This section covers the details of 5.5 Flash Attention.
+Standard attention is mathematically simple but computationally wasteful in a specific way: it writes large intermediate matrices to slow GPU memory (HBM) and then reads them back. FlashAttention fixes this with a carefully engineered tiling algorithm that keeps everything in fast on-chip memory, achieving the same mathematical result 2–4× faster and with much lower memory usage.
 
+## The Standard Attention Memory Problem
+
+The core attention operation for a sequence of length N:
+
+```python
+# Standard attention (simplified)
+def standard_attention(Q, K, V):
+    # Q, K, V shapes: [seq_len, head_dim]
+    
+    scores = Q @ K.T / math.sqrt(head_dim)    # [N × N] — written to HBM
+    scores = softmax(scores, dim=-1)           # [N × N] — read from HBM, written to HBM
+    output = scores @ V                        # read [N × N] from HBM again
+    
+    return output
+```
+
+The attention matrix `scores` has shape [N × N]. For different context lengths:
+
+| Context length N | Attention matrix size (fp16) | Per layer |
+|---|---|---|
+| 512 | 0.5 MB | trivial |
+| 2,048 | 8 MB | manageable |
+| 4,096 | 32 MB | noticeable |
+| 16,384 | 512 MB | significant |
+| 32,768 | 2 GB | severe |
+| 128,000 | 32 GB | exceeds A100 memory |
+
+For N=4096, a single forward pass (all layers) writes and reads: 32 layers × 32 heads × 32 MB = ~32 GB of attention matrices to/from HBM. This is the bottleneck.
+
+HBM bandwidth is 2,000–3,350 GB/s. Reading and writing 32 GB takes 10–16ms per forward pass at full bandwidth — dominated by this one operation.
+
+## FlashAttention: Tiled Computation in SRAM
+
+FlashAttention's insight: SRAM (on-chip memory, per streaming multiprocessor) is ~5× faster than HBM, but tiny (~40 MB on A100 total). If you can compute attention in tiles that fit in SRAM, you never need to write the full attention matrix to HBM.
+
+The challenge: softmax requires knowing all scores in a row before normalizing. How do you compute softmax incrementally without seeing all scores?
+
+The answer: the **online softmax** algorithm. You can compute a numerically stable softmax incrementally by tracking the running maximum and denominator:
+
+```python
+# Online softmax — can process tiles without seeing all values first
+def online_softmax_update(m_prev, l_prev, x_new):
+    """
+    m: running maximum
+    l: running sum of exp(x - m)
+    x_new: new tile of scores
+    """
+    m_new = max(m_prev, max(x_new))
+    l_new = exp(m_prev - m_new) * l_prev + sum(exp(x_new - m_new))
+    return m_new, l_new
+```
+
+FlashAttention tiles the Q, K, V matrices into blocks that fit in SRAM, processes each tile, and accumulates the output using online softmax — all without writing intermediate results to HBM:
+
+```
+SRAM tile processing:
+
+Load Q tile (block of rows) → SRAM
+For each K tile, V tile:
+    Load K tile, V tile → SRAM
+    Compute QK^T for this tile → SRAM
+    Update online softmax stats (m, l) → SRAM
+    Accumulate weighted V sum → SRAM
+Rescale accumulated output by final softmax denominator → SRAM
+Write final output tile → HBM
+```
+
+The full N×N attention matrix never exists in HBM — only tiles of size [block_size × block_size] ever exist, and they live in SRAM.
+
+## Memory Complexity
+
+| Algorithm | HBM memory usage | Notes |
+|---|---|---|
+| Standard attention | O(N²) | Full attention matrix in HBM |
+| FlashAttention | O(N) | Only Q, K, V, and output in HBM |
+
+For N=4096 with 32 heads in fp16:
+- Standard: ~32 GB of attention matrix writes/reads
+- FlashAttention: ~0 (tiles stay in SRAM)
+
+This means longer contexts are now feasible without OOM errors — and much faster.
+
+## Speed Improvements
+
+FlashAttention speeds up the overall attention computation by reducing HBM traffic:
+
+| Model context | Standard attention time (relative) | FlashAttention time (relative) |
+|---|---|---|
+| 512 tokens | 1× | ~0.7× |
+| 2,048 tokens | 1× | ~0.5× |
+| 4,096 tokens | 1× | ~0.3× |
+| 16,384 tokens | 1× | ~0.25× |
+
+The speedup grows with context length because the standard attention's O(N²) HBM traffic dominates more and more.
+
+Typical overall LLM inference speedup: **2–4× faster** end-to-end due to FlashAttention, depending on context length and hardware.
+
+## FlashAttention-2 and FlashAttention-3
+
+**FlashAttention-2** (2023):
+- Better parallelism across attention heads
+- Fewer non-matrix-multiply operations
+- ~2× speedup over FlashAttention-1
+
+**FlashAttention-3** (2024):
+- Exploits H100-specific features (WGMMA instructions, TMA)
+- Asynchronous memory operations
+- ~1.5–2× speedup over FA-2 on H100s
+- Achieves 75% of H100 theoretical peak FLOP/s
+
+```
+On H100 SXM5:
+Standard attention:    ~20–30% of peak FLOP/s
+FlashAttention-2:      ~55–60% of peak FLOP/s
+FlashAttention-3:      ~70–75% of peak FLOP/s
+```
+
+## Using FlashAttention in Practice
+
+In modern frameworks, FlashAttention is enabled automatically:
+
+```python
+# PyTorch 2.0+ — uses FlashAttention when available via scaled_dot_product_attention
+import torch
+import torch.nn.functional as F
+
+# This automatically uses FlashAttention if:
+# - The input is on CUDA
+# - Requires grad or not
+# - Sequence length and head dim are compatible
+output = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+```
+
+```python
+# HuggingFace Transformers — opt in
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Meta-Llama-3-8B",
+    attn_implementation="flash_attention_2",  # explicit opt-in
+    torch_dtype=torch.bfloat16,
+)
+```
+
+```bash
+# vLLM uses FlashAttention by default (requires flash-attn package)
+pip install vllm  # installs flash-attn as a dependency
+```
+
+```python
+# Direct FlashAttention library
+from flash_attn import flash_attn_func
+
+output = flash_attn_func(
+    q,            # [batch, seq_len, num_heads, head_dim]
+    k,            
+    v,            
+    causal=True,  # autoregressive causal mask
+)
+```
+
+## Hardware Requirements
+
+FlashAttention requires specific GPU compute capabilities:
+
+| GPU | FlashAttention support | Notes |
+|---|---|---|
+| A100 | FA1, FA2 | Full support |
+| H100 | FA1, FA2, FA3 | FA3 exploits H100-specific ISA |
+| RTX 3090/4090 | FA1, FA2 | Consumer GPUs work |
+| V100 | FA1 only | Older architecture |
+| CPU | Not applicable | CPU has no SRAM tier |
+
+FlashAttention requires CUDA and GPU SRAM — it's not applicable to CPU inference.
+
+## Summary
+
+- Standard attention writes an N×N matrix to slow HBM — this is the bottleneck for long contexts
+- FlashAttention tiles the computation to fit in fast SRAM, eliminating N×N HBM writes
+- Memory usage drops from O(N²) to O(N) — longer contexts become feasible without OOM
+- Speed improvement: 2–4× for typical contexts, higher gains for very long sequences
+- FlashAttention-2 adds better parallelism; FlashAttention-3 exploits H100-specific hardware
+- Used by default in vLLM, TGI, TensorRT-LLM, and PyTorch 2.0+'s `scaled_dot_product_attention`
+- Enable in HuggingFace with `attn_implementation="flash_attention_2"`

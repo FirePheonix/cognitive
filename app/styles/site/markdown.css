@@ -626,4 +626,30 @@ html.dark .md .shiki-wrapper {
   .md hr {
     @apply my-8 border-fd-border;
   }
+
+  /* ── KaTeX math rendering ─────────────────────────────────────────────────── */
+  .math-display {
+    @apply my-6 overflow-x-auto rounded-lg border border-fd-border bg-fd-secondary/30 px-6 py-4 text-center;
+  }
+
+  .math-display .katex-display {
+    margin: 0;
+  }
+
+  /* Inline math inherits text size naturally */
+  .katex {
+    font-size: 1.05em;
+  }
+
+  /* ── Plotly charts ────────────────────────────────────────────────────────── */
+  .plotly-chart {
+    @apply my-8 w-full overflow-hidden rounded-xl border border-fd-border bg-fd-secondary/20;
+    min-height: 380px;
+  }
+
+  /* The Plotly-injected div needs to fill the container */
+  .plotly-chart > .js-plotly-plot,
+  .plotly-chart > div {
+    width: 100% !important;
+  }
 }

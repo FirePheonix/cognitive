@@ -5,5 +5,148 @@ lastUpdatedDate: '2026-08-05'
 
 # 19.1 Retries
 
-This section covers the details of 19.1 Retries.
+Every external call to an LLM API will eventually fail. Rate limits, transient server errors, network timeouts — these are not exceptional events in production, they're routine. Retry logic is not optional; it's the baseline expectation for any production system.
 
+## The Retry Pattern
+
+**Exponential backoff with jitter** — wait longer between each retry, add randomness to prevent synchronized retry storms:
+
+```python
+import time
+import random
+from typing import TypeVar, Callable
+
+T = TypeVar("T")
+
+def execute_with_retry(
+    fn: Callable[[], T],
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    retryable_errors: tuple = (RateLimitError, APIStatusError),
+) -> T:
+    """
+    Execute fn with exponential backoff retry on transient errors.
+    Delay schedule: 1s, 2s, 4s (plus jitter).
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+
+        except retryable_errors as e:
+            if attempt == max_retries:
+                raise  # Final attempt failed — propagate
+
+            # Check if error is actually retryable
+            if hasattr(e, "status_code") and e.status_code in (400, 401, 403):
+                raise  # Permanent error — don't retry
+
+            delay = (base_delay * (2 ** attempt)) + random.uniform(0, 0.5)
+            logger.warning(
+                f"Attempt {attempt + 1}/{max_retries} failed: {e}. "
+                f"Retrying in {delay:.1f}s..."
+            )
+            time.sleep(delay)
+```
+
+Delay schedule:
+- Attempt 1 fails → wait ~1s
+- Attempt 2 fails → wait ~2s
+- Attempt 3 fails → wait ~4s
+- Attempt 4 fails → raise
+
+## Retryable vs Non-Retryable Errors
+
+```python
+RETRYABLE_STATUS_CODES = {
+    429,  # Rate limited — wait and retry
+    500,  # Internal server error — transient
+    502,  # Bad gateway — transient
+    503,  # Service unavailable — transient
+    504,  # Gateway timeout — transient
+}
+
+NON_RETRYABLE_STATUS_CODES = {
+    400,  # Bad request — your input is wrong, retrying won't help
+    401,  # Unauthorized — fix your credentials
+    403,  # Forbidden — fix your permissions
+    404,  # Not found — the resource doesn't exist
+    422,  # Unprocessable entity — invalid input
+}
+
+def is_retryable(error: Exception) -> bool:
+    if isinstance(error, TimeoutError):
+        return True
+    if hasattr(error, "status_code"):
+        return error.status_code in RETRYABLE_STATUS_CODES
+    return False
+```
+
+## Celery Task Retry Pattern
+
+For async agent tasks running in Celery workers:
+
+```python
+from celery import Celery
+
+app = Celery("atlas-agents")
+
+@app.task(
+    bind=True,
+    max_retries=3,
+    default_retry_delay=2,  # seconds, overridden below
+)
+def process_agent_task(self, task_data: dict) -> dict:
+    try:
+        result = atlas_agent.run(task_data["message"])
+        return {"status": "success", "result": result}
+
+    except RateLimitError as e:
+        # Retry with exponential backoff
+        raise self.retry(
+            exc=e,
+            countdown=2 ** self.request.retries,  # 1s, 2s, 4s
+        )
+
+    except AuthenticationError:
+        # Don't retry — credentials are wrong
+        return {"status": "error", "message": "Authentication failed."}
+
+    except Exception as e:
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=e, countdown=2 ** self.request.retries)
+        return {"status": "error", "message": "Task failed after retries."}
+```
+
+## Retry Budgets
+
+In high-throughput systems, retries can amplify load on an already-struggling provider. Implement a retry budget:
+
+```python
+class RetryBudget:
+    """
+    Limits total retry attempts within a time window.
+    Prevents retry storms from overwhelming downstream services.
+    """
+    def __init__(self, max_retries_per_minute: int = 100):
+        self.max_per_minute = max_retries_per_minute
+        self._count = 0
+        self._window_start = time.time()
+
+    def can_retry(self) -> bool:
+        now = time.time()
+        if now - self._window_start > 60:
+            self._count = 0
+            self._window_start = now
+
+        if self._count >= self.max_per_minute:
+            return False
+
+        self._count += 1
+        return True
+```
+
+## Related Sections
+
+- [19.3 Circuit Breakers](./193-circuit-breakers) — stopping retries when a provider is down
+- [19.2 Timeouts](./192-timeouts) — what to set as the timeout on each retry attempt
+- [17.6 Error Analysis](../chapter-17-observability/176-error-analysis) — classifying errors before deciding whether to retry

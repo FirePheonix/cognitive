@@ -1,9 +1,95 @@
 ---
-title: 15.6 LLM-as-a-Judge
+title: 15.6 LLM as a Judge
 lastUpdatedDate: '2026-08-05'
 ---
 
-# 15.6 LLM-as-a-Judge
+# 15.6 LLM as a Judge
 
-This section covers the details of 15.6 LLM-as-a-Judge.
+An LLM evaluating another LLM's output. Fast, scalable, and surprisingly reliable — when prompted correctly.
 
+## The Key Insight: Reasoning Before Score
+
+From the book:
+
+> "Ask for reasoning before score. Score-first produces random numbers; reasoning-first produces grounded scores."
+
+When you ask a model to output a score directly, it pattern-matches to a number. When you ask it to reason first, it builds a chain of evidence and the score becomes a conclusion rather than a guess.
+
+```python
+# WRONG — score first
+"Rate this answer from 1 to 5: {answer}"
+
+# RIGHT — reasoning first, score follows
+"Evaluate this answer. First explain what is correct, what is incorrect, and what is missing.
+ Then provide a score from 1 to 5 based on your analysis."
+```
+
+## The Reference Implementation
+
+```python
+# atlas-agents/ch18_evaluation/eval_harness.py
+def llm_judge(question: str, agent_answer: str, reference_facts: list[str]) -> dict:
+    facts_text = "\n".join(f"- {fact}" for fact in reference_facts)
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        system="You are an impartial evaluator. Grade ONLY based on the Reference Facts provided. "
+               "Do not use your own knowledge to supplement or contradict the reference facts.",
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Question: {question}\n\n"
+                f"Reference Facts:\n{facts_text}\n\n"
+                f"Agent Answer: {agent_answer}\n\n"
+                "Evaluate the Agent Answer against the Reference Facts.\n"
+                "Output valid JSON with this exact structure:\n"
+                '{"reasoning": "step-by-step analysis", "score": 1-5, "hallucinated": true/false}'
+            ),
+        }],
+    )
+    return json.loads(response.content[0].text)
+```
+
+## The Scoring Rubric
+
+The judge uses this rubric (also defined in `atlas-agents/ch18_evaluation/eval_harness.py`):
+
+| Score | Meaning |
+|---|---|
+| **5** | Correct, well-sourced, covers all aspects, no hallucinations |
+| **4** | Correct with minor gaps or style issues |
+| **3** | Partially correct, missing important aspects |
+| **2** | Mostly wrong but contains some accurate information |
+| **1** | Wrong, off-topic, or contains hallucinations |
+
+## The Cardinal Rules
+
+**Never use the same model to judge its own output.**
+
+If GPT-4o wrote the answer, use Claude as the judge. If Claude wrote the answer, use GPT-4o or Gemini as the judge. A model judging itself will rate its own confident-but-wrong outputs highly.
+
+**Never let the judge use its own knowledge.**
+
+The judge must evaluate against the provided reference facts only. If the judge's world knowledge contradicts the reference, the reference wins. This is what "Grade ONLY based on Reference Facts" enforces.
+
+**Pin the judge model.**
+
+If the judge model updates, your scores may shift. Use a specific model version (`claude-sonnet-4-6`, not `claude-latest`) and treat a judge model change the same as a baseline reset.
+
+## Parsing Judge Output Robustly
+
+LLMs occasionally produce malformed JSON. Handle it:
+
+```python
+def safe_judge(question: str, answer: str, facts: list[str]) -> dict:
+    try:
+        result = llm_judge(question, answer, facts)
+        assert "score" in result and "hallucinated" in result
+        assert 1 <= result["score"] <= 5
+        return result
+    except (json.JSONDecodeError, AssertionError, KeyError):
+        # Retry once with a stricter prompt, then default to score=3
+        return {"score": 3, "hallucinated": False, "reasoning": "parse_error", "error": True}
+```
+
+Track the error rate. If more than 2% of judge calls fail to parse, your judge prompt needs tightening.

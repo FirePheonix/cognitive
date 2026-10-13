@@ -254,3 +254,61 @@ REALITY (probably):
 - **Multimodal**: images become sequences of patch embeddings (196 patches from a 224×224 image). Concatenated with text tokens and processed by the same transformer. Cross-modal grounding emerges from attention.
 - **Open problems**: hallucination, long-horizon reasoning, sample efficiency, alignment at scale, compute cost. None fully solved.
 - **Scaling vs efficiency**: both matter. Scale creates raw capability; architectural improvements and better training extract more from the same compute. The field needs both.
+
+---
+
+## Open Questions: What NLP Still Can't Solve
+
+*Based on Stanford CS224n Lecture 19 — the course's final lecture on open problems.*
+
+### The Data Bottleneck
+
+The internet has a finite amount of high-quality text. At current training scales, models are approaching the limit of unique, high-quality training data. Continuing to scale means:
+
+- More duplication (which hurts generalization)
+- Lower quality data (which degrades capability)
+- Privacy/copyright issues at scale
+
+The shift: from "more data" to smarter data. The goal becomes finding the highest information-gain examples:
+
+$$x^* = \arg\max_x\ \Delta \mathcal{I}(\theta;\ x)$$
+
+Quality + diversity + curriculum matters more than raw quantity.
+
+### Synthetic Data — and Its Risks
+
+Models generating their own training data:
+
+$$x_{\text{syn}} \sim q_\phi(x)$$
+
+**Benefits:** you can target exactly the skills you want to improve, generate verified reasoning traces, filter automatically with verifiers.
+
+**Risks:** mode collapse (synthetic data amplifies the model's existing biases), diversity loss (the model keeps generating what it already knows), feedback loops (errors in generation become training data errors).
+
+### The Fundamental Open Questions (as of 2026)
+
+1. **Data efficiency**: How do you learn stronger representations from less data?
+2. **Reward design**: How do you specify goals that are resistant to Goodhart gaming?
+3. **Adaptive compute**: How do you allocate test-time compute optimally per query?
+4. **Long-horizon agents**: How do you credit-assign rewards to actions taken 50 steps ago?
+5. **Calibrated uncertainty**: How do you make models say "I don't know" reliably?
+6. **Quality + diversity**: How do you improve average quality without reducing output diversity?
+7. **Multilingual fairness**: How do you make models work equally well across languages?
+8. **Mechanistic understanding**: Can interpretability become causal, not just correlational?
+9. **Memory + computation**: Should knowledge live in weights, context, or external memory?
+10. **Unified evaluation**: How do you measure capability + safety + reliability + efficiency in one framework?
+
+### The Most Important Design Question: Where Should Knowledge Live?
+
+$$\underbrace{\text{parameters}}_{\text{weights}} \quad \text{vs} \quad \underbrace{\text{context}}_{\text{prompt/RAG}} \quad \text{vs} \quad \underbrace{\text{external memory}}_{\text{vector store/DB}} \quad \text{vs} \quad \underbrace{\text{recurrent state}}_{\text{SSM/hybrid}}$$
+
+Each has different cost, latency, updatability, and precision tradeoffs:
+
+| Storage | Update cost | Latency | Precision | Best for |
+|---|---|---|---|---|
+| Weights | Full retraining | Zero | Low (fused) | Stable world knowledge |
+| Context | None (prompt) | O(n²) attn | High | Per-session facts |
+| External memory | Cheap (vector insert) | Retrieval latency | Exact | Structured, updateable facts |
+| Recurrent state | Online (per token) | O(n) | Fixed capacity | Streaming/long sequences |
+
+The right architecture for the next generation of AI systems will probably combine all four — the question is how.

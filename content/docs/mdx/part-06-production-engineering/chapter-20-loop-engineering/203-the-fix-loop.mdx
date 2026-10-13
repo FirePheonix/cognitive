@@ -1,0 +1,317 @@
+---
+title: '20.3 The Self-Correcting Fix Loop'
+lastUpdatedDate: '2026-08-05'
+---
+
+# 20.3 The Self-Correcting Fix Loop
+
+The fix loop is the most common loop in engineering agents: the agent attempts to fix something (failing tests, lint errors, a broken build), the system verifies whether it worked, and if not, feeds the failure back as a distilled lesson rather than as raw noise.
+
+This section presents a complete, production-ready implementation with all five loop components from Chapter 20.2 assembled into a working system.
+
+## The Complete Fix Loop
+
+```python
+import hashlib
+import subprocess
+import time
+from dataclasses import dataclass, field
+from typing import Callable
+
+# ─── Types ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class LoopResult:
+    status: str            # "success" | "escalated"
+    attempts: int
+    reason: str = ""
+    lessons: list[str] = field(default_factory=list)
+    last_evidence: str = ""
+
+# ─── Verification ─────────────────────────────────────────────────────────────
+
+MAX_ATTEMPTS = 6
+
+def verify() -> tuple[bool, str]:
+    """
+    Run the test suite and return (passed, output).
+    The termination condition: all tests pass, exit code 0.
+    """
+    result = subprocess.run(
+        ["python", "-m", "pytest", "-x", "-q", "--tb=short"],
+        capture_output=True,
+        text=True,
+        timeout=300
+    )
+    output = (result.stdout + result.stderr)[-2000:]
+    return result.returncode == 0, output
+
+# ─── Fingerprinting ───────────────────────────────────────────────────────────
+
+def failure_fingerprint(output: str) -> str:
+    """
+    Detect if the agent is stuck on the same failure.
+    Hash the sorted set of failing test names and error messages.
+    If the hash doesn't change between attempts, the agent is stuck.
+    """
+    failures = [
+        line for line in output.splitlines()
+        if "FAILED" in line or "Error" in line or "assert" in line
+    ]
+    canonical = "\n".join(sorted(set(failures)))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:12]
+
+# ─── Context Compaction ───────────────────────────────────────────────────────
+
+def build_agent_context(goal: str, lessons: list[str], evidence: str) -> str:
+    """
+    Build a clean, forward-looking context from distilled lessons.
+    The agent sees lessons (compact) not raw history (noisy).
+    """
+    parts = [f"GOAL: {goal}", ""]
+    
+    if lessons:
+        parts.append("WHAT HAS BEEN TRIED AND FAILED:")
+        for i, lesson in enumerate(lessons, 1):
+            parts.append(f"  {i}. {lesson}")
+        parts.append("")
+        parts.append("Do NOT repeat any of the above approaches.")
+    
+    parts.extend([
+        "CURRENT TEST OUTPUT:",
+        evidence[:800],
+        "",
+        "Fix the failing tests. Make targeted changes only."
+    ])
+    
+    return "\n".join(parts)
+
+# ─── Escalation ───────────────────────────────────────────────────────────────
+
+def escalate(goal: str, lessons: list[str], reason: str, evidence: str) -> LoopResult:
+    """
+    Give up and package the situation for human review.
+    """
+    print(f"\n🚨 ESCALATING: {reason}")
+    print(f"   Attempts made: {len(lessons)}")
+    print(f"   Last evidence: {evidence[:200]}")
+    
+    return LoopResult(
+        status="escalated",
+        attempts=len(lessons),
+        reason=reason,
+        lessons=lessons,
+        last_evidence=evidence
+    )
+
+# ─── Agent Action (placeholder — swap in your own) ────────────────────────────
+
+def agent_act(goal: str, context: str):
+    """
+    Your agent implementation here.
+    This is the part that calls the LLM and makes code changes.
+    """
+    from openai import OpenAI
+    client = OpenAI()
+    
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a software engineer. Fix the failing tests. Make minimal, targeted changes. Output only the code changes you want to make using the provided tools."
+            },
+            {
+                "role": "user",
+                "content": context
+            }
+        ],
+        tools=get_code_editing_tools(),  # file read/write/patch tools
+        tool_choice="auto",
+        max_tokens=4096
+    )
+    
+    execute_tool_calls(response)  # Apply the code changes
+
+# ─── The Main Loop ────────────────────────────────────────────────────────────
+
+def run_loop(goal: str) -> LoopResult:
+    """
+    The self-correcting fix loop.
+    
+    Run the agent, verify the result, distill failures into lessons,
+    detect stalls, escalate when stuck or exhausted.
+    """
+    lessons: list[str] = []
+    last_fp: str | None = None
+    stall_count: int = 0
+    evidence: str = ""
+    
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        print(f"\n── Attempt {attempt}/{MAX_ATTEMPTS} ──────────────────────")
+        t_start = time.time()
+        
+        # 1. Build clean context from distilled lessons
+        context = build_agent_context(goal, lessons, evidence)
+        
+        # 2. Agent acts (calls LLM, makes code changes)
+        agent_act(goal, context=context)
+        
+        elapsed = time.time() - t_start
+        
+        # 3. Machine verifies the termination condition
+        done, evidence = verify()
+        
+        if done:
+            print(f"   ✅ Done in {attempt} attempt(s) ({elapsed:.1f}s)")
+            return LoopResult(status="success", attempts=attempt)
+        
+        print(f"   ❌ Failed ({elapsed:.1f}s)")
+        
+        # 4. Detect futility — same failure 3x in a row
+        fp = failure_fingerprint(evidence)
+        if fp == last_fp:
+            stall_count += 1
+        else:
+            stall_count = 0
+            last_fp = fp
+        
+        print(f"   Fingerprint: {fp} (stall count: {stall_count})")
+        
+        if stall_count >= 2:  # fingerprint unchanged across 3 consecutive attempts
+            return escalate(
+                goal,
+                lessons,
+                reason=f"Same failure fingerprint '{fp}' for 3 consecutive attempts. Agent is stuck.",
+                evidence=evidence
+            )
+        
+        # 5. Compact: convert failure to a distilled lesson, not a transcript
+        key_errors = [
+            line for line in evidence.splitlines()
+            if "FAILED" in line or "Error:" in line
+        ][:3]
+        lesson = f"Attempt {attempt}: " + "; ".join(key_errors)[:200] if key_errors else f"Attempt {attempt}: {evidence[:150]}"
+        lessons.append(lesson)
+        print(f"   Lesson: {lesson[:100]}...")
+    
+    return escalate(
+        goal,
+        lessons,
+        reason=f"Max attempts ({MAX_ATTEMPTS}) exhausted without passing termination condition.",
+        evidence=evidence
+    )
+```
+
+## Running the Loop
+
+```python
+# Fix all failing tests in the current project
+result = run_loop(
+    goal="Fix all failing tests. Run pytest to verify. All tests must pass."
+)
+
+if result.status == "success":
+    print(f"Fixed in {result.attempts} attempt(s).")
+else:
+    print(f"Could not fix automatically: {result.reason}")
+    print("Lessons learned:")
+    for lesson in result.lessons:
+        print(f"  - {lesson}")
+```
+
+## The Loop in Action
+
+Here's what a typical successful run looks like:
+
+```
+── Attempt 1/6 ────────────────────────
+   ❌ Failed (42.3s)
+   Fingerprint: a7f3c1d92e44 (stall count: 0)
+   Lesson: Attempt 1: FAILED tests/test_utils.py::test_parse_date; TypeError: strptime...
+
+── Attempt 2/6 ────────────────────────
+   ❌ Failed (38.1s)
+   Fingerprint: 8b2e5f7a1c33 (stall count: 0)
+   Lesson: Attempt 2: FAILED tests/test_utils.py::test_parse_date; ValueError: time data...
+
+── Attempt 3/6 ────────────────────────
+   ✅ Done in 3 attempt(s) (35.7s)
+```
+
+And a stall (escalation):
+
+```
+── Attempt 1/6 ────────────────────────
+   ❌ Failed (41.0s)
+   Fingerprint: cc891d3f7a12 (stall count: 0)
+   Lesson: Attempt 1: FAILED tests/test_auth.py::test_jwt_decode; ImportError: No module...
+
+── Attempt 2/6 ────────────────────────
+   ❌ Failed (40.5s)
+   Fingerprint: cc891d3f7a12 (stall count: 1)
+   Lesson: Attempt 2: FAILED tests/test_auth.py::test_jwt_decode; ImportError: No module...
+
+── Attempt 3/6 ────────────────────────
+   ❌ Failed (39.8s)
+   Fingerprint: cc891d3f7a12 (stall count: 2)
+
+🚨 ESCALATING: Same failure fingerprint 'cc891d3f7a12' for 3 consecutive attempts. Agent is stuck.
+   Attempts made: 3
+   Last evidence: FAILED tests/test_auth.py::test_jwt_decode - ImportError: No module named 'jose'
+```
+
+In this case, the agent is trying to fix a missing dependency but doesn't have permission to modify `requirements.txt` or run `pip install`. A human reviewer immediately spots the issue. The loop correctly identified it was stuck and escalated after 3 attempts instead of burning 6.
+
+## Key Design Decisions
+
+### Why `-x` (fail fast) in pytest?
+
+Without `-x`, pytest runs all tests and the agent gets a long list of failures to address. With `-x`, it gets one failure at a time. This produces cleaner feedback and prevents the agent from trying to fix 15 failures simultaneously (and doing a poor job on all of them).
+
+### Why distill lessons instead of passing raw output?
+
+By attempt 3, the raw output approach has filled the context with:
+- Attempt 1's full stack trace (200 lines)
+- Attempt 1's code changes (100 lines of code that didn't work)
+- Attempt 2's full stack trace (200 lines, partially different)
+- Attempt 2's code changes (100 lines of different code that also didn't work)
+
+The model starts reasoning about its own failed reasoning. Quality collapses. Lessons replace all of that with 3 bullet points totaling ~200 tokens.
+
+### Why stop at 3 stalls, not 1?
+
+A single repeated fingerprint can happen if the agent's fix was correct but there's a transient test failure (network dependency, timing issue). Requiring 3 consecutive identical fingerprints filters out noise while still catching true stalls quickly.
+
+## Adapting the Loop to Other Tasks
+
+The `verify()` function is the only part that's test-specific. Swap it for any machine-checkable condition:
+
+```python
+# For a lint-and-format loop
+def verify_lint() -> tuple[bool, str]:
+    result = subprocess.run(["ruff", "check", "."], capture_output=True, text=True)
+    return result.returncode == 0, result.stdout[-1000:]
+
+# For an API health check loop
+def verify_health() -> tuple[bool, str]:
+    import requests
+    try:
+        r = requests.get("http://localhost:8000/health", timeout=5)
+        return r.status_code == 200, f"Status: {r.status_code}, Body: {r.text[:200]}"
+    except Exception as e:
+        return False, str(e)
+
+# For a JSON schema validation loop
+def verify_json_output(output_path: str, schema: dict) -> tuple[bool, str]:
+    import json, jsonschema
+    with open(output_path) as f:
+        data = json.load(f)
+    try:
+        jsonschema.validate(data, schema)
+        return True, "Schema validation passed."
+    except jsonschema.ValidationError as e:
+        return False, str(e)[:500]
+```
+
+The loop skeleton stays the same. The verification logic is the variable.

@@ -191,3 +191,27 @@ GPT-2 (2019) demonstrated this with a 1.5B parameter model. GPT-3 (2020) showed 
 - The **LM head is weight-tied** with the token embedding matrix — no extra parameters.
 - GPT-3 175B uses the same architecture as GPT-2 small, just with 96 layers, d_model=12288, and n_heads=96 instead of 12/768/12.
 - The FFN holds ~45% of all parameters and is where most of the model's "knowledge" appears to be stored.
+
+---
+
+## Three Architecture Families: A Comparison
+
+There are three fundamentally different ways to build a Transformer, each with different information visibility and best-suited tasks:
+
+| Architecture | Objective | Attention Mask | Representative Models | Best For |
+|---|---|---|---|---|
+| **Encoder-only** | Masked LM (predict masked tokens) | Bidirectional (sees all tokens) | BERT, RoBERTa | Classification, NER, embeddings |
+| **Decoder-only** | Causal LM (predict next token) | Causal (sees only past tokens) | GPT, Llama, Claude | Generation, chat, reasoning |
+| **Encoder-Decoder** | Denoising / seq-to-seq | Encoder: bidirectional; Decoder: causal + cross-attention | T5, BART | Translation, summarization |
+
+**The key insight about information visibility:**
+- Encoder models see the whole sentence at once — great for understanding a fixed input
+- Decoder models only see what came before — necessary for generation (you can't cheat and read the future)
+- Encoder-decoder models combine both — encoder reads the source, decoder generates the target
+
+**Why decoder-only won:**
+Despite starting as "just the decoder half," decoder-only models turned out to be remarkably general. With enough scale, a model trained purely on "predict the next token" learns to do translation, summarization, coding, and reasoning — without any task-specific architecture. The simplicity is the feature.
+
+The causal LM objective:
+$$\mathcal{L}_{\text{CLM}} = -\sum_t \log P(x_t \mid x_{<t})$$
+Every sentence in every document is training data. No labels needed. At trillion-token scale, this simple objective produces surprisingly general capabilities.

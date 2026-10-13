@@ -5,5 +5,153 @@ lastUpdatedDate: '2026-08-05'
 
 # 10.9 Termination Conditions
 
-This section covers the details of 10.9 Termination Conditions.
+## The Rule
 
+> *"Always set a maximum iteration limit. An uncapped loop is a direct line to runaway API bills and infinite recursion."*
+
+This is not optional. Every agent loop must have a defined exit condition. The only question is which type — and ideally you want all three.
+
+## Three Types of Termination
+
+### 1. Natural Termination
+
+The agent returns a final answer with no tool calls. This is the happy path.
+
+```python
+response = call_llm(messages)
+msg = response.choices[0].message
+
+if not msg.tool_calls:
+    return msg.content  # Natural termination — agent is done
+```
+
+The LLM signals "I'm done" by not requesting any more tools. When the message list contains enough information to answer the question, the model stops calling tools and returns the answer directly.
+
+### 2. Budget Termination
+
+The agent hits `MAX_ITERATIONS` or a cost ceiling.
+
+```python
+MAX_ITERATIONS = 6
+
+for iteration in range(MAX_ITERATIONS):
+    # ... agent loop
+    pass
+
+# If we reach here, budget was exhausted
+return {
+    "status": "budget_exhausted",
+    "iterations": MAX_ITERATIONS,
+    "partial_result": last_response,
+}
+```
+
+Budget termination is not failure — it's a controlled exit. Return whatever the agent accomplished so far. Include `iterations` in the response so callers can distinguish "budget hit after 6 iterations" from "natural completion after 2 iterations."
+
+### 3. Stall Detection (Escalation)
+
+The most important termination type for complex tasks. From `atlas-agents/ch20_loop_engineering`:
+
+```python
+def failure_fingerprint(output: str) -> str:
+    failures = [l for l in output.splitlines() if "FAILED" in l or "Error" in l]
+    return hashlib.sha256("\n".join(sorted(failures)).encode()).hexdigest()[:12]
+
+# If fingerprint hasn't changed in 2 attempts → escalate
+if fp == last_fp:
+    stall_count += 1
+if stall_count >= 2:
+    return escalate(goal, lessons, reason=f"same failure 3x ({fp})")
+```
+
+The stall detector catches a specific failure mode: the agent is doing *something* on each iteration (so budget termination doesn't kick in), but nothing is changing. The same tests fail, the same errors appear, the same tools return the same errors.
+
+Without stall detection, this agent consumes the full `MAX_ITERATIONS` budget before giving up. With it, you exit after 3 identical failures — saving the remaining budget.
+
+## The Termination Decision Tree
+
+```
+Agent produces a response
+    │
+    ├─ No tool calls?
+    │   └─ YES → Natural termination ✓
+    │
+    ├─ Iteration count >= MAX_ITERATIONS?
+    │   └─ YES → Budget termination (return partial result)
+    │
+    ├─ Cost >= MAX_COST?
+    │   └─ YES → Cost termination (return partial result)
+    │
+    ├─ Same failure fingerprint 3x?
+    │   └─ YES → Stall detection → Escalate
+    │
+    └─ Otherwise → Continue loop
+```
+
+Evaluate these conditions in order, after every iteration.
+
+## Machine-Checkable Termination Conditions
+
+Termination is only reliable when you can verify it automatically. The contrast:
+
+| Condition | Machine-checkable? |
+|---|---|
+| "All 214 tests pass and ruff reports zero errors" | **Yes** — run the tests, check exit code |
+| "Improve the codebase" | **No** — improvement is subjective |
+| "The API returns 200 for all endpoints" | **Yes** — send the requests, check responses |
+| "Make the code cleaner" | **No** — cleaner is not defined |
+| "Memory usage under 512MB during load test" | **Yes** — measurable threshold |
+
+Always define termination in terms of verifiable outcomes. An agent with a vague goal will never terminate naturally — it will always find something else to "improve." An agent with a specific, checkable goal knows exactly when it's done.
+
+```python
+# Bad: vague goal
+goal = "improve the code quality"
+
+# Good: machine-checkable goal
+goal = """
+Make all tests pass:
+  - pytest returns exit code 0
+  - All 214 tests collected, 214 passed
+  - ruff check reports 0 errors
+  - mypy reports 0 errors
+"""
+
+def is_done(output: str) -> bool:
+    return (
+        "214 passed" in output and
+        "ruff check" in output and "0 errors" in output
+    )
+```
+
+## Graceful Degradation
+
+When termination is forced (budget or stall), return what you have — don't return nothing:
+
+```python
+def run_agent_with_graceful_degradation(goal: str) -> dict:
+    partial_results = []
+
+    for iteration in range(MAX_ITERATIONS):
+        result = run_iteration()
+        partial_results.append(result)
+
+        if is_done(result):
+            return {"status": "complete", "result": result}
+
+        if is_stalled(partial_results):
+            return {
+                "status": "stalled",
+                "partial_results": partial_results,
+                "last_error": extract_last_error(result),
+                "recommendation": "Manual review required",
+            }
+
+    return {
+        "status": "budget_exhausted",
+        "partial_results": partial_results,
+        "progress": estimate_progress(partial_results),
+    }
+```
+
+A partial result with context about why it stopped is far more useful than an empty error response. Give the caller enough information to decide whether to retry, escalate, or accept the partial work.

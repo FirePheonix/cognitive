@@ -5,5 +5,170 @@ lastUpdatedDate: '2026-08-05'
 
 # 7.7 Quantization-Aware Training
 
-This section covers the details of 7.7 Quantization-Aware Training.
+Post-training quantization (PTQ) is fast and convenient, but it has limits. At aggressive quantization levels (int4, int2) or for small models with limited parameter redundancy, PTQ can't fully recover quality. Quantization-Aware Training (QAT) addresses this by incorporating quantization into the training process itself, allowing the model to adapt its weights to work optimally within quantized precision.
 
+## What QAT Does Differently
+
+In standard training, the model learns weights in fp32 or bf16 with no awareness that those weights will later be quantized.
+
+In QAT, quantization is **simulated during the forward pass** while gradients still flow through fp32 values:
+
+```python
+# Standard training forward pass:
+output = model(input)  # all ops in fp16/bf16
+
+# QAT forward pass:
+def qat_linear(x, W, scale, zero_point):
+    # Simulate quantization of weights (differentiable approximation)
+    W_q = fake_quantize(W, scale, zero_point, bits=4)
+    # W_q has int4 values but is stored/backpropped as fp32
+    return x @ W_q.T
+    
+def fake_quantize(tensor, scale, zero_point, bits):
+    # Forward: quantize then dequantize (introduces rounding error)
+    quantized = torch.clamp(torch.round(tensor / scale) + zero_point, 0, 2**bits - 1)
+    dequantized = (quantized - zero_point) * scale
+    # Backward: pass through gradients unchanged (Straight-Through Estimator)
+    return tensor + (dequantized - tensor).detach()
+```
+
+The `fake_quantize` operation:
+- **Forward**: introduces quantization noise (rounding)
+- **Backward**: passes gradients through unchanged (Straight-Through Estimator trick)
+
+This allows the model to experience quantization noise during training and learn to work around it.
+
+## The Straight-Through Estimator (STE)
+
+Quantization is a step function — its gradient is zero almost everywhere. You can't backpropagate through it normally.
+
+The **Straight-Through Estimator** approximates the gradient as if quantization didn't exist:
+
+```
+∂Loss/∂W (true) = 0  (step function, no gradient)
+
+∂Loss/∂W (STE) = ∂Loss/∂W_dequantized  (pretend dequantized == W)
+```
+
+This is mathematically incorrect but practically very effective. The model treats quantization as transparent during backprop, updating the underlying fp32 weights in the direction that reduces loss despite quantization.
+
+## QAT Training Loop
+
+```python
+import torch
+import torch.nn as nn
+from torch.quantization import prepare_qat, convert
+
+# 1. Define the model with QAT config
+model = YourLLMModel()
+model.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
+
+# 2. Prepare for QAT: insert fake-quantize operations
+model_prepared = prepare_qat(model)
+
+# 3. Train with quantization simulation
+optimizer = torch.optim.Adam(model_prepared.parameters(), lr=1e-5)
+
+for epoch in range(num_epochs):
+    for batch in dataloader:
+        optimizer.zero_grad()
+        
+        output = model_prepared(batch['input_ids'], ...)
+        loss = compute_loss(output, batch['labels'])
+        
+        loss.backward()
+        optimizer.step()
+    
+    print(f"Epoch {epoch}: loss = {loss.item():.4f}")
+
+# 4. Convert to actual quantized model (replace fake-quantize with real int8 ops)
+model_quantized = convert(model_prepared)
+torch.save(model_quantized.state_dict(), "qat_model.pt")
+```
+
+## QAT for LLMs: Practical Considerations
+
+Pure QAT from scratch (training a model from scratch with quantization simulation) is rare for LLMs — the training cost is already enormous.
+
+In practice, QAT for LLMs means **fine-tuning a pre-trained model with quantization simulation**:
+
+```
+Step 1: Start with a pre-trained fp16 model (e.g., Llama-3-8B)
+Step 2: Apply PTQ to get initial quantized weights
+Step 3: Fine-tune with QAT on a representative dataset (thousands of steps)
+Step 4: The model adapts its weights to minimize quality loss at quantized precision
+```
+
+This is sometimes called **QAT fine-tuning** or **recovery fine-tuning**.
+
+### LLM.int8() and BitNet
+
+Microsoft Research has explored QAT for very aggressive quantization (int1, binary):
+
+- **BitNet b1.58**: trained from scratch with ternary weights {-1, 0, 1} — models learn to work entirely within 2-bit precision
+- Requires full training from scratch (expensive)
+- Achieves competitive quality vs fp16 at a fraction of the compute
+
+For most practitioners, BitNet-style approaches remain research — the training infrastructure requirement is prohibitive.
+
+## GGUF/GGML Quantization (llama.cpp)
+
+For CPU inference, the llama.cpp ecosystem uses its own quantization formats:
+
+```
+Q2_K:  ~2.6 bits/weight (extreme compression, significant quality loss)
+Q4_0:  4 bits, basic   (fastest, lower quality)
+Q4_K_M: 4 bits, mixed  (most important layers at higher precision — recommended)
+Q5_K_M: 5 bits, mixed  (better quality vs Q4_K_M)
+Q6_K:  ~6.5 bits       (near fp16 quality on CPU)
+Q8_0:  8 bits          (excellent quality, good speed on CPU)
+```
+
+The `K_M` variants use a mixed-precision approach: attention layers and other sensitive layers use higher precision, while less sensitive FFN layers use lower precision. This is a form of layer-wise QAT heuristic.
+
+```bash
+# Convert to GGUF format with llama.cpp
+python convert.py meta-llama/Meta-Llama-3-8B-Instruct --outtype f16 --outfile llama3-8b.gguf
+
+# Quantize to Q4_K_M (recommended 4-bit for CPU)
+./quantize llama3-8b.gguf llama3-8b-q4km.gguf Q4_K_M
+
+# Run inference on CPU
+./llama-cli -m llama3-8b-q4km.gguf -p "Explain transformers:" -n 200
+```
+
+## When QAT Is Worth It
+
+| Scenario | PTQ sufficient | QAT needed |
+|---|---|---|
+| int8 quantization | Yes — minimal quality loss | Overkill |
+| int4, large model (70B+) | Usually yes | Maybe for critical use cases |
+| int4, small model (1–7B) | Usually yes | If quality degradation unacceptable |
+| int4, complex reasoning tasks | Sometimes | Yes, if math/reasoning is critical |
+| int2 / ternary / binary | No | Yes — required |
+| Edge deployment with strict quality SLA | Depends | Often yes |
+
+## Compute Cost of QAT
+
+QAT for LLMs is expensive:
+
+| Approach | Compute cost | Data needed |
+|---|---|---|
+| PTQ (GPTQ/AWQ) | Minutes–hours (offline, no GPU training) | ~128 calibration samples |
+| PTQ + light QAT recovery | A few hundred GPU-hours | Thousands of examples |
+| Full QAT from scratch | Same as full training (thousands of GPU-hours) | Full training dataset |
+
+For most production use cases, GPTQ or AWQ (PTQ) provides acceptable quality at negligible compute cost. Only pursue QAT if:
+1. PTQ quality is measurably below your requirement
+2. You have the training infrastructure
+3. The quality improvement justifies the compute cost
+
+## Summary
+
+- QAT simulates quantization during the training forward pass using fake-quantize operations
+- The Straight-Through Estimator allows backpropagation through non-differentiable rounding
+- QAT for LLMs = fine-tune a pre-trained model with quantization simulation (not train from scratch)
+- QAT recovers most or all quality lost in PTQ — at the cost of training compute
+- GGUF mixed-precision formats (Q4_K_M) implement layer-wise precision heuristics similar to QAT principles
+- Use PTQ (GPTQ/AWQ) first — only pursue QAT when PTQ quality is unacceptable
+- Full from-scratch QAT (like BitNet) is research-scale, not practical for most teams

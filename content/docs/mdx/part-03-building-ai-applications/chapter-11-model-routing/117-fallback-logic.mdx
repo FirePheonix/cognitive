@@ -5,5 +5,228 @@ lastUpdatedDate: '2026-08-05'
 
 # 11.7 Fallback Logic
 
-This section covers the details of 11.7 Fallback Logic.
+Fallback logic is the specific decision tree that executes when your primary option fails. The circuit-breaker pattern from the previous section handles availability. This section covers capability fallbacks — what to do when the right model can't handle the request, not just when it's unavailable.
 
+## The Three Fallback Levels
+
+### Level 1: Model Fallback (Same Capability)
+
+A different provider with equivalent capability. User gets identical quality, just from a different model.
+
+```python
+EQUIVALENT_MODELS = {
+    "gpt-4o":            ["claude-sonnet-4-6", "gemini/gemini-1.5-pro"],
+    "claude-sonnet-4-6": ["gpt-4o",            "gemini/gemini-1.5-pro"],
+    "claude-haiku-4-5":  ["gemini/gemini-2.0-flash", "gpt-4o-mini"],
+}
+
+def level1_fallback(primary_model: str, messages: list) -> str | None:
+    equivalents = EQUIVALENT_MODELS.get(primary_model, [])
+    for model in equivalents:
+        try:
+            return call_model(model, messages)
+        except Exception:
+            continue
+    return None
+```
+
+### Level 2: Degraded Capability Fallback
+
+A simpler model with reduced quality, but still useful. User gets 80% of the normal quality.
+
+```python
+DEGRADED_FALLBACKS = {
+    "gpt-4o":            "claude-haiku-4-5",
+    "claude-sonnet-4-6": "gemini/gemini-2.0-flash",
+    "claude-opus-4-5":   "claude-sonnet-4-6",
+}
+
+def level2_fallback(primary_model: str, messages: list) -> tuple[str, str] | None:
+    """Returns (response, fallback_model) or None."""
+    fallback = DEGRADED_FALLBACKS.get(primary_model)
+    if not fallback:
+        return None
+
+    try:
+        response = call_model(fallback, messages)
+        return response, fallback
+    except Exception:
+        return None
+```
+
+### Level 3: Cached Response Fallback
+
+The last good response for a similar request. Only when all generation fails.
+
+```python
+import hashlib
+import json
+
+class ResponseCache:
+    def __init__(self, max_age_seconds: int = 3600):
+        self._cache = {}
+        self.max_age = max_age_seconds
+
+    def key(self, messages: list) -> str:
+        payload = json.dumps(messages, sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    def get(self, messages: list) -> str | None:
+        import time
+        key = self.key(messages)
+        entry = self._cache.get(key)
+        if entry and (time.time() - entry["timestamp"]) < self.max_age:
+            return entry["response"]
+        return None
+
+    def set(self, messages: list, response: str):
+        import time
+        self._cache[self.key(messages)] = {
+            "response": response,
+            "timestamp": time.time(),
+        }
+```
+
+## The Ollama Local Fallback
+
+Reference: `atlas-agents/ch07_model_portability/online/ollama_tool_calling.py:130`
+
+A full tool-calling agent running locally via Ollama — zero API cost, works completely offline:
+
+```python
+import ollama
+import json
+
+class OllamaFallbackAgent:
+    """
+    Local fallback agent using Ollama.
+    Full tool-calling support — same interface as cloud agents.
+    Uses llama3.2 or similar open-weight model.
+    """
+
+    def __init__(self, model: str = "llama3.2"):
+        self.model = model
+        # Verify the model is available
+        try:
+            ollama.show(model)
+        except Exception:
+            raise RuntimeError(
+                f"Model {model} not available locally. Run: ollama pull {model}"
+            )
+
+    def complete_with_tools(
+        self,
+        messages: list,
+        tools: list,
+        registry,
+    ) -> str:
+        current_messages = messages.copy()
+
+        for _ in range(10):  # Max turns
+            response = ollama.chat(
+                model=self.model,
+                messages=current_messages,
+                tools=tools,
+            )
+            msg = response["message"]
+
+            if not msg.get("tool_calls"):
+                return msg["content"]  # Final response
+
+            # Execute tool calls
+            current_messages.append(msg)
+            for tc in msg["tool_calls"]:
+                fn = tc["function"]
+                result = registry.execute(fn["name"], fn["arguments"])
+                current_messages.append({
+                    "role": "tool",
+                    "content": result,
+                })
+
+        return "Max turns reached."
+
+
+def create_local_fallback():
+    """Factory — returns None if Ollama isn't available."""
+    try:
+        return OllamaFallbackAgent(model="llama3.2")
+    except Exception:
+        return None
+```
+
+The local fallback isn't as capable as Claude Sonnet or GPT-4o, but it *works* — and working at 80% quality is better than an error at 0%.
+
+## Composing the Three Levels
+
+```python
+class ThreeLevelFallback:
+    def __init__(
+        self,
+        primary_model: str,
+        cache: ResponseCache,
+        local_fallback: OllamaFallbackAgent | None = None,
+    ):
+        self.primary = primary_model
+        self.cache = cache
+        self.local = local_fallback
+
+    def complete(self, messages: list) -> tuple[str, str]:
+        """Returns (response, source) where source explains how we got it."""
+
+        # Level 1: Same capability
+        result = level1_fallback(self.primary, messages)
+        if result:
+            return result, "level1_equivalent"
+
+        # Level 2: Degraded capability
+        result = level2_fallback(self.primary, messages)
+        if result:
+            response, model = result
+            return response, f"level2_degraded:{model}"
+
+        # Level 3a: Local model
+        if self.local:
+            try:
+                response = self.local.complete_with_tools(messages, tools=[], registry=None)
+                return response, "level3_local"
+            except Exception:
+                pass
+
+        # Level 3b: Cache
+        cached = self.cache.get(messages)
+        if cached:
+            return cached + "\n\n*(Cached response — live service unavailable)*", "level3_cache"
+
+        # Level 4: Fail gracefully
+        return (
+            "I'm unable to process your request right now. Please try again shortly.",
+            "level4_error"
+        )
+```
+
+## Logging Fallback Events
+
+Every fallback event should be logged for alerting and post-incident analysis:
+
+```python
+import logging
+
+fallback_logger = logging.getLogger("model_fallback")
+
+def logged_complete(router: ThreeLevelFallback, messages: list) -> str:
+    response, source = router.complete(messages)
+
+    if source != "level1_equivalent":
+        fallback_logger.warning(
+            "Model fallback triggered",
+            extra={
+                "primary_model": router.primary,
+                "fallback_source": source,
+                "message_count": len(messages),
+            }
+        )
+
+    return response
+```
+
+Set an alert if fallback rate exceeds 1–2% of requests — that indicates a systemic provider problem, not just occasional blips.

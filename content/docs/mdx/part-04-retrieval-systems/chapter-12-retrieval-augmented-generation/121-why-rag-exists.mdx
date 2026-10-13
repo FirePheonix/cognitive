@@ -5,5 +5,90 @@ lastUpdatedDate: '2026-08-05'
 
 # 12.1 Why RAG Exists
 
-This section covers the details of 12.1 Why RAG Exists.
+LLMs have two fundamental knowledge limitations: a **training cutoff** and no access to **private data**. RAG (Retrieval-Augmented Generation) solves both at query time — without retraining.
 
+## The Two Problems RAG Solves
+
+### Problem 1: Knowledge Cutoff
+
+An LLM trained in early 2024 knows nothing about events after that date. You cannot ask it about yesterday's outage, last week's API changes, or the latest research paper. The model's weights are frozen.
+
+### Problem 2: Private Data
+
+Your internal documentation, customer data, codebase, and proprietary content were not in the training data. The model has no knowledge of anything behind your firewall.
+
+## The RAG Solution
+
+At query time, retrieve relevant documents from your knowledge base and inject them into the context. The LLM answers using both its world knowledge and the retrieved material.
+
+```
+User asks: "What changed in our API v3.2 release?"
+          │
+          ▼
+  Embed the question → query vector
+          │
+          ▼
+  Search vector store for similar chunks
+          │
+          ▼
+  Retrieved: release-notes-v3.2.md (similarity: 0.94)
+             migration-guide-v3.md (similarity: 0.87)
+          │
+          ▼
+  Inject into context:
+    "Using this documentation: [retrieved chunks]
+     Answer: What changed in our API v3.2 release?"
+          │
+          ▼
+  LLM answers with grounding in your actual docs
+```
+
+## RAG vs. Fine-Tuning vs. Training
+
+| Approach | Up-to-date? | Private data? | Cost | Auditability |
+|---|---|---|---|---|
+| **Base LLM** | No (cutoff) | No | Low | None |
+| **Fine-tuning** | After training | Yes (baked in) | High (training runs) | Limited |
+| **RAG** | Yes (refresh index) | Yes (from store) | Low (retrieval only) | High (see what was retrieved) |
+
+RAG wins on three dimensions:
+- **Cheaper** than fine-tuning — no training runs, just index updates
+- **More up-to-date** — add a new document, it's immediately retrievable
+- **More auditable** — you can show the user exactly which sources grounded the answer
+
+## The Core Pipeline
+
+```python
+def rag_pipeline(user_query: str) -> str:
+    # 1. Embed the query
+    query_embedding = embed(user_query)
+
+    # 2. Retrieve relevant chunks
+    chunks = vector_store.similarity_search(
+        query_embedding,
+        k=5,
+        filter={"source": "internal_docs"},
+    )
+
+    # 3. Build context
+    context = "\n\n---\n\n".join(chunk.content for chunk in chunks)
+
+    # 4. Generate grounded answer
+    response = llm.complete(
+        system="Answer using only the provided context. If the context doesn't contain the answer, say so.",
+        user=f"Context:\n{context}\n\nQuestion: {user_query}",
+    )
+
+    return response
+```
+
+## When RAG is Not the Answer
+
+RAG is not a universal solution:
+
+| Situation | Better approach |
+|---|---|
+| Agent needs deep behavioral change | Fine-tuning |
+| Knowledge fits in context (< 20 pages) | Just include it in the system prompt |
+| Knowledge is truly static and public | LLM may already know it |
+| You need sub-100ms latency | RAG adds retrieval latency |

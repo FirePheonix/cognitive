@@ -5,5 +5,169 @@ lastUpdatedDate: '2026-08-05'
 
 # 8.5 Output Repair
 
-This section covers the details of 8.5 Output Repair.
+When validation fails, your first instinct might be to throw away the output and retry from scratch. Don't. The model's broken output usually contains most of what you need — a few malformed tokens are preventing a valid parse. Repair first; retry only if repair fails.
 
+## Repair Strategy 1: Regex Repair
+
+Fix the most common syntax problems with targeted regex patterns. This is fast (~1ms), cheap, and handles the majority of real-world failures:
+
+```python
+import re
+import json
+
+def regex_repair(text: str) -> str:
+    """Fix common JSON syntax issues."""
+    # Remove markdown code fences
+    text = re.sub(r'^```(?:json)?\s*', '', text.strip())
+    text = re.sub(r'\s*```$', '', text.strip())
+
+    # Strip leading/trailing non-JSON text
+    # Find the first { or [ and the last } or ]
+    start = min(
+        (text.find(c) for c in ['{', '['] if c in text),
+        default=0
+    )
+    end = max(
+        (text.rfind(c) for c in ['}', ']'] if c in text),
+        default=len(text)
+    )
+    text = text[start:end + 1]
+
+    # Fix trailing commas before } or ]
+    text = re.sub(r',\s*([}\]])', r'\1', text)
+
+    # Fix single-quoted strings (naive — won't handle apostrophes in values)
+    # Only do this if double-quote parse fails
+    try:
+        json.loads(text)
+        return text  # Already valid
+    except json.JSONDecodeError:
+        pass
+
+    # Replace single quotes with double quotes for keys
+    text = re.sub(r"'([^']*)'(\s*:)", r'"\1"\2', text)
+
+    return text
+
+
+def try_repair(raw: str) -> dict | None:
+    repaired = regex_repair(raw)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        return None
+```
+
+## Repair Strategy 2: LLM Repair
+
+When regex repair fails, use a small fast model to fix the JSON. Haiku or Flash at ~$0.001 per call:
+
+```python
+def llm_repair(broken_json: str, schema_str: str, client) -> str:
+    """Use a small model to repair broken JSON."""
+    repair_prompt = f"""The following is broken JSON that failed to parse.
+Fix it so it is valid JSON matching this schema:
+
+Schema:
+{schema_str}
+
+Broken JSON:
+{broken_json}
+
+Return ONLY the fixed JSON. No explanation. No markdown fences."""
+
+    response = client.messages.create(
+        model="claude-haiku-4-5",   # Small, fast, cheap
+        max_tokens=2048,
+        messages=[{"role": "user", "content": repair_prompt}],
+    )
+    return response.content[0].text
+
+
+def try_llm_repair(raw: str, schema_str: str, client) -> dict | None:
+    repaired = llm_repair(raw, schema_str, client)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        return None
+```
+
+## Repair Strategy 3: Partial Parsing
+
+If the JSON is truncated or structurally broken, extract whatever fields you can get with targeted regex:
+
+```python
+def partial_parse(raw: str) -> dict:
+    """Extract individual fields when full parse is impossible."""
+    result = {}
+
+    # Extract string fields
+    for field in ["title", "summary", "confidence"]:
+        match = re.search(rf'"{field}"\s*:\s*"([^"]*)"', raw)
+        if match:
+            result[field] = match.group(1)
+
+    # Extract array fields
+    for field in ["findings", "sources"]:
+        match = re.search(rf'"{field}"\s*:\s*\[(.*?)\]', raw, re.DOTALL)
+        if match:
+            items = re.findall(r'"([^"]*)"', match.group(1))
+            result[field] = items
+
+    return result
+```
+
+Partial parsing is a last resort — you're working with an incomplete object. Use it to salvage what you can before falling back to a retry.
+
+## The Repair Loop
+
+Chain the strategies in order of cost:
+
+```python
+from pydantic import ValidationError, BaseModel
+import json
+
+def parse_with_repair(raw: str, model: type[BaseModel], client) -> BaseModel | None:
+    """
+    Three-stage repair pipeline:
+    1. Direct parse (no repair needed)
+    2. Regex repair
+    3. LLM repair
+    """
+    schema_str = json.dumps(model.model_json_schema(), indent=2)
+
+    # Stage 1: Direct parse
+    try:
+        return model.model_validate_json(raw)
+    except (ValidationError, json.JSONDecodeError):
+        pass
+
+    # Stage 2: Regex repair
+    regex_fixed = regex_repair(raw)
+    try:
+        return model.model_validate_json(regex_fixed)
+    except (ValidationError, json.JSONDecodeError):
+        pass
+
+    # Stage 3: LLM repair
+    llm_fixed = llm_repair(raw, schema_str, client)
+    try:
+        return model.model_validate_json(llm_fixed)
+    except (ValidationError, json.JSONDecodeError):
+        pass
+
+    # All repair attempts failed
+    return None
+```
+
+## When to Repair vs When to Retry
+
+| Situation | Action |
+|---|---|
+| Syntax error (trailing comma, single quotes) | Regex repair |
+| Valid JSON, wrong schema (missing required field) | LLM repair or retry with error |
+| Truncated output | Retry with shorter output schema or higher `max_tokens` |
+| Model refused entirely | Retry with different prompt |
+| Repeated failures | Retry with stronger model |
+
+Repair is cheaper than a full retry — you save one API call per successful repair. At scale, this matters.

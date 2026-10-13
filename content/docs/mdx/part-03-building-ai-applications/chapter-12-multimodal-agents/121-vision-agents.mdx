@@ -1,0 +1,281 @@
+---
+title: '12.1 Vision Agents'
+lastUpdatedDate: '2026-08-05'
+---
+
+# 12.1 Vision Agents
+
+Vision agents can look at what a human would look at — a screenshot, a photo, a scanned form — and reason about it. This section covers the API mechanics, the practical applications, and the edge cases that trip up new builders.
+
+## Sending Images to LLMs
+
+Every major frontier model accepts images as part of the message content array. Instead of a plain string, you pass a list of content blocks where each block is either `text` or an image.
+
+### OpenAI Vision API
+
+```python
+import base64
+import openai
+
+client = openai.OpenAI()
+
+# Load and encode image
+with open("screenshot.png", "rb") as f:
+    image_data = base64.b64encode(f.read()).decode("utf-8")
+
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "What's in this screenshot? Are there any errors?"
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{image_data}"
+                    }
+                }
+            ]
+        }
+    ],
+    max_tokens=1024
+)
+
+print(response.choices[0].message.content)
+```
+
+You can also pass a public URL instead of base64-encoded data:
+
+```python
+{
+    "type": "image_url",
+    "image_url": {
+        "url": "https://example.com/screenshot.png",
+        "detail": "high"  # "low", "high", or "auto"
+    }
+}
+```
+
+The `detail` parameter matters for cost and accuracy. `"low"` uses a fixed 85-token budget for the image regardless of size — fast and cheap, good for simple questions. `"high"` tiles the image and processes each tile separately — expensive, but reads small text and fine detail accurately.
+
+### Anthropic Vision API
+
+Anthropic's structure is slightly different — images go in a `source` block rather than `image_url`:
+
+```python
+import anthropic
+import base64
+
+client = anthropic.Anthropic()
+
+with open("screenshot.png", "rb") as f:
+    image_data = base64.b64encode(f.read()).decode("utf-8")
+
+response = client.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=1024,
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image_data
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": "Describe what you see. Flag any errors, broken UI elements, or anomalies."
+                }
+            ]
+        }
+    ]
+)
+
+print(response.content[0].text)
+```
+
+Anthropic also supports `"url"` as a source type for publicly accessible images:
+
+```python
+{
+    "type": "image",
+    "source": {
+        "type": "url",
+        "url": "https://example.com/screenshot.png"
+    }
+}
+```
+
+### Supported Image Formats
+
+| Format | OpenAI | Anthropic |
+|---|---|---|
+| PNG | ✅ | ✅ |
+| JPEG | ✅ | ✅ |
+| GIF (first frame) | ✅ | ❌ |
+| WebP | ✅ | ✅ |
+
+For agent work, PNG is the safest default — lossless compression means text in screenshots stays readable.
+
+## Practical Application: UI Testing Agent
+
+A UI testing agent takes a screenshot of the rendered page and asks the model to identify visual anomalies. This catches things that Playwright assertions miss: misaligned elements, truncated text, overlapping components, and wrong colors.
+
+```python
+import subprocess
+import base64
+from pathlib import Path
+import openai
+
+client = openai.OpenAI()
+
+def take_screenshot(url: str, output_path: str = "screenshot.png") -> str:
+    """Use Playwright CLI to capture a screenshot."""
+    subprocess.run(
+        ["playwright", "screenshot", "--full-page", url, output_path],
+        check=True
+    )
+    return output_path
+
+def analyze_ui(screenshot_path: str, context: str = "") -> dict:
+    """Ask GPT-4o to analyze the screenshot for UI issues."""
+    with open(screenshot_path, "rb") as f:
+        image_data = base64.b64encode(f.read()).decode("utf-8")
+
+    prompt = f"""You are a UI quality reviewer. Examine this screenshot carefully.
+
+Context: {context if context else 'No additional context provided.'}
+
+Report:
+1. Any broken or misaligned elements
+2. Text that is truncated or overflowing
+3. Missing images or broken icons
+4. Color or contrast issues
+5. Overall visual assessment (pass/fail)
+
+Be specific — include element descriptions and approximate positions."""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{image_data}",
+                            "detail": "high"
+                        }
+                    }
+                ]
+            }
+        ],
+        max_tokens=1024
+    )
+
+    text = response.choices[0].message.content
+    passed = "pass" in text.lower() and "fail" not in text.lower()
+    return {"passed": passed, "report": text}
+
+
+# Example usage
+result = analyze_ui(
+    take_screenshot("http://localhost:3000/dashboard"),
+    context="This is the main dashboard after a user logs in."
+)
+
+if not result["passed"]:
+    print("UI issues detected:")
+    print(result["report"])
+```
+
+## Practical Application: Code Review with Screenshots
+
+Some bugs only manifest visually. A code review agent that also accepts screenshots can correlate source code with rendered output:
+
+```python
+def code_review_with_screenshot(
+    diff: str,
+    screenshot_path: str | None = None
+) -> str:
+    content = [
+        {
+            "type": "text",
+            "text": f"""Review this code diff. Identify bugs, style issues, and potential problems.
+
+```diff
+{diff}
+```
+
+{'A screenshot of the rendered result is attached.' if screenshot_path else ''}"""
+        }
+    ]
+
+    if screenshot_path:
+        with open(screenshot_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/png;base64,{image_data}",
+                "detail": "high"
+            }
+        })
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": content}],
+        max_tokens=2048
+    )
+
+    return response.choices[0].message.content
+```
+
+## Vision Costs and Token Counting
+
+Images are not free. OpenAI's tile-based pricing:
+
+| Mode | Tokens | Approximate Cost (GPT-4o) |
+|---|---|---|
+| `"low"` | 85 tokens | ~$0.00013 |
+| `"high"` (512×512 tile) | 170 tokens | ~$0.00026 |
+| Full 1920×1080 screenshot | ~1,105 tokens | ~$0.0017 |
+
+At high volume (10,000 screenshots/day), image costs dominate. Mitigation strategies:
+
+1. **Downscale before sending** — a 960×540 screenshot costs half what a 1920×1080 one does, and models read UI elements just fine at half resolution
+2. **Crop to relevant region** — if you only care about the header, crop to 200px height before encoding
+3. **Use `"low"` for classification** — is the page broken yes/no? Use low detail. If yes, re-run with `"high"` for the detailed report
+
+```python
+from PIL import Image
+
+def downscale_for_vision(path: str, max_width: int = 1280) -> str:
+    """Downscale image to reduce vision API costs."""
+    img = Image.open(path)
+    if img.width > max_width:
+        ratio = max_width / img.width
+        new_size = (max_width, int(img.height * ratio))
+        img = img.resize(new_size, Image.LANCZOS)
+    
+    output_path = path.replace(".png", "_scaled.png")
+    img.save(output_path, optimize=True)
+    return output_path
+```
+
+## Key Takeaways
+
+- Both OpenAI and Anthropic accept base64-encoded images or URLs in content arrays
+- Use `"high"` detail when reading text in screenshots; `"low"` for coarse visual classification
+- Vision costs add up — downscale and crop before sending
+- Vision agents unlock UI testing, scanned document reading, and visual code review that text-only agents cannot do

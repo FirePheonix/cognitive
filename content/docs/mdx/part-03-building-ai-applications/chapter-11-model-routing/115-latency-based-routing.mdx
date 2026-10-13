@@ -5,5 +5,193 @@ lastUpdatedDate: '2026-08-05'
 
 # 11.5 Latency-Based Routing
 
-This section covers the details of 11.5 Latency-Based Routing.
+For latency-sensitive paths, use the fastest model that meets your quality requirements. More capable models are generally slower — routing by latency means trading some quality headroom for response time.
 
+## Approximate Latencies (2026)
+
+These are first-token latency (TTFT) + generation time for a typical ~300 token response. Your actual numbers will vary by load, region, and prompt size.
+
+| Model | Approximate total latency |
+|---|---|
+| Gemini Flash 2.0 | ~200ms |
+| Claude Haiku 4.5 | ~300ms |
+| GPT-4o | ~500ms |
+| Claude Sonnet 4.6 | ~800ms |
+| Llama 3 (local, 8B, GPU) | ~400ms |
+| Claude Opus 4.5 | ~2,000ms |
+
+Measure your own latencies under realistic load. Provider latencies fluctuate significantly based on time of day and their infrastructure state.
+
+## Latency Measurement
+
+```python
+import time
+import statistics
+from typing import Callable
+
+def measure_latency(
+    model_fn: Callable,
+    prompt: str,
+    n_samples: int = 20,
+) -> dict:
+    latencies = []
+    for _ in range(n_samples):
+        start = time.time()
+        model_fn(prompt)
+        latencies.append((time.time() - start) * 1000)
+
+    return {
+        "p50_ms": statistics.median(latencies),
+        "p95_ms": statistics.quantiles(latencies, n=20)[-1],  # 95th percentile
+        "p99_ms": statistics.quantiles(latencies, n=100)[-1],
+        "mean_ms": statistics.mean(latencies),
+    }
+```
+
+Always measure p95 and p99, not just the mean. Tail latencies matter for user experience.
+
+## The Latency-Quality Routing Decision
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class ModelProfile:
+    name: str
+    p50_latency_ms: float
+    quality_score: float  # 0–1, your benchmark result for this task
+
+# Order by latency (fastest first)
+MODEL_PROFILES = [
+    ModelProfile("gemini/gemini-2.0-flash", p50_latency_ms=200, quality_score=0.91),
+    ModelProfile("claude-haiku-4-5",         p50_latency_ms=300, quality_score=0.87),
+    ModelProfile("gpt-4o",                   p50_latency_ms=500, quality_score=0.96),
+    ModelProfile("claude-sonnet-4-6",        p50_latency_ms=800, quality_score=0.95),
+]
+
+def latency_route(
+    max_latency_ms: float,
+    min_quality: float = 0.90,
+) -> str:
+    """
+    Find the fastest model that meets both latency and quality requirements.
+    """
+    candidates = [
+        m for m in MODEL_PROFILES
+        if m.p50_latency_ms <= max_latency_ms and m.quality_score >= min_quality
+    ]
+
+    if not candidates:
+        # No model meets both constraints — relax quality
+        candidates = [m for m in MODEL_PROFILES if m.p50_latency_ms <= max_latency_ms]
+
+    if not candidates:
+        # Latency constraint is too tight — use the fastest available
+        return min(MODEL_PROFILES, key=lambda m: m.p50_latency_ms).name
+
+    # Return the fastest qualifying model
+    return min(candidates, key=lambda m: m.p50_latency_ms).name
+```
+
+## Streaming for Perceived Latency
+
+Streaming doesn't reduce actual time-to-complete — it reduces *perceived* latency by showing the user partial output as it generates. For user-facing applications, always stream:
+
+```python
+from openai import OpenAI
+
+client = OpenAI()
+
+def stream_response(messages: list):
+    """Stream tokens as they're generated."""
+    with client.chat.completions.stream(
+        model="gpt-4o",
+        messages=messages,
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)  # Print each token as it arrives
+
+        # Access final message after stream completes
+        final = stream.get_final_message()
+    return final.content
+```
+
+For agents that produce structured output: stream the response but buffer and validate the complete output before acting on it.
+
+## The Guardrail Latency Problem
+
+Your guardrails run *before* the main agent response. Their latency is additive:
+
+```
+Total latency = guardrail_1 + guardrail_2 + main_agent_latency
+
+With sequential guardrails:
+  regex check:     ~1ms
+  Haiku guardrail: ~300ms  ← adds to every request
+  main agent:      ~500ms
+  Total:           ~801ms
+```
+
+This is why guardrail layer selection matters. A Haiku guardrail costs 300ms per request. An Opus guardrail would cost 2000ms — unacceptable for real-time use.
+
+Run guardrails in parallel when possible:
+
+```python
+import asyncio
+
+async def parallel_guardrails(content: str) -> dict:
+    """Run multiple guardrail checks concurrently."""
+
+    async def regex_check():
+        return check_with_regex(content)  # ~1ms
+
+    async def llm_safety_check():
+        return await haiku_safety_check(content)  # ~300ms
+
+    async def pii_detection():
+        return await haiku_pii_check(content)  # ~300ms
+
+    results = await asyncio.gather(
+        regex_check(),
+        llm_safety_check(),
+        pii_detection(),
+    )
+
+    return {
+        "regex": results[0],
+        "safety": results[1],
+        "pii": results[2],
+    }
+
+# With parallel guardrails:
+# Total latency = max(1ms, 300ms, 300ms) + main_agent = 300ms + 500ms = ~800ms
+# vs sequential: 1ms + 300ms + 300ms + 500ms = ~1101ms
+```
+
+## Caching for Latency
+
+Cache responses for identical or near-identical inputs. The fastest model call is the one you don't make:
+
+```python
+import hashlib
+import json
+from functools import lru_cache
+
+def cache_key(model: str, messages: list) -> str:
+    payload = json.dumps({"model": model, "messages": messages}, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+response_cache = {}
+
+def cached_complete(model: str, messages: list) -> str:
+    key = cache_key(model, messages)
+
+    if key in response_cache:
+        return response_cache[key]  # 0ms — cache hit
+
+    result = call_model(model, messages)
+    response_cache[key] = result
+    return result
+```
+
+Caching is most effective for: routing classification (same phrasing → same route), guardrail checks on common safe inputs, and static document Q&A.

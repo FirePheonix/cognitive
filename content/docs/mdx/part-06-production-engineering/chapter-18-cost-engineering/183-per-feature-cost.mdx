@@ -5,5 +5,95 @@ lastUpdatedDate: '2026-08-05'
 
 # 18.3 Per-Feature Cost
 
-This section covers the details of 18.3 Per-Feature Cost.
+Calculate the **fully-loaded cost** of one use of each feature. This is the number that drives pricing decisions, budget allocations, and optimization priorities.
 
+## The Fully-Loaded Cost Breakdown
+
+Example — a code review feature:
+
+```
+Code Review — Fully-Loaded Cost: $0.040 per use
+─────────────────────────────────────────────
+Component          Calls    Cost
+─────────────────────────────────────────────
+Guardrail check     1       $0.001   (Haiku, fast classifier)
+Agent turn 1        1       $0.010   (Sonnet, analyze code)
+Tool: code_scanner  1       $0.000   (local tool, no LLM cost)
+Agent turn 2        1       $0.010   (Sonnet, process results)
+Agent turn 3        1       $0.010   (Sonnet, write review)
+Eval loop judge     1       $0.009   (Haiku, quality check)
+─────────────────────────────────────────────
+Total               6       $0.040
+```
+
+That $0.040 is not an estimate — it is measured from your cost attribution data (see [18.2 Cost Attribution](/docs/part-06-production-engineering/chapter-18-cost-engineering/182-cost-attribution)).
+
+## The Benchmark Cost Reporter
+
+From `atlas-agents/ch07_model_portability/benchmark.py:218` — this benchmark runs each task type against multiple models and reports cost per model per task:
+
+```python
+# atlas-agents/ch07_model_portability/benchmark.py:218
+def benchmark_model_costs(
+    models: list[str],
+    task_types: list[str],
+    eval_cases: list[EvalCase],
+) -> CostBenchmarkReport:
+    results = {}
+    for model in models:
+        results[model] = {}
+        for task_type in task_types:
+            cases = [c for c in eval_cases if c.category == task_type]
+            costs = []
+            scores = []
+            for case in cases:
+                response, cost = run_with_cost_tracking(model, case.input)
+                score = evaluate(case, response)
+                costs.append(cost)
+                scores.append(score)
+            results[model][task_type] = {
+                "avg_cost": sum(costs) / len(costs),
+                "avg_score": sum(scores) / len(scores),
+                "cost_per_quality_point": sum(costs) / sum(scores),
+            }
+    return CostBenchmarkReport(results=results)
+```
+
+## Benchmark Output — Choose the Right Model
+
+```
+Model Cost Benchmark — code_review task
+────────────────────────────────────────────────────────────────
+Model                   Avg Cost    Avg Score   Cost/Quality
+────────────────────────────────────────────────────────────────
+gpt-4o                  $0.085      4.8         $0.018
+claude-sonnet-4-6       $0.042      4.7         $0.009  ← best value
+claude-haiku-4-5        $0.008      3.9         $0.002  ← acceptable?
+gpt-4o-mini             $0.006      3.7         $0.002
+gemini-flash-1.5        $0.004      3.5         $0.001
+────────────────────────────────────────────────────────────────
+```
+
+If your quality threshold is ≥ 4.0, Claude Sonnet is the cost-optimal choice. If you can tolerate 3.9, Haiku is 5× cheaper for the same task.
+
+## Setting Per-Feature Budgets
+
+Once you know per-feature cost, set budgets:
+
+```python
+FEATURE_COST_BUDGETS = {
+    "simple_qa":       0.005,   # Haiku, no tools
+    "code_review":     0.050,   # Sonnet, 3 turns
+    "research_agent":  0.200,   # Sonnet, multiple tools, large context
+    "newsletter_crew": 0.500,   # Multi-agent pipeline
+}
+
+def enforce_budget(feature: str, current_cost: float) -> bool:
+    budget = FEATURE_COST_BUDGETS.get(feature, 0.100)
+    if current_cost > budget:
+        logger.error(f"Feature {feature} exceeded budget: ${current_cost:.4f} > ${budget:.4f}")
+        raise CostBudgetExceededError(feature=feature, cost=current_cost, budget=budget)
+    return True
+```
+
+Alert when a feature regularly hits its budget — it's a signal that the implementation needs optimization, not that the budget should increase.

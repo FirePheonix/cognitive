@@ -5,5 +5,150 @@ lastUpdatedDate: '2026-08-05'
 
 # 2.7 Conversation Memory
 
-This section covers the details of 2.7 Conversation Memory.
+By default, every conversation with an LLM starts from zero. The model has no idea who you are, what you worked on yesterday, or what preferences you've expressed in the past. This is fine for a one-shot question answering system. It's a problem for any agent you expect to work with over time.
 
+Memory is how you fix this. Not by making the model "remember" things — the model can't do that — but by building a system around it that captures important information and injects it back in when relevant.
+
+---
+
+## Three Tiers of Memory
+
+### Tier 1: Short-Term Memory (Current Conversation)
+
+This is the message list — the raw back-and-forth of the current session. The model can see everything in the current context window, so this "memory" is automatic. No special infrastructure needed.
+
+The limitation: it resets when the session ends, and it fills up quickly (see [Section 2.6](/docs/part-01-foundations/chapter-02-context-engineering/26-context-compression) on compression).
+
+```python
+# Short-term memory is just the messages list
+messages = [
+    {"role": "system", "content": system_prompt},
+    {"role": "user", "content": "How do I fix the Redis timeout?"},
+    {"role": "assistant", "content": "The issue is in auth/tokens.py line 87..."},
+]
+```
+
+### Tier 2: Episodic Memory (Records of Past Sessions)
+
+Facts extracted from previous conversations and stored in a key-value store. When a new session starts, relevant facts are retrieved and injected into the context.
+
+This is where things like user preferences, established project context, and past decisions live. It's not the full conversation history — it's the extracted signal from those conversations.
+
+```python
+# Simple episodic memory using a JSON store
+def save_memory(user_id: str, fact: str, category: str):
+    memory_path = MEMORY_DIR / f"{user_id}.json"
+    memories = json.loads(memory_path.read_text()) if memory_path.exists() else []
+    memories.append({
+        "fact": fact,
+        "category": category,
+        "timestamp": datetime.now().isoformat(),
+    })
+    memory_path.write_text(json.dumps(memories, indent=2))
+
+def load_memories(user_id: str, limit: int = 10) -> list[str]:
+    memory_path = MEMORY_DIR / f"{user_id}.json"
+    if not memory_path.exists():
+        return []
+    memories = json.loads(memory_path.read_text())
+    # Return most recent facts
+    return [m["fact"] for m in memories[-limit:]]
+```
+
+### Tier 3: Semantic Memory (Domain Knowledge)
+
+Vector-indexed knowledge that can be searched by meaning. This is where you store things like documentation, code patterns, product knowledge, and anything where "find the most relevant piece" is the right retrieval strategy.
+
+From `atlas-agents/ch11_memory/memory_agent.py:164` — Atlas v0.11 uses ChromaDB with two collections:
+
+```python
+import chromadb
+
+client = chromadb.PersistentClient(path=".atlas_memory")
+
+# Two collections: preferences (episodic) and knowledge (semantic)
+preferences = client.get_or_create_collection("preferences")
+knowledge = client.get_or_create_collection("knowledge")
+
+# Store a user preference
+preferences.add(
+    documents=["User prefers technical depth over brevity"],
+    metadatas=[{"type": "preference", "timestamp": "2025-03-15"}],
+    ids=["mem-001"]
+)
+
+# Store a domain fact
+knowledge.add(
+    documents=["The refresh token TTL is set in config/redis.py, key REFRESH_TOKEN_TTL"],
+    metadatas=[{"type": "fact", "project": "user-service"}],
+    ids=["know-001"]
+)
+
+# Query for relevant memories
+results = preferences.query(
+    query_texts=["how detailed should responses be?"],
+    n_results=3
+)
+```
+
+---
+
+## Auto-Extracting Memories
+
+Manually deciding what to remember is a chore. The better approach: use a cheap model (Claude Haiku, GPT-4o-mini) to automatically extract memorable facts from each conversation turn.
+
+```python
+def extract_memories(conversation: list[dict], model: str = "claude-haiku-3-5") -> list[str]:
+    extraction_prompt = """
+    Review this conversation and extract facts worth remembering long-term.
+    Focus on: user preferences, project-specific facts, decisions made, errors encountered.
+    Ignore: pleasantries, routine tool calls, temporary state.
+    
+    Return a JSON list of strings. Each string is one memorable fact.
+    If nothing is worth remembering, return [].
+    
+    Conversation:
+    """ + format_messages(conversation)
+    
+    response = call_model(model, extraction_prompt)
+    return json.loads(response)
+```
+
+Run this at the end of each session (or every N turns for long sessions). The extracted facts feed into your episodic memory store. The cost is small — a few hundred tokens to a cheap model — and the payoff is an agent that feels like it knows you.
+
+---
+
+## Memory Injection at Session Start
+
+When a new session starts, pull relevant memories and inject them into the context:
+
+```python
+def build_memory_context(user_id: str, current_task: str) -> str:
+    # Get episodic memories (most recent)
+    recent_facts = load_memories(user_id, limit=5)
+    
+    # Get semantically relevant knowledge
+    relevant_knowledge = knowledge.query(
+        query_texts=[current_task],
+        n_results=3
+    )["documents"][0]
+    
+    if not recent_facts and not relevant_knowledge:
+        return ""
+    
+    parts = ["=== Memory ==="]
+    if recent_facts:
+        parts.append("Known about this user:\n" + "\n".join(f"- {f}" for f in recent_facts))
+    if relevant_knowledge:
+        parts.append("Relevant knowledge:\n" + "\n".join(f"- {k}" for k in relevant_knowledge))
+    
+    return "\n".join(parts)
+```
+
+This block gets injected as Layer 3 of the system prompt (context injection). The model now walks into every session with a brief but meaningful picture of who it's working with and what it already knows about the current project.
+
+---
+
+## A Note on Privacy
+
+Memory systems are powerful, and that power cuts both ways. Store only what you'd be comfortable showing the user in a "here's what we remember about you" screen. Build a clear deletion mechanism from day one. Memory without transparency erodes trust quickly.

@@ -5,5 +5,125 @@ lastUpdatedDate: '2026-08-05'
 
 # 10.5 Memory
 
-This section covers the details of 10.5 Memory.
+## The Problem
 
+An LLM has no memory between API calls. Every time you call the API, it starts fresh — it has no idea what happened in previous sessions unless you explicitly give it that context.
+
+For a one-off query, this is fine. For an agent that's supposed to know your preferences, remember past research, or accumulate knowledge over time, you need to build memory into the system.
+
+## Three Memory Tiers
+
+Every production agent needs at least two of these. Most need all three.
+
+| Tier | What it holds | Lifetime | Typical tool |
+|---|---|---|---|
+| **Short-term** | Current conversation — everything that's happened in this session | Single session | Message list |
+| **Episodic** | Past interactions — "last Tuesday the user asked about X and we concluded Y" | Cross-session | Key-value store (Redis, DynamoDB) |
+| **Semantic** | Domain knowledge — facts, documents, embeddings | Permanent | Vector store (ChromaDB, Qdrant) |
+
+Each tier answers a different question:
+
+- Short-term: *"What have we talked about so far today?"*
+- Episodic: *"Have I worked with this user before? What did I learn?"*
+- Semantic: *"What do I know about this topic from my knowledge base?"*
+
+## Short-Term Memory: The Message List
+
+You already know this one. The list of `{"role": ..., "content": ...}` dicts you pass to the API *is* the short-term memory. Every tool result, every user message, every assistant response is appended to the list.
+
+The constraint: context windows are finite. A long session eventually exceeds the limit. Common mitigations:
+
+```python
+# Option 1: Keep only the last N messages (sliding window)
+messages = messages[-20:]
+
+# Option 2: Summarize older messages into a single summary block
+if len(messages) > 30:
+    summary = summarize(messages[:20])
+    messages = [{"role": "system", "content": f"Summary: {summary}"}] + messages[20:]
+```
+
+## Semantic Memory: ChromaDB Collections
+
+From `atlas-agents/ch11_memory/memory_agent.py:164`, Atlas v0.11 uses ChromaDB with two collections:
+
+- `preferences` — what the user likes, dislikes, and prefers
+- `knowledge` — facts learned during past sessions
+
+At the start of each turn, the three most relevant memories are retrieved and injected into the system prompt:
+
+```python
+# From atlas-agents/ch11_memory/memory_agent.py
+def recall_memories(query: str, n_results: int = 3) -> list[str]:
+    """Retrieve the most relevant memories for the current query."""
+    results = memory_collection.query(
+        query_texts=[query],
+        n_results=n_results
+    )
+    return results["documents"][0]  # Top-3 relevant memories
+
+# Injected into the prompt:
+# "Relevant memories:
+# - User prefers Python over JavaScript
+# - Last session: researched LangGraph state machines
+# - User is working on a production deployment for healthcare"
+```
+
+At the end of each turn, new information is extracted and stored:
+
+```python
+def extract_and_store_memories(conversation: str) -> None:
+    """Use a cheap model to extract memorable facts from the conversation."""
+    new_facts = claude_haiku.extract_facts(conversation)
+    for fact in new_facts:
+        memory_collection.add(documents=[fact], ids=[uuid4().hex])
+```
+
+Claude Haiku is used for extraction — it's fast and cheap, and extracting facts doesn't require a powerful model.
+
+## Episodic Memory: The Scratchpad
+
+For within-session state — findings, intermediate results, decisions — a structured scratchpad works well. From `atlas-agents/ch11_memory/memory_agent.py`:
+
+```python
+# From atlas-agents/ch11_memory/memory_agent.py
+def update_scratchpad(section: str, content: str) -> str:
+    """Keep a structured record of key findings this session."""
+    text = SCRATCHPAD.read_text() if SCRATCHPAD.exists() else ""
+    # Update section in-place — don't append, overwrite
+    ...
+```
+
+The key design choice is **overwrite, don't append**. A scratchpad that accumulates all revisions becomes noise. The current best version of each section is what matters.
+
+## Memory Decay
+
+Not all memories should be equal forever. `atlas-agents/ch11_memory/online/memory_decay.py:115` implements a scoring function that weights memories by recency and access frequency:
+
+```python
+# Simplified from atlas-agents/ch11_memory/online/memory_decay.py
+import math
+
+def memory_score(memory: dict, now: datetime) -> float:
+    age_days = (now - memory["last_accessed"]).days
+    access_count = memory["access_count"]
+
+    recency_score = math.exp(-age_days / 30)          # Decays over ~30 days
+    frequency_score = math.log1p(access_count) / 10   # Boosts frequently used memories
+
+    return 0.7 * recency_score + 0.3 * frequency_score
+```
+
+A memory accessed yesterday scores roughly `0.59`. The same memory, untouched for 6 months, scores roughly `0.03`. When retrieving memories, sort by this score and take the top N.
+
+This matters at scale. An agent with years of episodic memory can't inject all of it into every prompt. Decay scoring ensures the most relevant memories bubble to the top.
+
+## Practical Advice
+
+**Start with short-term only.** Most agents don't need cross-session memory on day one. Add episodic and semantic memory when users start complaining that "it doesn't remember anything."
+
+**Be selective about what you store.** Not every message deserves to be a memory. Store facts, preferences, and conclusions — not every intermediate tool call result.
+
+**Separate retrieval from injection.** The step that fetches memories and the step that decides which ones to include are separate concerns. You might retrieve 20 candidates and inject only the 3 most relevant.
+
+**Test memory retrieval explicitly.** Vector search is not deterministic. Write tests that verify your key memories are retrieved when expected. A preference that's never retrieved is the same as no preference.

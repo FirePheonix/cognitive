@@ -179,6 +179,8 @@ The entire source sentence — no matter how long — was compressed into a sing
 
 The paper itself acknowledged the issue: performance degraded significantly on sentences longer than about 20 words. You can see it in the gradient experiment from Chapter 9 — information from early tokens fades. The encoder "forgets" the beginning of the sentence by the time it finishes reading the end.
 
+![The Bottleneck That Wouldn't Go Away — seq2seq compresses an entire variable-length source sentence into a single fixed-size context vector; BLEU score vs. sentence length shows sharp degradation without attention, with attention closing the gap by 12+ BLEU points on long sentences](/appendix-b/10-seq2seq-and-the-context-vector/seq2seq-bottleneck.png)
+
 ```notebook
 {
   "title": "The context vector bottleneck — performance degrades with sentence length",
@@ -251,3 +253,20 @@ Appendix C covers exactly how that weighting works, how it evolved into self-att
 - The fundamental limitation: long sequences can't be adequately compressed into a single fixed-size vector. Translation quality degrades sharply on sentences longer than ~20 tokens.
 - Bahdanau et al. (2015) identified this as a bottleneck and introduced **attention**: instead of one context vector, give the decoder access to all encoder hidden states, weighted dynamically at each step.
 - That attention mechanism — and the realization that you could remove the RNN entirely and do everything with attention — is the story of Appendix C.
+
+---
+
+### The Formal Probability Model of Seq2Seq
+
+**The formal model:** Seq2Seq factorizes the translation probability as:
+$$P(y_{1:n} \mid x_{1:m}) = \prod_t P(y_t \mid y_{<t}, h^{\text{enc}})$$
+The encoder compresses the full source sentence into $h^{\text{enc}}$. The decoder generates the target language one word at a time, conditioned on both what it's already generated and the encoder's summary.
+
+**Why the fixed vector is a bottleneck:**
+If you're translating a 50-word sentence, the encoder tries to cram all 50 words' worth of meaning into a single vector of maybe 512 numbers. The longer the sentence, the more information is lost. Empirically, Seq2Seq models perform well for short sentences (under 15 words) and degrade significantly on longer ones.
+
+The bottleneck is structural: the decoder only gets access to the *final* hidden state of the encoder. Earlier parts of the source sentence are diluted through all the subsequent hidden state updates.
+
+This is exactly the problem that attention was designed to fix. Instead of giving the decoder one fixed vector, attention lets the decoder look back at all encoder hidden states and decide which parts of the source to focus on at each generation step.
+
+> **The direct line from Seq2Seq to Transformers:** The evolution is: RNN language model → Seq2Seq with fixed vector → Seq2Seq with attention → Transformer (attention without RNNs at all). Each step addressed a specific failure mode of the previous one. Understanding why each step was necessary is understanding why transformers work.

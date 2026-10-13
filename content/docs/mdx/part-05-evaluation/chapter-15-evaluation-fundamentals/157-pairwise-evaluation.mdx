@@ -5,5 +5,118 @@ lastUpdatedDate: '2026-08-05'
 
 # 15.7 Pairwise Evaluation
 
-This section covers the details of 15.7 Pairwise Evaluation.
+Instead of asking "rate this answer from 1 to 5," ask "which is better, A or B?"
 
+Comparative judgment is more consistent than absolute scoring. Humans and LLMs both find it easier to compare two options than to assign a precise number to one in isolation.
+
+## Why Pairwise Works Better
+
+When scoring in isolation, evaluators anchor on arbitrary reference points. When comparing two responses, they focus on concrete differences — which answer is more complete, more accurate, clearer.
+
+```
+Absolute scoring:
+  "This is a pretty good answer... I'll say 3.5? Or maybe 4?"
+
+Pairwise:
+  "Answer A covers all three aspects of the question. Answer B only covers two
+   and has an error in the third. Answer A is better."
+```
+
+The pairwise judgment is grounded in specific observations. The absolute score is a guess dressed up as a measurement.
+
+## The Tournament Bracket
+
+To rank multiple versions, run round-robin comparisons:
+
+```
+3 versions: A, B, C
+Run:  A vs B → A wins
+      B vs C → C wins
+      A vs C → A wins
+
+Rankings: A (2 wins) > C (1 win) > B (0 wins)
+```
+
+This produces a stable ranking. A single "A vs B" comparison only tells you the relative order of two — the bracket tells you the global order across all versions.
+
+Use pairwise evaluation for:
+- Comparing **prompt versions** (current vs. proposed)
+- Comparing **model upgrades** (GPT-4o vs. Claude Sonnet)
+- Comparing **response strategies** (step-by-step vs. direct answer)
+
+## Multi-Judge Consensus
+
+From `atlas-agents/ch18_evaluation/online/multi_judge_consensus.py`:
+
+The reference implementation uses three judges:
+- Claude Sonnet
+- Claude Haiku
+- Gemini Flash
+
+Each judge independently picks A or B. The final verdict requires **90%+ agreement** (i.e., all three must agree, or the case is flagged as ambiguous).
+
+```python
+# atlas-agents/ch18_evaluation/online/multi_judge_consensus.py
+def pairwise_consensus(question: str, answer_a: str, answer_b: str) -> PairwiseResult:
+    judges = [
+        ("claude-sonnet-4-6", claude_client),
+        ("claude-haiku-4-5", claude_client),
+        ("gemini-flash-1.5", gemini_client),
+    ]
+
+    votes = []
+    for model, client in judges:
+        winner = pairwise_judge(client, model, question, answer_a, answer_b)
+        votes.append(winner)  # "A", "B", or "tie"
+
+    a_count = votes.count("A")
+    b_count = votes.count("B")
+    total = len(votes)
+
+    if a_count / total >= 0.90:
+        return PairwiseResult(winner="A", confidence="high", votes=votes)
+    elif b_count / total >= 0.90:
+        return PairwiseResult(winner="B", confidence="high", votes=votes)
+    else:
+        return PairwiseResult(winner="ambiguous", confidence="low", votes=votes)
+```
+
+Ambiguous cases (where judges split) are escalated to human review — exactly the same escalation logic as in [15.5 Human Evaluation](/docs/part-05-evaluation/chapter-15-evaluation-fundamentals/155-human-evaluation).
+
+## Pairwise Prompt Template
+
+```python
+PAIRWISE_PROMPT = """
+You are evaluating two AI responses to the same question.
+
+Question: {question}
+
+Response A:
+{answer_a}
+
+Response B:
+{answer_b}
+
+Which response is better? Consider: accuracy, completeness, clarity, and absence of hallucinations.
+
+First explain your reasoning. Then output exactly one of: "A", "B", or "tie".
+"""
+```
+
+## Limitations
+
+Pairwise evaluation has one weakness: **position bias**. LLM judges tend to favor whichever answer appears first. To counteract this:
+
+```python
+# Run each pair twice with positions swapped
+result_ab = pairwise_judge(question, answer_a, answer_b)
+result_ba = pairwise_judge(question, answer_b, answer_a)
+
+# A win is only confirmed if A wins when presented first AND when presented second
+if result_ab.winner == "A" and result_ba.winner == "B":
+    confirmed_winner = "A"
+elif result_ab.winner == "B" and result_ba.winner == "A":
+    confirmed_winner = "B"
+else:
+    confirmed_winner = "ambiguous"  # Position influenced the result
+```

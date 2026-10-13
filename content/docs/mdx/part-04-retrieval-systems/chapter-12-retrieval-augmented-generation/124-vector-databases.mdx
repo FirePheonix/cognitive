@@ -5,5 +5,138 @@ lastUpdatedDate: '2026-08-05'
 
 # 12.4 Vector Databases
 
-This section covers the details of 12.4 Vector Databases.
+A vector database stores embeddings and finds the most semantically similar ones to a query vector. It is the retrieval engine at the core of every RAG system.
 
+## ChromaDB — Local Development
+
+ChromaDB is the right choice when you're building and testing locally. Zero infrastructure, simple API, persists to disk.
+
+From `atlas-agents/ch11_memory/memory_agent.py`:
+
+```python
+import chromadb
+
+# Persistent local store — survives restarts
+client = chromadb.PersistentClient(path="./chroma_db")
+
+collection = client.get_or_create_collection(
+    name="agent_memory",
+    metadata={"hnsw:space": "cosine"},  # Cosine similarity for text
+)
+
+# Add documents
+collection.add(
+    documents=["The API uses OAuth 2.0 for authentication."],
+    embeddings=[embed("The API uses OAuth 2.0 for authentication.")],
+    metadatas=[{"source": "api_docs", "section": "auth"}],
+    ids=["doc_001"],
+)
+
+# Search
+results = collection.query(
+    query_embeddings=[embed("How do I authenticate?")],
+    n_results=5,
+)
+```
+
+ChromaDB limitations: single-node only, no distributed deployment, no production SLAs. Use it for development, not for serving production traffic.
+
+## Qdrant — Production
+
+Qdrant is purpose-built for production vector search. Distributed, persistent, fast, and supports hybrid search (dense + sparse vectors).
+
+From `atlas-agents/ch11_memory`:
+
+```python
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+
+# Connect to Qdrant server
+qclient = QdrantClient(url="http://localhost:6333")
+
+# Create collection with explicit configuration
+qclient.create_collection(
+    collection_name="agent_memory",
+    vectors_config=VectorParams(
+        size=1536,                # Must match your embedding model's dimensions
+        distance=Distance.COSINE, # Standard for text embeddings
+    ),
+)
+
+# Add vectors
+qclient.upsert(
+    collection_name="agent_memory",
+    points=[
+        PointStruct(
+            id=1,
+            vector=embed("The API uses OAuth 2.0 for authentication."),
+            payload={
+                "content": "The API uses OAuth 2.0 for authentication.",
+                "source": "api_docs",
+                "section": "auth",
+                "created_at": "2026-08-05",
+            },
+        )
+    ],
+)
+
+# Search
+results = qclient.search(
+    collection_name="agent_memory",
+    query_vector=embed("How do I authenticate?"),
+    limit=5,
+    with_payload=True,
+)
+```
+
+### Why `Distance.COSINE`?
+
+Cosine distance measures the **angle** between two vectors — not their magnitude. This is correct for text embeddings because:
+
+- Two documents about "Python authentication" should be similar regardless of length
+- Cosine similarity normalizes for document length automatically
+- Alternative `Distance.EUCLID` (Euclidean) penalizes length differences inappropriately for text
+
+## Choosing Between ChromaDB and Qdrant
+
+| Factor | ChromaDB | Qdrant |
+|---|---|---|
+| Setup | Zero config | Docker or cloud |
+| Local dev | Perfect | Overkill |
+| Production | Not recommended | Production-ready |
+| Scale | Single node | Distributed |
+| Hybrid search | Limited | Native support |
+| Filtering | Basic | Rich payload filtering |
+| Persistence | Local disk | Distributed storage |
+
+## The Migration Path
+
+Start with ChromaDB during development. When you're ready for production, migrate to Qdrant:
+
+```python
+def migrate_chroma_to_qdrant(
+    chroma_collection,
+    qdrant_client: QdrantClient,
+    collection_name: str,
+):
+    # Export all data from ChromaDB
+    all_data = chroma_collection.get(include=["documents", "embeddings", "metadatas"])
+
+    # Import to Qdrant in batches
+    batch_size = 100
+    for i in range(0, len(all_data["ids"]), batch_size):
+        batch_ids = all_data["ids"][i:i + batch_size]
+        batch_embeddings = all_data["embeddings"][i:i + batch_size]
+        batch_metadatas = all_data["metadatas"][i:i + batch_size]
+        batch_documents = all_data["documents"][i:i + batch_size]
+
+        points = [
+            PointStruct(
+                id=int(hashlib.sha256(id_.encode()).hexdigest()[:8], 16),
+                vector=emb,
+                payload={**meta, "content": doc},
+            )
+            for id_, emb, meta, doc in zip(batch_ids, batch_embeddings, batch_metadatas, batch_documents)
+        ]
+        qdrant_client.upsert(collection_name=collection_name, points=points)
+```
