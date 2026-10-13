@@ -576,6 +576,31 @@ function recipes(name: string, params: Record<string, any>, dark: boolean) {
 
 // ─── Component ─────────────────────────────────────────────────────────────────
 
+const PLOTLY_CDN = 'https://cdn.plot.ly/plotly-2.35.2.min.js';
+
+/** Load Plotly from CDN once, reuse thereafter */
+function loadPlotly(): Promise<any> {
+  if (typeof window === 'undefined') return Promise.resolve(null);
+  const w = window as any;
+  if (w.Plotly) return Promise.resolve(w.Plotly);
+
+  return new Promise((resolve, reject) => {
+    // If already injecting, wait for the existing script
+    const existing = document.querySelector<HTMLScriptElement>('script[data-plotly-cdn]');
+    if (existing) {
+      existing.addEventListener('load', () => resolve(w.Plotly));
+      existing.addEventListener('error', reject);
+      return;
+    }
+    const script = document.createElement('script');
+    script.setAttribute('data-plotly-cdn', '');
+    script.src = PLOTLY_CDN;
+    script.onload  = () => resolve(w.Plotly);
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+}
+
 export function PlotlyInitializer({ html }: { html: string }) {
   const { resolvedTheme } = useTheme();
 
@@ -584,7 +609,8 @@ export function PlotlyInitializer({ html }: { html: string }) {
     if (!charts.length) return;
     const dark = resolvedTheme === 'dark';
 
-    import('plotly.js-dist-min').then((Plotly: any) => {
+    loadPlotly().then((Plotly: any) => {
+      if (!Plotly) return;
       charts.forEach((el) => {
         const script = el.querySelector<HTMLScriptElement>('script[type="application/json"]');
         if (!script) return;
@@ -599,7 +625,7 @@ export function PlotlyInitializer({ html }: { html: string }) {
           });
         } catch (e) { console.error('Plotly:', e); }
       });
-    });
+    }).catch(e => console.error('Failed to load Plotly from CDN:', e));
   }, [html, resolvedTheme]);
 
   return null;
