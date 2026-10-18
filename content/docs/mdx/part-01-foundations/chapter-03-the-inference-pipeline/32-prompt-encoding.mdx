@@ -22,6 +22,9 @@ Tokenization gives you integers. But integers can't go directly into a Transform
 [final embeddings for Transformer layer 1]
 ```
 
+![IDs become vectors, then positions get mixed in](/part-01/chapter-03/embed-plus-position.png)
+*Fig: Lookup is a gather from a table of shape vocab × d. GPT-style models add a learned position vector; Llama-style models rotate Q and K by an angle that depends on index (RoPE). Mix tokenizers and ID 5 means a different row.*
+
 Every token ID is looked up in an **embedding table** — a learned matrix of shape `[vocab_size × d_model]`. For GPT-4 class models, `d_model` is likely 4096–12288 dimensions. For smaller models like Llama-3-8B, it's 4096.
 
 ## Embeddings: Vectors That Carry Meaning

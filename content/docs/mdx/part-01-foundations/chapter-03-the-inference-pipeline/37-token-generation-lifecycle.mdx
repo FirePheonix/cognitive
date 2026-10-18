@@ -26,6 +26,9 @@ flowchart TD
     K --> M["Return to user"]
 ```
 
+![Two phases, two different machines: prefill is compute-bound, decode is bandwidth-bound](/part-01/chapter-03/two-bottlenecks.png)
+*Fig: Throwing FLOPs at decode does little. Throwing HBM bandwidth at prefill does little. Match the lever to the bound.*
+
 ## Step-by-Step Breakdown
 
 ### Step 1: Tokenization
@@ -174,6 +177,9 @@ Timeline (not to scale):
               compute-bound        First token                          Memory-BW bound
               scales w/ prompt     reaches client                       scales w/ output len
 ```
+
+![Where the milliseconds go: network, prefill, first token, then a long decode](/part-01/chapter-03/latency-timeline.png)
+*Fig: Typical 1K-prompt plus 500-token answer. Users judge TTFT (the first token). Finance judges the whole bar. Shorten or cache the prompt to move TTFT. Quantize, batch, or speculate to move tokens per second.*
 
 ## Summary
 

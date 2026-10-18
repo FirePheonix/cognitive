@@ -44,6 +44,9 @@ flowchart TD
     G -->|Yes| I["Return full generated text"]
 ```
 
+![Decode: embed last token, attend with the cache, sample, append, loop](/part-01/chapter-03/decode-one-step.png)
+*Fig: You cannot emit token n+1 before token n exists. Stop on EOS, max_tokens, or a stop string. Always set max_tokens.*
+
 ## Why Decode Is Memory-Bandwidth Bound
 
 This surprises most people when they first hear it: during decode, the GPU is **not** compute-bound. It's **memory-bandwidth bound**.
@@ -66,6 +69,9 @@ For a 7B model decode step:
   Time to actually compute: <1 ms worth of FLOPs
   → bottleneck is memory, not compute
 ```
+
+![Decode is waiting on memory, not math: 14 GB of weights over 2000 GB/s is about 7 ms](/part-01/chapter-03/decode-memory-bandwidth.png)
+*Fig: An A100's ALUs sit idle. Quantization and batching help decode more than "a faster core." int4 is one-quarter the bytes. A bigger batch shares the read.*
 
 This has important consequences:
 
@@ -102,6 +108,9 @@ After 50 decode steps:
 After 1000 decode steps:
   KV cache: [1100 × layers × heads × head_dim]
 ```
+
+![The KV cache grows one row per generated token](/part-01/chapter-03/kv-cache-grows.png)
+*Fig: After a 100-token prefill you hold 100 rows. A thousand generated tokens later you hold 1,100. Ballpark: about 1 MB per 1K tokens for 7B fp16, about 8 MB per 1K for 70B.*
 
 For a 7B model at fp16, the KV cache uses roughly 1 MB per 1K tokens. For a 70B model, ~8 MB per 1K tokens. Long outputs on large models create real memory pressure.
 

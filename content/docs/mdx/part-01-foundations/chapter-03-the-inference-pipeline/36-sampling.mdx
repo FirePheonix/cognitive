@@ -31,6 +31,9 @@ Token         Logit    Probability
 ... (50,000 more tokens, mostly near 0)
 ```
 
+![Sampling step 1: softmax turns three logits into a distribution](/part-01/chapter-03/sample-step-1-softmax.png)
+*Fig: Worked on a three-word vocab so you can do it on paper. Production is 50k–150k of the same recipe. mat is the mode; the long tail in the table above is everything else.*
+
 ## Temperature: Controlling Sharpness
 
 Temperature `T` is applied **before** softmax by dividing logits:
@@ -60,6 +63,9 @@ Temperature = 2.0 (flat):
   "mat": 12%, "floor": 11%, "couch": 10%, "the": 9%, "xyz": 1%, ...
 ```
 
+![Sampling step 2: temperature divides logits before softmax, T = 0.5 vs 1 vs 2](/part-01/chapter-03/sample-step-2-temperature.png)
+*Fig: Same logits 8.2, 7.1, 6.8. After dividing by 0.5, mat is about 0.85. After dividing by 2, mat is about 0.48 — the gap that made mat obvious is almost gone. Structured JSON wants T = 0.*
+
 **Temperature = 0** is a special case: it's equivalent to `argmax` — always pick the single highest-probability token. This makes generation fully **deterministic** (same prompt → same output, every time). Essential for reproducible tests and structured output parsers.
 
 > Note: Most providers implement temperature=0 as a very small epsilon (~0.00001) rather than true 0, for numerical stability. The behavior is effectively identical.
@@ -81,6 +87,9 @@ Sort tokens by probability (descending):
 With top-p=0.9: only sample from ["mat", "floor", "couch", "roof", "sofa", "bed"]
 Renormalize probabilities within this set, then sample.
 ```
+
+![Sampling step 3: top-p keeps adding until cumulative mass reaches 0.90](/part-01/chapter-03/sample-step-3-topp.png)
+*Fig: Same running sum as the table above. Include the token that crosses 0.90 (bed), drop the rest, re-normalize, then sample. Top-k = 5 would have dropped bed — that is why nucleus adapts and a hard k does not.*
 
 **Why top-p is useful**: it adapts to the model's confidence. When the model is very confident (one token has 95% probability), only 1–2 tokens are in the nucleus. When the model is uncertain (many tokens have similar probabilities), more tokens are included. This provides a natural quality floor.
 
@@ -117,6 +126,9 @@ Temperature, top-p, and top-k are typically applied in sequence:
 ```
 
 When top-p and top-k are both set, whichever is more restrictive wins.
+
+![Sampling step 4: logits, divide by T, softmax, top-k, top-p, re-normalize, draw](/part-01/chapter-03/sample-step-4-order.png)
+*Fig: If T = 0, later filters barely matter. If T > 0, top-p is a quality floor on the garbage tail. Tune one knob in production; leaving both "interesting" makes evals incomparable.*
 
 ## Practical Recommendations
 

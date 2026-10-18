@@ -48,6 +48,9 @@ data: {"choices":[{"delta":{"content":" brown"}}]}
 data: [DONE]
 ```
 
+![Streaming is deltas on a long HTTP connection: The, then quick, then brown, then DONE](/part-01/chapter-03/sse-deltas.png)
+*Fig: Perceived latency is time-to-first-token. Total time is still decode times output length. Tool-call JSON is unusable until the object is complete — accumulate, then execute.*
+
 Each `data:` line is a JSON object with a delta — the incremental content. The connection stays open until `[DONE]` is sent.
 
 ### Chunked Transfer Encoding

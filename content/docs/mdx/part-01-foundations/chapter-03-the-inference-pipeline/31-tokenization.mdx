@@ -30,6 +30,9 @@ IDs:    [9906,    11,  1917,     0]
 
 Those integers — `[9906, 11, 1917, 0]` — are what the model actually receives. The mapping from string to integer is defined by the tokenizer's **vocabulary**, typically 50,000–150,000 entries.
 
+![The model never sees the string: Hello comma world bang becomes four integer IDs](/part-01/chapter-03/tokenize-hello-world.png)
+*Fig: Cost, context limits, and latency are counted in this unit — not in words. A token is roughly three-quarters of an English word. Count with tiktoken before you send.*
+
 ## Byte-Pair Encoding (BPE)
 
 BPE is the dominant tokenization algorithm for modern LLMs (GPT, Llama, Mistral, etc.). It works by:
@@ -62,6 +65,9 @@ Here's where tokenization has real cost and performance implications: **differen
 | Arabic | "الثعلب البني السريع" | 8–12 | 0.5–0.7 |
 
 English text is the most token-efficient because BPE vocabularies are trained predominantly on English. A Chinese prompt that conveys the same information as an English prompt can cost **2–3× more tokens**.
+
+![English is cheap; Chinese and Japanese pay a token tax per character](/part-01/chapter-03/language-token-tax.png)
+*Fig: Illustrative tokens-per-character from the table above. The same idea in Chinese can cost two to three times the money, the prefill, and the context.*
 
 This matters directly for:
 
@@ -116,6 +122,9 @@ A: 2  ← wrong, there are 3
 ```
 
 The model never "sees" individual characters unless the tokenizer happens to split them that way. Similarly:
+
+![Why counting r's in strawberry is a token problem, not a spelling problem](/part-01/chapter-03/strawberry-tokens.png)
+*Fig: You imagine ten letters. The model gets a handful of subword IDs. The r's are inside pieces, not counted. Anagrams and pig latin fail for the same reason.*
 
 - **Anagrams** — models can't reliably rearrange characters
 - **Pig latin** — requires manipulating first characters

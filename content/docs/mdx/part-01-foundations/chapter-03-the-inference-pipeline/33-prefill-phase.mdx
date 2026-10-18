@@ -27,6 +27,9 @@ sequenceDiagram
     Note over GPU: Prefill complete — ready to decode
 ```
 
+![Prefill: the whole prompt in one parallel pass, producing a KV cache](/part-01/chapter-03/prefill-kv-cache.png)
+*Fig: The thing you keep is not the first output token — it is keys and values for all prompt positions, at every layer and head. Compute-bound. Cost scales with prompt length, so TTFT on 128K can be tens of seconds.*
+
 The key word is **parallel**: all tokens are processed in the same forward pass. This is fundamentally different from the decode phase, where tokens are generated one at a time.
 
 ## What Prefill Produces: The KV Cache
@@ -122,6 +125,9 @@ The economics are significant:
 ```
 
 Put everything that doesn't change at the **top** of your prompt. Put user-specific, request-specific content at the bottom. This maximizes cache hit rate.
+
+![Prompt caching wants a stable prefix: system and examples first, user last](/part-01/chapter-03/prompt-cache-prefix.png)
+*Fig: Providers skip prefill when the leading tokens match a recent cache, byte-for-byte. Put the 2,000-token system prompt first. Put the user id and timestamp last, or you get a miss every call.*
 
 ## Multi-Turn Conversations and Prefill
 
