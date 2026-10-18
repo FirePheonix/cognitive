@@ -195,7 +195,13 @@ You have a loss. Now you need to figure out: which weights caused it? And in whi
 
 The answer is **backpropagation** — an algorithm that applies the chain rule of calculus backwards through the network. It computes the gradient of the loss with respect to every single weight. The gradient tells you: "if you increase this weight slightly, does the loss go up or down?"
 
-The math is deep but the implementation isn't. PyTorch does it automatically. You call `loss.backward()` and every parameter's `.grad` attribute gets filled in.
+The math is deep but the implementation isn't. PyTorch does it automatically. You call `loss.backward()` and every parameter's `.grad` attribute gets filled in. Before that, here is the whole story for **one neuron**, with numbers you can check on paper: input \(x = 2\), weight \(w = 0.4\), bias \(b = 0.2\), ReLU, target \(0\), learning rate \(0.1\).
+
+![One neuron, forward pass. z = wx + b = 0.8 + 0.2 = 1; y = ReLU(1) = 1; squared error L = ½(1 − 0)² = 0.5. The answer is too big; gradient descent will shrink w and b.](/appendix-b/07-how-neural-networks-learn/neuron-step-1-forward.png)
+
+![One neuron, backward pass. Chain rule right to left: ∂L/∂y = y − t = 1; ReLU′(1) = 1 so ∂L/∂z = 1; ∂L/∂w = 1 × x = 2; ∂L/∂b = 1. If z were ≤ 0 the ReLU path would be a dead zero.](/appendix-b/07-how-neural-networks-learn/neuron-step-2-backward.png)
+
+![One neuron, take a step. w ← 0.4 − 0.1×2 = 0.2; b ← 0.2 − 0.1×1 = 0.1. Next forward pass: z = 0.5, y = 0.5, L = 0.125 — already a quarter of 0.5.](/appendix-b/07-how-neural-networks-learn/neuron-step-3-update.png)
 
 ```notebook
 {
