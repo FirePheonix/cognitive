@@ -83,6 +83,12 @@ k=5: Only consider the top 5 tokens. Ignore the rest.
 
 Top-k is simple and effective but has a fixed threshold that doesn't adapt to the model's confidence. When the model is very confident (peaked distribution), k=50 still allows 49 unlikely alternatives. When the model is uncertain (flat distribution), k=50 might cut off reasonable choices.
 
+Using the same four-word distribution as the figure above (`the=0.70, a=0.20, my=0.06, purple=0.04`) and `k = 2`:
+
+![Top-k step 1. Keep the two biggest probabilities (the, a) and set my and purple to zero. Those two still had 10% of the mass; with a hard cutoff they can never be sampled this step.](/appendix-d/14-inference-and-text-generation/topk-step-1-keep-k.png)
+
+![Top-k step 2. Re-normalize what survived: divide by 0.70 + 0.20 = 0.90. P′(the) ≈ 0.78, P′(a) ≈ 0.22. Now you can sample.](/appendix-d/14-inference-and-text-generation/topk-step-2-renorm.png)
+
 ---
 
 ## Top-P (Nucleus) Sampling
@@ -96,6 +102,8 @@ top_p=0.90:  Keep [the, a] (cumsum: 0.70 + 0.20 = 0.90) — 2 tokens
 top_p=0.97:  Keep [the, a, my] (cumsum: 0.96) — 3 tokens
 top_p=0.99:  Keep [the, a, my, purple] (cumsum: 1.00) — 4 tokens
 ```
+
+![Top-p (nucleus): sort descending and keep adding until the running sum reaches p = 0.90. “the” (cum 0.70) still under, “a” hits 0.90 and we stop. “my” and “purple” drop. Include the token that crosses p, then re-normalize.](/appendix-d/14-inference-and-text-generation/topp-nucleus-cumsum.png)
 
 When the model is confident, top-p selects a small set (high confidence = fewer candidates needed to reach p). When the model is uncertain, top-p selects a larger set (spread distribution = more candidates needed).
 
