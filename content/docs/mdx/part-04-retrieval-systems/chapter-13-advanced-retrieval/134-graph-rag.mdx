@@ -211,3 +211,16 @@ Building a production knowledge graph is non-trivial:
 - **Entity resolution:** "Alice", "Alice Johnson", and "A. Johnson" may refer to the same person. Requires deduplication logic.
 - **Schema design:** Define your entity types and relationship types upfront. A freeform graph becomes unmaintainable.
 - **Update frequency:** Re-extracting from updated documents and merging changes into the graph is complex. Plan for it from the start.
+
+![Vector RAG answers from nearby chunks; GraphRAG answers from community summaries of entities and relations](/part-04/chapter-13/vector-vs-graphrag.png)
+*Fig: Edge et al. (2024) built the map first — entities, relations, community summaries — and queried the map. That indexing pass is the cost. Global questions (“what are the themes?”) are the reason to pay it.*
+
+<figure class="paper-shot">
+<img src="/part-04/chapter-13/papers/graphrag-2024-abstract.png" alt="Title and abstract of From Local to Global: A Graph RAG Approach to Query-Focused Summarization, Edge et al. 2024" />
+<figcaption>Edge, Trinh, Cheng, Bradley, Chao, Mody, Truitt &amp; Larson (2024), <em>From Local to Global: A Graph RAG Approach to Query-Focused Summarization</em>. <a href="https://arxiv.org/abs/2404.16130">arXiv:2404.16130</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-04/chapter-13/papers/graphrag-2024-figure.png" alt="First figure of the GraphRAG paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2404.16130">HTML version</a>.</figcaption>
+</figure>

@@ -145,3 +145,15 @@ Do you have fewer than ~30 pages of documents total?
 ```
 
 When in doubt, start with long context for its simplicity, measure quality and cost, then migrate to RAG if cost or quality becomes a problem.
+
+Liu et al. (2023) measured the failure mode hiding inside “just paste it”: models use the beginning and the end of a long context and miss the middle. A retrieved chunk placed at the end of the prompt is not the same as the same chunk buried at token 40,000.
+
+<figure class="paper-shot">
+<img src="/part-04/chapter-13/papers/lost-in-the-middle-2023-abstract.png" alt="Title and abstract of Lost in the Middle: How Language Models Use Long Contexts, Liu et al. 2023" />
+<figcaption>Liu, Lin, Hewitt, Paranjape, Bevilacqua, Petroni &amp; Liang (2023), <em>Lost in the Middle: How Language Models Use Long Contexts</em>. <a href="https://arxiv.org/abs/2307.03172">arXiv:2307.03172</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-04/chapter-13/papers/lost-in-the-middle-2023-figure.png" alt="First figure of Lost in the Middle" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2307.03172">HTML version</a>.</figcaption>
+</figure>

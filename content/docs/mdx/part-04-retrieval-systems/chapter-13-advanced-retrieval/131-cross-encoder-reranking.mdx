@@ -162,3 +162,16 @@ class TwoStageRetriever:
 ```
 
 The two-stage pattern is the production standard for quality-critical retrieval. Use it whenever answer quality is more important than minimizing retrieval latency.
+
+![A bi-encoder returns 50 passages and a cross-encoder keeps 5](/part-04/chapter-13/retrieve-then-rerank.png)
+*Fig: The bi-encoder is allowed to be a bit wrong because it is cheap. The cross-encoder reads the query and the passage together and is not.*
+
+<figure class="paper-shot">
+<img src="/part-04/chapter-13/papers/rerank-2019-abstract.png" alt="Title and abstract of Passage Re-ranking with BERT, Nogueira and Cho 2019" />
+<figcaption>Nogueira &amp; Cho (2019), <em>Passage Re-ranking with BERT</em>. <a href="https://arxiv.org/abs/1901.04085">arXiv:1901.04085</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-04/chapter-13/papers/rerank-2019-figure.png" alt="First figure of the passage re-ranking paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/1901.04085">HTML version</a>.</figcaption>
+</figure>
