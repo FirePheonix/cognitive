@@ -17,6 +17,8 @@ The standard transformer has a fixed cost per token: every token activates every
 
 **Mixture of Experts (MoE)** breaks this constraint.
 
+![MoE routing: a small router scores experts for each token, picks top-K, and only those FFNs run. Mixtral-8×7B keeps ~47B total parameters but ~13B active per token.](/appendix-g/28-the-future-of-language-models/moe-routing.png)
+
 ```text
 DENSE (standard) transformer:
   Token → embedding → [attention + FFN(all params)] × N layers → output

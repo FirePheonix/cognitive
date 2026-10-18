@@ -25,6 +25,8 @@ $$P(\text{statement is true} \mid \text{statement is generated})$$
 
 Fluent-looking text and true text are different things. The model produces text that is statistically likely to follow the prompt — which often happens to be true, but not because the model "checked." It's a fundamental objective mismatch baked in at training time.
 
+![Failure modes that do not vanish with scale: hallucination (a next-token model must emit something), sycophancy (RLHF can reward agreeing), and monoculture (one stack of models, many products).](/appendix-g/30-ai-impact-on-society/failure-modes.png)
+
 ```text
 The hallucination gap:
 

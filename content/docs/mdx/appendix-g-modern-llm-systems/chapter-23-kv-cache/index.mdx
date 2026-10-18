@@ -66,27 +66,9 @@ The KV cache stores the K and V tensors for every token that has already been pr
 2. **Append** them to the cache
 3. Use the full cached K and V history for the attention computation
 
-```text
-WITHOUT KV cache (step 4):
-  
-  compute K₁, V₁, K₂, V₂, K₃, V₃, K₄, V₄   ← all 4 positions
-  attention_scores = Q₄ @ [K₁, K₂, K₃, K₄]ᵀ / √d_k
-  output = softmax(scores) @ [V₁, V₂, V₃, V₄]
-  
-  Cost: 4 K/V computations this step
+![Without a KV cache, step 4 recomputes K and V for every previous token. With the cache, those tensors are reused and only the new position is computed. Same attention math, N× less K/V work by step N.](/appendix-g/23-kv-cache/kv-cache-reuse.png)
 
-WITH KV cache (step 4):
-  
-  cache already holds: K₁, V₁, K₂, V₂, K₃, V₃
-  compute only: K₄, V₄                         ← new token only
-  append to cache: [K₁..K₄], [V₁..V₄]
-  attention_scores = Q₄ @ [K₁..K₄]ᵀ / √d_k    ← same math, different source
-  output = softmax(scores) @ [V₁..V₄]
-  
-  Cost: 1 K/V computation this step
-  
-  At step N: constant 1 computation instead of N → N× speedup
-```
+![Decode as q₄ K_cacheᵀ. Cached K for The/cat/sat is 3×4; the new key is appended to 4×4. The new query (1×4) times Kᵀ (4×4) is one score row. Worked: q₄ · k_sat = [1,1,0,2]·[1,0,0,1] = 3. Then softmax and weights × V — another 1×d multiply, not a full n×n map.](/appendix-g/23-kv-cache/qk-cache-matmul.png)
 
 The outputs are **mathematically identical**. This isn't an approximation — it's memoization. The values stored in the cache are the exact same numbers you would have computed anyway.
 

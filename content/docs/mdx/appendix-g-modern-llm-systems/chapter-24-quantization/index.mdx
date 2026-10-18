@@ -17,19 +17,9 @@ Neural network computations are fundamentally floating-point. Floats can represe
 
 But at inference time, you don't need that full range. A trained model's weights have settled into a distribution that's much narrower. You can approximate that distribution with integers if you're smart about the mapping.
 
-```text
-float16 representation:
-  1 sign bit  +  5 exponent bits  +  10 mantissa bits  =  16 bits
-  Range: ±65,504   Precision: ~3 decimal digits
+![Symmetric int8: scale = max|x| / 127, q = round(x / scale) clipped to [−127, 127], x̂ = q × scale. A worked example maps [0.50, −1.20, 0.80, −0.30, 2.10] onto integers and back with tiny error. Beside it, memory for real models in fp16 vs int8 vs int4.](/appendix-g/24-quantization/int8-and-memory.png)
 
-int8 representation:
-  8 bits, range [-128, 127]
-  Only 256 distinct values
-
-But a typical transformer weight matrix has values roughly in [-2, 2].
-Map that range to [-127, 127] and you can represent it with int8.
-The question: how do you do that mapping well?
-```
+float16 uses 1 sign + 5 exponent + 10 mantissa bits (range ±65,504). int8 is 256 distinct values in [−128, 127]. A typical transformer weight matrix lives roughly in [−2, 2] — map that range onto [−127, 127] and you can store it as int8. The question: how do you do that mapping well?
 
 ---
 

@@ -17,6 +17,8 @@ But there's a clever workaround: what if you *guessed* the next several tokens w
 
 Here's the key observation: the large model is slow not because of the *number of tokens* it processes per forward pass — it's slow because of the *number of forward passes*. If you can get multiple tokens out of a single forward pass, you've won.
 
+![Speculative decoding: a small draft model guesses K tokens; the large target model verifies all K in one parallel pass. Accept the prefix that matches, sample a correction at the first reject. Output distribution matches the target model alone.](/appendix-g/25-speculative-decoding/draft-and-verify.png)
+
 ```text
 Normal autoregressive generation (generating 4 tokens):
 

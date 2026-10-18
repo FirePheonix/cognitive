@@ -17,22 +17,11 @@ This chapter is about the systems layer: how real inference servers handle concu
 
 Every LLM request has two distinct phases with completely different computational profiles:
 
-```text
-PREFILL (processing the prompt):
-  All prompt tokens processed in one forward pass, in parallel.
-  Compute-intensive: big matrix multiplies, high GPU utilization.
-  Duration: proportional to prompt length.
-  Example: 1,000-token prompt → maybe 0.3 seconds.
+![Prefill vs decode, then PagedAttention: the KV cache is split into fixed-size blocks (like OS pages) so a request's tokens can live anywhere in GPU memory instead of one contiguous slab that fragments.](/appendix-g/26-inference-systems-at-scale/prefill-decode-paging.png)
 
-DECODE (generating the response):
-  One token per forward pass, serially.
-  Memory-bandwidth-intensive: reads all model weights + KV cache each step.
-  Duration: proportional to response length × latency per token.
-  Example: 500-token response at 30ms/token → 15 seconds.
-  
-  GPU utilization during decode: often 30-50% of theoretical peak.
-  The bottleneck is reading data from GPU memory, not computation.
-```
+**Prefill** processes the whole prompt in one parallel forward pass — compute-heavy, high GPU utilization, duration proportional to prompt length (a 1,000-token prompt might take ~0.3s).
+
+**Decode** emits one token per forward pass — memory-bandwidth-heavy, often 30–50% of peak GPU, duration = response length × latency per token (500 tokens at 30ms is 15 seconds).
 
 These two phases have different resource requirements. Prefill wants GPU compute. Decode wants memory bandwidth and low-latency KV cache access. This mismatch is one reason serving LLMs efficiently is hard.
 
@@ -130,29 +119,7 @@ PagedAttention applies this to KV cache:
   No fragmentation (all blocks are identical size).
 ```
 
-```text
-Physical KV cache layout WITHOUT PagedAttention:
-
-  GPU memory:
-  ┌──────────────────┬──────────────┬────────────────────┬──────────────┐
-  │ Request A        │ Request B    │ [WASTED: internal]  │ Request C    │
-  │ (active, 600 tok)│(done, freed) │ (fragmented gaps)   │ (active)     │
-  └──────────────────┴──────────────┴────────────────────┴──────────────┘
-  New request needs 400 tokens → MAY NOT FIT despite total free space
-
-Physical KV cache layout WITH PagedAttention (block size = 16 tokens):
-
-  GPU memory (divided into fixed 16-token blocks):
-  ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
-  │A │A │A │ ←freed→  │C │C │ ←freed→  │A │ ←freed→  │D │
-  └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
-  
-  Request A's block table: [0, 1, 2, 12]   ← blocks scattered around but logically contiguous
-  Request D's block table: [17]             ← just got a free block anywhere
-  
-  New request needing 5 blocks? Take any 5 free blocks.
-  No fragmentation ever — free blocks are always usable.
-```
+The figure at the top of this chapter is that layout: contiguous slabs fragment; fixed-size KV blocks can sit anywhere, so a new request takes any free blocks.
 
 ```notebook
 {

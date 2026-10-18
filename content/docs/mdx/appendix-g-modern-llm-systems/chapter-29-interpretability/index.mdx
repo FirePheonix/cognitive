@@ -15,26 +15,11 @@ Interpretability is the field that tries to answer these questions — to unders
 
 Interpretability research works at three levels of granularity, each asking a different kind of question:
 
-```text
-Level 1 — Feature/Neuron
-  Question: What does this individual unit respond to?
-  Example: "Neuron 4,271 in layer 12 fires strongly when it sees
-            the word 'Paris' following a question about capitals."
-  Tool: maximum activation examples, activation histograms
+![From probes to sparse autoencoders: (1) a tiny classifier on frozen activations, (2) concept directions / CAVs, (3) named circuits such as induction heads. Superposition packs many facts into fewer neurons; SAEs try to unpack them into sparse, nameable features.](/appendix-g/29-interpretability/probes-to-saes.png)
 
-Level 2 — Representation
-  Question: What information is encoded in these hidden states?
-  Example: "The layer-8 residual stream contains enough information
-            to predict part-of-speech with 94% accuracy."
-  Tool: probing classifiers, linear representation analysis
-
-Level 3 — Circuit/Mechanistic
-  Question: What sequence of operations actually produces this output?
-  Example: "Heads 3.7 and 5.1 collaborate to copy the subject of
-            the sentence to the output position, regardless of
-            intervening tokens."
-  Tool: ablation studies, activation patching, causal tracing
-```
+1. **Feature / neuron** — what does this unit respond to? Tools: max-activating examples, histograms.
+2. **Representation** — what information is in these hidden states? Tools: probing classifiers, linear probes.
+3. **Circuit / mechanistic** — what sequence of operations produces the output? Tools: ablation, activation patching, causal tracing.
 
 These levels are not independent — a full mechanistic explanation requires understanding features, how they're combined into representations, and how circuits route information. In practice, most interpretability work focuses on one level at a time.
 

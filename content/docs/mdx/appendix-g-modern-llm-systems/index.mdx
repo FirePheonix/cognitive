@@ -45,18 +45,6 @@ Where the field is heading. Mixture of Experts (MoE): routing tokens to speciali
 
 ## The arc
 
-```
-Single-request efficiency:
-  KV Cache (Ch23) → Quantization (Ch24) → Speculative Decoding (Ch25)
-
-Multi-request systems:
-  Inference at Scale (Ch26): PagedAttention, continuous batching, prefix caching
-
-New capabilities:
-  Reasoning (Ch27): chain-of-thought, thinking models, test-time scaling
-
-Where it's going:
-  Future (Ch28): MoE, long context, multimodal, open problems
-```
+![Appendix G as a stack: KV cache, quantization, and speculative decoding for one request; PagedAttention and batching for many; chain-of-thought for new capabilities; MoE and long context for where the field is going.](/appendix-g/modern-llm-systems-arc.png)
 
 These aren't independent topics. KV cache pressure motivates GQA and PagedAttention. Quantization reduces the memory cost that constrains how many concurrent requests can be served. Speculative decoding requires enough VRAM to hold both draft and target models. Understanding any one properly requires knowing the constraints from the others.
