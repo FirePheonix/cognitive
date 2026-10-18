@@ -25,6 +25,8 @@ dot(a, b) = (1×4) + (2×5) + (3×6)
            =  32
 ```
 
+![Dot product by hand. Three pair-multiplies: 1×4 = 4, 2×5 = 10, 3×6 = 18, then add them to get 32. One number comes out; it is large when the two vectors point the same way.](/appendix-a/06-maths/dot-product-by-hand.png)
+
 One input (two vectors), one output (one number). Simple.
 
 **Why it matters:** the dot product measures how much two vectors "agree" — how much they point in the same direction. If `a` and `b` are parallel (pointing exactly the same way), the dot product is large and positive. If they're perpendicular (completely unrelated), it's zero. If they're opposite, it's negative.
@@ -73,6 +75,10 @@ C[0,1] = dot([1,2,3], [8,10,12]) = 8 + 20 + 36 = 64
 C[1,0] = dot([4,5,6], [7,9,11])  = 28 + 45 + 66 = 139
 C[1,1] = dot([4,5,6], [8,10,12]) = 32 + 50 + 72 = 154
 ```
+
+![Matmul step 1. The top-left cell of C is one dot: row 0 of A (yellow) with column 0 of B (blue). 1×7 + 2×9 + 3×11 = 58. The other three cells of C are still unknown.](/appendix-a/06-maths/matmul-step-1-one-cell.png)
+
+![Matmul step 2. Fill the rest the same way: C is 58 and 64 on the first row, 139 and 154 on the second. A neural-net layer is this picture with thousands of rows (the batch) and hundreds of columns (the next width).](/appendix-a/06-maths/matmul-step-2-all-cells.png)
 
 **Why it matters for neural networks:** every layer in a neural network is a matrix multiplication. The input is a tensor of shape `(batch, features_in)`. The layer's weight matrix has shape `(features_in, features_out)`. Multiply them and you get `(batch, features_out)` — a new representation of the same batch, transformed by the learned weights.
 
@@ -149,6 +155,12 @@ ReLU([-2, -1, 0, 1, 2]) = [0, 0, 0, 1, 2]
 softmax([2.0, 1.0, 0.5]) = [0.62, 0.23, 0.15]
                                 ↑ all positive, sum = 1.0
 ```
+
+![Softmax step 1 — exponentiate. Logits 2.0, 1.0, 0.5 for {the, a, cat} become e^z ≈ 7.39, 2.72, 1.65. Raw scores can be any real number; exp makes them positive.](/appendix-a/06-maths/softmax-step-1-exp.png)
+
+![Softmax step 2 — add them. 7.39 + 2.72 + 1.65 ≈ 11.76. That single sum Z is the denominator for every class.](/appendix-a/06-maths/softmax-step-2-sum.png)
+
+![Softmax step 3 — divide by the sum. Probabilities ≈ 0.63, 0.23, 0.14, which add to 1. If the true next token is “the”, cross-entropy is −log(0.63) ≈ 0.46.](/appendix-a/06-maths/softmax-step-3-divide.png)
 
 <iframe width="560" height="315" src="https://www.youtube.com/embed/TYNs2q6AGTo?si=e9UEJEphgPAvp23r" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
 
