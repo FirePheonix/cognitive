@@ -41,24 +41,13 @@ To fix this, you need training examples that say: "this response is better than 
 
 **Reinforcement Learning from Human Feedback (RLHF)** is the training pipeline used by OpenAI (ChatGPT), Anthropic (Claude), and others. It has three stages:
 
-```text
-Stage 1: Supervised Fine-Tuning (SFT)
-   ↓
-   Take the base model, fine-tune on curated instruction-response pairs
-   (Chapter 16). Output: SFT Model.
+![Classic RLHF in three stages — SFT, a reward model on chosen vs rejected replies, then PPO — next to DPO, which trains the same preference data as a classification loss on the policy and skips the separate reward model.](/appendix-e/18-alignment/rlhf-and-dpo.png)
 
-Stage 2: Train a Reward Model (RM)
-   ↓
-   Collect human preference data: (prompt, chosen response, rejected response)
-   Train a separate model that predicts which response humans prefer.
-   Output: Reward Model — a function that scores any (prompt, response) pair.
+1. **SFT** — fine-tune the base model on curated instruction–response pairs (Chapter 16).
+2. **Reward model** — humans pick chosen vs rejected; the RM scores any (prompt, response) pair (Bradley–Terry: $P(\text{chosen} \succ \text{rejected}) = \sigma(r_c - r_r)$).
+3. **PPO** — treat $r$ as a reward, with a KL penalty so the policy stays close to the SFT model.
 
-Stage 3: PPO — Fine-tune with Reinforcement Learning
-   ↓
-   Use the Reward Model as the "environment".
-   Update the SFT model to generate responses that get higher reward scores.
-   Output: Aligned Model.
-```
+**DPO** (Rafailov et al., 2023) rewrites that objective so you can train the chat model directly on the same preference data — no separate reward model, no PPO loop.
 
 ---
 

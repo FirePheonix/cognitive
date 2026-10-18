@@ -17,40 +17,15 @@ This is important enough to say explicitly: **GPT-3 and ChatGPT use the same tra
 
 What changed is the training:
 
-```text
-GPT-3 (base model):
-  Training data:  ~500B tokens of internet text (CommonCrawl, WebText, Books, Wikipedia)
-  Objective:      Next-token prediction
-  Result:         Knows an enormous amount; will complete any text pattern
-  Problem:        Doesn't know to answer questions; can be harmful; inconsistent
+![Same transformer, new training: GPT-3 completes internet patterns; InstructGPT/ChatGPT adds SFT then preference training. Right: what the model actually sees — system, user, then assistant tokens, wrapping “How do I reverse a list in Python?”.](/appendix-e/19-how-chatgpt-works/what-the-model-sees.png)
 
-ChatGPT (InstructGPT):
-  Stage 1 — SFT:    ~13,000 curated (instruction, response) pairs
-  Stage 2 — RM:     ~33,000 human preference comparisons
-  Stage 3 — PPO:    Fine-tune with reward signal from RM
-  Result:           Follows instructions, prefers helpful responses, avoids harm
-```
-
-The InstructGPT paper (Ouyang et al. 2022) found that a 1.3B model trained with RLHF was preferred by human raters over a 175B model trained only with supervised learning. Alignment training is extraordinarily data-efficient.
+GPT-3 trained on ~500B tokens of internet text to predict the next token. ChatGPT (InstructGPT) added ~13,000 SFT pairs, ~33,000 preference comparisons, then PPO. The InstructGPT paper (Ouyang et al. 2022) found that a 1.3B model trained with RLHF was preferred by human raters over a 175B model trained only with supervised learning. Alignment training is extraordinarily data-efficient.
 
 ---
 
 ## What a ChatGPT Request Actually Looks Like
 
-When you send a message to ChatGPT, what arrives at the model is not just your message. It's your message wrapped in a **conversation structure** that the model was trained to understand:
-
-```text
-What you type:                 What the model receives:
-────────────────               ────────────────────────────────────────────
-"How do I reverse a            <|im_start|>system
- list in Python?"              You are a helpful assistant.
-                               <|im_end|>
-                               <|im_start|>user
-                               How do I reverse a list in Python?
-                               <|im_end|>
-                               <|im_start|>assistant
-                               ← model generates from here
-```
+When you send a message to ChatGPT, what arrives at the model is not just your message. It's your message wrapped in a **conversation structure** that the model was trained to understand — the figure above is that wrap: system prompt, user turn, then the assistant block the model fills in.
 
 The model's job is to predict what comes after `<|im_start|>assistant\n`. Because it was trained on millions of examples where good responses follow this pattern, it produces a relevant, helpful answer.
 

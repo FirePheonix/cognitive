@@ -37,27 +37,6 @@ The last piece: how does a fine-tuned, aligned model become a conversational pro
 
 ## The conceptual arc
 
-```
-Pre-trained GPT              (Appendix D)
-     |
-     | Fine-tuning on curated conversations
-     |   loss masked to response tokens only
-     v
-SFT Model                    (Chapter 16)
-     |
-     | LoRA: train only low-rank adapters
-     |   100x fewer parameters, competitive quality
-     v
-Fine-tuned cheaply           (Chapter 17)
-     |
-     | RLHF or DPO: learn from human preferences
-     |   what's helpful, honest, harmless
-     v
-Aligned Model                (Chapter 18)
-     |
-     | Chat template + system prompt + conversation format
-     v
-ChatGPT / Claude / LLaMA-chat  (Chapter 19)
-```
+![Appendix E in five cards: a pre-trained GPT, SFT that imitates curated answers, LoRA adapters, RLHF/DPO preference training, then a chat product with a template and system prompt.](/appendix-e/from-gpt-to-chatgpt-arc.png)
 
 Same transformer architecture throughout. The difference is entirely in training.

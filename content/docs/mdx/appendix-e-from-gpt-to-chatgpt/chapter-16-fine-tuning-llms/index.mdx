@@ -31,28 +31,9 @@ But the objective is completion, not helpfulness. The model learned to continue 
 
 **Supervised Fine-Tuning** is the first step in turning a pre-trained model into an assistant. You take a dataset of curated (instruction, response) pairs and train the model to produce the right response given the instruction.
 
-```text
-Pre-training data:           Fine-tuning data:
---------------------         ---------------------
-"The cat sat on the mat."    Instruction: "Translate to French: Hello"
-"Paris is the capital of..."  Response: "Bonjour"
-"Scientists discovered that"  Instruction: "Summarize this article: ..."
-"stock markets fell today..."  Response: "The article discusses..."
-                              Instruction: "Write a Python function that..."
-                              Response: "def add(a, b):\n    return a + b"
-```
+![SFT uses the same five training steps as pre-training, but on (instruction, response) pairs. Loss masking: tokens of “Translate to French: Hello” are labelled −100 and skipped; only “Bonjour” and EOS contribute gradient.](/appendix-e/16-fine-tuning-llms/sft-and-loss-mask.png)
 
-The training loop is **identical** to pre-training:
-
-```text
-for each (instruction, response) pair:
-    1. Tokenize: [instruction tokens] + [response tokens]
-    2. Forward pass → logits
-    3. Compute cross-entropy loss
-    4. Backprop → update weights
-```
-
-Same five steps from Appendix D, Chapter 13. The only thing that changed is the dataset.
+The training loop is **identical** to pre-training — tokenize instruction + response, forward pass, cross-entropy, backprop. Same five steps from Appendix D, Chapter 13. The only thing that changed is the dataset.
 
 ---
 
@@ -62,25 +43,11 @@ Here's the subtle but critical part: you don't want to compute loss on the instr
 
 Think about it. The instruction "Translate to French: Hello" is the *input* — you gave it to the model. There's nothing to learn from predicting those tokens, because at inference time you won't ask the model to predict the question. You want it to predict the *answer*.
 
-If you compute loss over both instruction and response tokens:
+If you compute loss over both instruction and response tokens, the first five terms push the model to better predict "Translate to French: Hello" — which is useless and potentially harmful, since the model shouldn't expect to generate its own instructions at inference time.
 
-```text
-Input:  [Translate] [to] [French] [:] [Hello] [Bonjour]
-Loss:    L_1        L_2   L_3    L_4   L_5      L_6
-         ^------- wasted gradient --------^      ^useful
-```
+The fix: **mask the instruction tokens** in the labels by replacing them with `-100`. PyTorch's `CrossEntropyLoss` skips any position where the label is `-100`. Only the response tokens contribute gradient. The model learns to produce good responses given instructions.
 
-Those first five loss terms push the model to better predict "Translate to French: Hello" — which is useless and potentially harmful, since the model shouldn't expect to generate its own instructions at inference time.
-
-The fix: **mask the instruction tokens** in the labels by replacing them with `-100`. PyTorch's `CrossEntropyLoss` skips any position where the label is `-100`.
-
-```text
-Input IDs:   [Trans] [to] [French] [:] [Hello] [Bonjour] [<eos>]
-Labels:       [ -100] [-100] [-100] [-100] [-100]  [tok_id]  [<eos_id>]
-                ^---------- masked (ignored) ----------^  ^--- loss computed here
-```
-
-Only the response tokens contribute gradient. The model learns to produce good responses given instructions.
+![SFT logits matrix (5 positions × 4-word vocab). Prompt rows are labelled −100 and skipped. The last row is softmaxed; CE is −log p(Bonjour). Grey cells would have trained the model to emit its own question.](/appendix-e/16-fine-tuning-llms/sft-logits-mask.png)
 
 ```notebook
 {

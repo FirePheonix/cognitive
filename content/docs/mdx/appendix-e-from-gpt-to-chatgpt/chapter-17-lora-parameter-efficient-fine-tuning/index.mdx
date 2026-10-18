@@ -53,26 +53,11 @@ Low-rank decomposition:
 
 During the forward pass, the output is the sum of the frozen original path and the trainable LoRA side path:
 
-```text
-Without LoRA:
-  h = W @ x
-      ^─── frozen original weight
+![LoRA: freeze W and train a thin side path. W′ = W + (α/r)·AB. A 4096×4096 matrix is 16.8M numbers; rank-16 adapters are 131k. Forward: x goes through frozen W and through B then A; the two paths add. Memory for Llama-7B full fine-tuning ≈ 84 GB vs LoRA on a 24 GB GPU.](/appendix-e/17-lora-parameter-efficient-fine-tuning/lora-side-path.png)
 
-With LoRA:
-  h = W @ x  +  (alpha/r) * A @ (B @ x)
-      ^───────   ^──────────────────────
-      frozen     trainable side path
-      path       (A and B are the only learned params)
+$$h = Wx + \frac{\alpha}{r}\, A(Bx)$$
 
-  where:
-    W:     (d_out, d_in)  — FROZEN, not updated
-    B:     (r, d_in)      — trainable, initialized to ZERO
-    A:     (d_out, r)     — trainable, initialized randomly
-    alpha: scalar hyperparameter (controls scaling)
-    r:     rank (controls capacity; typical: 8, 16, 32, 64)
-```
-
-The `alpha/r` scaling factor normalizes the contribution relative to rank so that changing `r` doesn't require retuning the learning rate.
+$W$ stays frozen. $B$ is $(r, d_{\text{in}})$, initialized to zero; $A$ is $(d_{\text{out}}, r)$, initialized randomly. Typical ranks: 8, 16, 32, 64. The $\alpha/r$ scaling factor normalizes the contribution relative to rank so that changing $r$ doesn't require retuning the learning rate.
 
 **Why B=0 at initialization?** At training start, `A @ B = 0` (because B=0), so the LoRA side path contributes nothing. The model starts exactly as the pre-trained model, with no disruption. Training gradually moves B away from zero.
 
@@ -87,35 +72,9 @@ At initialization:            After training:
 
 ## Dimension Walkthrough
 
-Let's trace the shapes through a LoRA-wrapped linear layer with concrete numbers:
+Let's trace the shapes through a LoRA-wrapped linear layer with concrete numbers. The figure uses *d* = 4 and rank *r* = 2 so every cell fits on one page; the algebra is the same at 4096 × 16.
 
-```text
-Example: d_model=8, r=2, alpha=4
-
-Input x:  shape (8,)
-
-─── Original path (frozen) ───────────────────────────────
-W:        shape (8, 8)    ← 64 parameters, NOT updated
-W @ x:    (8,8) @ (8,)  = (8,)    ← original transformation
-
-─── LoRA side path (trainable) ────────────────────────────
-B:        shape (2, 8)    ← 16 parameters, updated by optimizer
-A:        shape (8, 2)    ← 16 parameters, updated by optimizer
-
-Step 1:   B @ x  =  (2,8) @ (8,)  =  (2,)   ← project to rank-r space
-Step 2:   A @ (B @ x)  =  (8,2) @ (2,)  =  (8,)   ← project back
-
-Scale:    (alpha/r) * A @ (B @ x)  =  (4/2) * ...  =  2 * (8,)
-
-─── Output ────────────────────────────────────────────────
-h = W @ x  +  2 * A @ B @ x
-    ─────     ───────────────
-    (8,)         (8,)
-         = (8,)  ← same shape as no-LoRA
-
-Parameters: 64 (frozen) + 16 + 16 = 96 total
-Trainable:  16 + 16 = 32   (33% of total, vs 100% in full fine-tuning)
-```
+![LoRA by hand. A (4×2) times B (2×4) equals a rank-2 4×4 with repeated rows. Forward: Bx is 2×1, A(Bx) is 4×1, add to Wx (here W = I). At init B = 0 so the side path is zero.](/appendix-e/17-lora-parameter-efficient-fine-tuning/lora-by-hand.png)
 
 In practice with d_model=4096, r=16:
 - Original layer: 16,777,216 params — frozen
