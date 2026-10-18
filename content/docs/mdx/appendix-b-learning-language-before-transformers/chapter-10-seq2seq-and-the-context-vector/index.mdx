@@ -24,6 +24,28 @@ The insight in Sutskever, Vinyals, and Le's 2014 paper "Sequence to Sequence Lea
 
 The summary vector is called the **context vector**. It's the bridge between the two networks.
 
+Two 2014 papers introduced the picture, a few months apart. Cho et al. named the RNN encoder–decoder; Sutskever, Vinyals and Le showed a deep LSTM could beat phrase-based translation.
+
+<figure class="paper-shot">
+<img src="/appendix-b/10-seq2seq-and-the-context-vector/papers/cho-encoder-decoder-2014-abstract.png" alt="Title and abstract of Learning Phrase Representations using RNN Encoder-Decoder for Statistical Machine Translation (Cho et al., 2014)" />
+<figcaption>Title and abstract of Cho et al. (2014), <em>Learning Phrase Representations using RNN Encoder–Decoder for Statistical Machine Translation</em>. <a href="https://arxiv.org/abs/1406.1078">arXiv:1406.1078</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/appendix-b/10-seq2seq-and-the-context-vector/papers/cho-encoder-decoder-2014-figure.png" alt="Figure 1 from Cho et al. 2014: RNN encoder reads x1..xT into a context vector C; the decoder emits y1, y2, … from C" />
+<figcaption>Figure 1 from the same paper: the encoder compresses $x_1,\ldots,x_T$ into a vector $C$; the decoder unrolls $C$ into the target. <a href="https://ar5iv.labs.arxiv.org/html/1406.1078">HTML version</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/appendix-b/10-seq2seq-and-the-context-vector/papers/seq2seq-2014-abstract.png" alt="Title and abstract of Sequence to Sequence Learning with Neural Networks (Sutskever, Vinyals and Le, 2014)" />
+<figcaption>Title and abstract of Sutskever, Vinyals &amp; Le (2014), <em>Sequence to Sequence Learning with Neural Networks</em>. <a href="https://arxiv.org/abs/1409.3215">arXiv:1409.3215</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/appendix-b/10-seq2seq-and-the-context-vector/papers/seq2seq-2014-figure.png" alt="Figure 1 from Sutskever et al. 2014: an LSTM reads ABC then emits WXYZ and an end-of-sentence token" />
+<figcaption>Figure 1 from the same paper: read <code>ABC</code>, emit <code>WXYZ</code>. The source is reversed so the first target word sits close in time to the first source word. <a href="https://ar5iv.labs.arxiv.org/html/1409.3215">HTML version</a>.</figcaption>
+</figure>
+
 ```mermaid
 flowchart LR
     subgraph Encoder

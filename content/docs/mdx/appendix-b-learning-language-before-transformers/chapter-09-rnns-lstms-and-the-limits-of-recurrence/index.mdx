@@ -189,6 +189,16 @@ This was a well-known and well-documented problem by the early 1990s. Hochreiter
 
 The Long Short-Term Memory network was proposed by Sepp Hochreiter and Jürgen Schmidhuber in 1997. It's the result of asking: what if instead of a single hidden state, we had a separate **cell state** that was designed to preserve gradients over long time spans?
 
+<figure class="paper-shot">
+<img src="/appendix-b/09-rnns-lstms-and-the-limits-of-recurrence/papers/lstm-1997-abstract.png" alt="Title and abstract of Long Short-Term Memory (Hochreiter and Schmidhuber, 1997)" />
+<figcaption>Title and abstract of Hochreiter &amp; Schmidhuber (1997), <em>Long Short-Term Memory</em>, Neural Computation 9(8). <a href="https://www.bioinf.jku.at/publications/older/2604.pdf">PDF (JKU reprint)</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/appendix-b/09-rnns-lstms-and-the-limits-of-recurrence/papers/lstm-1997-figure.png" alt="Figure 1 from the LSTM paper: the original memory cell with input and output gates and a constant-error carousel of weight 1.0" />
+<figcaption>Figure 1 from the same paper: the original memory cell. The self-loop of weight 1.0 is the constant error carousel — the path that keeps gradients alive. Forget gates arrived later (Gers, Schmidhuber &amp; Cummins, 2000); the diagram in the next section is the modern three-gate cell.</figcaption>
+</figure>
+
 The key insight is that the problem with vanilla RNNs is *multiplicative* — gradients shrink because they're repeatedly *multiplied* by numbers less than 1. The LSTM's cell state uses *additive* updates instead. Addition doesn't shrink gradients the way multiplication does. Information can flow relatively unchanged across hundreds of steps.
 
 But you can't just add everything — you'd accumulate garbage indefinitely. So the LSTM uses **gates** — learned sigmoid functions that act like valves, controlling how much of the new information enters the cell state and how much of the old information remains.
@@ -327,7 +337,17 @@ Before getting to the limitations, it's worth being concrete about what these ar
 - **Doing speech recognition** with error rates approaching human performance
 - **Summarizing documents** and **answering questions**
 
-This was genuinely impressive. The NLP world in 2014–2016 felt like rapid progress.
+This was genuinely impressive. The NLP world in 2014–2016 felt like rapid progress. Jozefowicz, Vinyals, Schuster, Shazeer and Wu (2016) is the snapshot of that peak: huge LSTMs, character-aware softmaxes, and a serious attempt to see how far recurrence could go on language modeling.
+
+<figure class="paper-shot">
+<img src="/appendix-b/09-rnns-lstms-and-the-limits-of-recurrence/papers/exploring-limits-2016-abstract.png" alt="Title and abstract of Exploring the Limits of Language Modeling (Jozefowicz et al., 2016)" />
+<figcaption>Title and abstract of Jozefowicz et al. (2016), <em>Exploring the Limits of Language Modeling</em>. <a href="https://arxiv.org/abs/1602.02410">arXiv:1602.02410</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/appendix-b/09-rnns-lstms-and-the-limits-of-recurrence/papers/exploring-limits-2016-figure.png" alt="Figure 1 from Exploring the Limits of Language Modeling: LSTM language model, character-CNN embeddings, and a character-level softmax LSTM" />
+<figcaption>Figure 1 from the same paper: (a) a standard LSTM language model, (b) character-CNN embeddings on both sides, (c) a character-level LSTM replacing the softmax. This is what “neural language modeling” looked like the year before the Transformer. <a href="https://ar5iv.labs.arxiv.org/html/1602.02410">HTML version</a>.</figcaption>
+</figure>
 
 ```notebook
 {
