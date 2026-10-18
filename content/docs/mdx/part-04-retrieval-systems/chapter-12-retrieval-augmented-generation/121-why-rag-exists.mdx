@@ -92,3 +92,16 @@ RAG is not a universal solution:
 | Knowledge fits in context (< 20 pages) | Just include it in the system prompt |
 | Knowledge is truly static and public | LLM may already know it |
 | You need sub-100ms latency | RAG adds retrieval latency |
+
+![Question to embedding to top-k chunks to a prompt to an answer](/part-04/chapter-12/rag-pipeline.png)
+*Fig: The weights stay frozen. Lewis et al. (2020) put a retriever in front of a generator and trained them together; most production systems freeze both and only swap the index.*
+
+<figure class="paper-shot">
+<img src="/part-04/chapter-12/papers/rag-2020-abstract.png" alt="Title and abstract of Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks, Lewis et al. 2020" />
+<figcaption>Lewis, Perez, Piktus, Petroni, Karpukhin, Goyal, Küttler, Lewis, Yih, Rocktäschel, Riedel &amp; Kiela (2020), <em>Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks</em>. <a href="https://arxiv.org/abs/2005.11401">arXiv:2005.11401</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-04/chapter-12/papers/rag-2020-figure.png" alt="Figure 1 of the RAG paper: a query encoder, a document index searched by maximum inner product, and a generator that marginalizes over the retrieved documents" />
+<figcaption>Figure 1 from the same paper. A query encoder produces q(x), maximum inner-product search hits the document index, and the generator pθ produces the answer conditioned on each retrieved document. <a href="https://ar5iv.labs.arxiv.org/html/2005.11401">HTML version</a>.</figcaption>
+</figure>

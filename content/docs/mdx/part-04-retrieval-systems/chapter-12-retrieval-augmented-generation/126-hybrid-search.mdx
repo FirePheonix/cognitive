@@ -118,3 +118,18 @@ Measure retrieval quality using your golden dataset: find the weights that maxim
 ## Short Answer
 
 Always use hybrid search. The performance gains on exact technical terms alone justify it, and it never hurts precision on semantic queries.
+
+![BM25 and a dense retriever fused into one top-k](/part-04/chapter-12/hybrid-search.png)
+*Fig: BM25 will find API_KEY_TTL. A dense retriever will find “how long until the key expires” when those words never appear. Reciprocal rank fusion is the usual way to add the two lists without tuning a shared score.*
+
+ColBERT (Khattab & Zaharia, 2020) is the late-interaction version of the dense side: one vector per token instead of one vector per chunk, so a keyword-like match can still happen inside a neural retriever.
+
+<figure class="paper-shot">
+<img src="/part-04/chapter-12/papers/colbert-2020-abstract.png" alt="Title and abstract of ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT, Khattab and Zaharia 2020" />
+<figcaption>Khattab &amp; Zaharia (2020), <em>ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT</em>. <a href="https://arxiv.org/abs/2004.12832">arXiv:2004.12832</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-04/chapter-12/papers/colbert-2020-figure.png" alt="First figure of the ColBERT paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2004.12832">HTML version</a>.</figcaption>
+</figure>

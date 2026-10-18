@@ -123,3 +123,6 @@ chunks = splitter.split_documents(documents)
 ```
 
 The overlap ensures that a sentence split between chunk N and chunk N+1 appears fully in at least one of them.
+
+![Three chunk sizes: 200 tokens loses the subject, 500 to 800 with overlap is the default, a whole file averages every topic into one vector](/part-04/chapter-12/chunk-sizes.png)
+*Fig: The chunk is the unit you can retrieve. Overlap, in the paragraph above, is how a sentence that straddles a boundary still appears whole in one of the two chunks.*
