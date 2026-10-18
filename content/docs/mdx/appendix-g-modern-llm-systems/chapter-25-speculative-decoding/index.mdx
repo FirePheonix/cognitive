@@ -85,6 +85,14 @@ Example with 4 draft tokens:
     - 1 target forward pass → 3 tokens (2 accepted + 1 corrected)
 ```
 
+The same example, one picture per step:
+
+![Speculative decoding step 1 — draft. A small model proposes three tokens after “The cat”: sat (id 15, q=0.80), on (id 23, q=0.70), a (id 8, q=0.60). The big model has not run yet.](/appendix-g/25-speculative-decoding/spec-step-1-draft.png)
+
+![Speculative decoding step 2 — verify. One target forward pass scores all three positions. Pos 0: p=0.90 ≥ q=0.80, always accept. Pos 1: p=0.80 ≥ q=0.70, always accept. Pos 2: p=0.20 < q=0.60, accept with probability ⅓ — here we reject.](/appendix-g/25-speculative-decoding/spec-step-2-verify.png)
+
+![Speculative decoding step 3 — keep the prefix. Tokens 15 and 23 stay; token 8 and everything after it are dropped. Sample one real token from the target at the rejection position. Net: 2 free tokens + 1 real sample, from 1 big-model forward.](/appendix-g/25-speculative-decoding/spec-step-3-accept-reject.png)
+
 The mathematics ensure that the joint distribution over accepted tokens equals what you'd get from running the target model alone. No quality compromise.
 
 ```notebook
