@@ -277,6 +277,18 @@ Modern Transformers handle this differently. The initial embedding lookup still 
 
 Both started from the same initial vector. The Transformer layers made them contextual. This is one of the core reasons why Transformers outperformed earlier models so dramatically.
 
+The first widely used *contextual* embeddings were ELMo (Peters et al., 2018) — a deep bidirectional LSTM language model whose internal states became the word vectors. Same word, different context, different vector. Transformers then made that idea bidirectional *and* parallel.
+
+<figure class="paper-shot">
+<img src="/appendix-a/03-embeddings/papers/elmo-2018-abstract.png" alt="Title and abstract of Deep Contextualized Word Representations (Peters et al., 2018)" />
+<figcaption>Title and abstract of Peters et al. (2018), <em>Deep contextualized word representations</em> — ELMo. <a href="https://arxiv.org/abs/1802.05365">arXiv:1802.05365</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/appendix-a/03-embeddings/papers/elmo-2018-figure.png" alt="Figure 1 from the ELMo paper: ELMo vs baseline accuracy as training set size varies on SNLI and SRL" />
+<figcaption>Figure 1 from the same paper: ELMo helps most when labeled data is scarce. The architecture itself is a bidirectional language model (biLM) whose layer states are mixed into a task model. <a href="https://ar5iv.labs.arxiv.org/html/1802.05365">HTML version</a>.</figcaption>
+</figure>
+
 ---
 
 ## Before You Move On
@@ -294,7 +306,29 @@ With tokenization and embeddings in place, you now have the full picture of how 
 
 ## Word2Vec: Learning Embeddings from Context
 
-The static embeddings described above need to be *learned* from data somehow. The most influential method for doing this — Word2Vec (Mikolov et al., 2013) — is worth understanding in detail, because it makes concrete what "learning from text" actually means mathematically.
+The idea of a learned word vector is older than Word2Vec. Bengio, Ducharme, Vincent and Jauvin (2003) trained a neural network to predict the next word from a window of previous ones, and stored each word as a row of a shared matrix $C$. That paper is the direct ancestor of every embedding table in this book.
+
+<figure class="paper-shot">
+<img src="/appendix-a/03-embeddings/papers/nnlm-2003-abstract.png" alt="Title and abstract of A Neural Probabilistic Language Model (Bengio et al., 2003)" />
+<figcaption>Title and abstract of Bengio, Ducharme, Vincent &amp; Jauvin (2003), <em>A Neural Probabilistic Language Model</em>. <a href="https://www.jmlr.org/papers/volume3/bengio03a/bengio03a.pdf">JMLR PDF</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/appendix-a/03-embeddings/papers/nnlm-2003-figure.png" alt="Figure 1 from Bengio et al. 2003: neural probabilistic language model with a shared embedding matrix C, a tanh hidden layer, and a softmax over the vocabulary" />
+<figcaption>Figure 1 from the same paper: look up previous words in a shared matrix C, mix them with a neural net, softmax over the next word. Word2Vec is this picture made cheap enough to train on a billion words.</figcaption>
+</figure>
+
+The static embeddings described above need to be *learned* from data somehow. The most influential *scalable* method for doing this — Word2Vec (Mikolov et al., 2013) — is worth understanding in detail, because it makes concrete what "learning from text" actually means mathematically.
+
+<figure class="paper-shot">
+<img src="/appendix-a/03-embeddings/papers/word2vec-2013-abstract.png" alt="Title and abstract of Efficient Estimation of Word Representations in Vector Space (Mikolov et al., 2013)" />
+<figcaption>Title and abstract of Mikolov, Chen, Corrado &amp; Dean (2013), <em>Efficient Estimation of Word Representations in Vector Space</em>. <a href="https://arxiv.org/abs/1301.3781">arXiv:1301.3781</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/appendix-a/03-embeddings/papers/word2vec-2013-figure.png" alt="Figure 1 from Word2Vec: CBOW predicts the center word from context; Skip-gram predicts surrounding words from the center word" />
+<figcaption>Figure 1 from the same paper: CBOW predicts the current word from its neighbours; Skip-gram predicts the neighbours from the current word. <a href="https://ar5iv.labs.arxiv.org/html/1301.3781">HTML version</a>.</figcaption>
+</figure>
 
 The core intuition is called the **Distributional Hypothesis**: a word's meaning is defined by the company it keeps. Words that appear in similar contexts — "doctor" and "physician," "fast" and "quick" — should end up with similar vector representations. You don't need to label what any word means; you just need to observe which words tend to appear near each other.
 
@@ -329,6 +363,18 @@ The noise distribution uses a 3/4 power smoothing to prevent ultra-frequent word
 $$P_n(w) \propto f(w)^{3/4}$$
 
 This raises the sampling probability of rare words and lowers it for common ones — giving the model more informative negatives to learn from.
+
+The same year, Mikolov et al. published a follow-up that is how most people actually *run* Word2Vec: phrase tokens (`New_York`), subsampled frequent words, and a more careful negative-sampling story.
+
+<figure class="paper-shot">
+<img src="/appendix-a/03-embeddings/papers/word2vec-phrases-2013-abstract.png" alt="Title and abstract of Distributed Representations of Words and Phrases and their Compositionality (Mikolov et al., 2013)" />
+<figcaption>Title and abstract of Mikolov, Sutskever, Chen, Corrado &amp; Dean (2013), <em>Distributed Representations of Words and Phrases and their Compositionality</em>. <a href="https://arxiv.org/abs/1310.4546">arXiv:1310.4546</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/appendix-a/03-embeddings/papers/word2vec-phrases-2013-figure.png" alt="Figure 1 from the Word2Vec phrases paper: Skip-gram architecture" />
+<figcaption>Figure 1 from the same paper: Skip-gram again, now the workhorse for phrases and negative sampling. <a href="https://ar5iv.labs.arxiv.org/html/1310.4546">HTML version</a>.</figcaption>
+</figure>
 
 ### GloVe: Global Vectors for Word Representation
 
