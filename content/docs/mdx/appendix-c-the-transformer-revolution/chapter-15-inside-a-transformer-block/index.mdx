@@ -90,6 +90,14 @@ Worked by hand for one token $x = [2, -1, 3, 0]$ (with $\gamma = 1$, $\beta = 0$
 - LayerNorm: $\mu = 1$, $\sigma^2 = (1 + 4 + 4 + 1)/4 = 2.5$, $\sigma = 1.581$, giving $[0.632,\ -1.265,\ 1.265,\ -0.632]$.
 - RMSNorm: $\tfrac{1}{4}(4 + 1 + 9 + 0) = 3.5$, RMS $= 1.871$, giving $[1.069,\ -0.535,\ 1.604,\ 0]$.
 
+The same LayerNorm arithmetic, one picture per step:
+
+![LayerNorm step 1 — mean of this token. x = (2, −1, 3, 0); μ = (2 − 1 + 3 + 0)/4 = 1. LayerNorm never looks at other tokens, so it works at batch size 1.](/appendix-c/15-inside-a-transformer-block/ln-step-1-mean.png)
+
+![LayerNorm step 2 — scale by the std. Deviations (1, −2, 2, −1), squares (1, 4, 4, 1), variance 2.5, σ = √2.5 ≈ 1.581. A tiny ε under the square root avoids dividing by zero.](/appendix-c/15-inside-a-transformer-block/ln-step-2-variance.png)
+
+![LayerNorm step 3 — the normalized vector. x̂ = (x − 1)/1.581 ≈ (0.632, −1.265, 1.265, −0.632). Mean 0, variance 1. Then learned γ and β restore scale and shift; RMSNorm skips the mean subtraction.](/appendix-c/15-inside-a-transformer-block/ln-step-3-normalize.png)
+
 ```notebook
 {
   "title": "LayerNorm and RMSNorm from scratch",
