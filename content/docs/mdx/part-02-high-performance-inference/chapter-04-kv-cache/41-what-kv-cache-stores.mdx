@@ -134,3 +134,19 @@ At some point, the cache hits GPU memory limits or the model's context window li
 - Cache size = 2 × layers × KV_heads × head_dim × seq_len × bytes
 - For a 7B model: roughly 128 KB per token; for a 70B model: roughly 1 MB per token
 - Memory pressure from the KV cache is a primary constraint on context length and concurrency
+
+![KV cache bytes for Llama-3-8B: 2 times 32 layers times 8 KV heads times 128 times 2 equals 128 KB per token](/part-02/chapter-04/kv-bytes.png)
+*Fig: The formula in this section, multiplied out. 1,000 tokens is about 128 MB, not the 0.5 MB in the table above — that row is short by roughly 256×. 8,000 tokens is about 1 GB. Thirty-two concurrent 2,000-token requests are about 8 GB of cache before the weights.*
+
+![MHA stores a KV pair per query head; GQA lets several query heads share one KV head](/part-02/chapter-04/gqa-vs-mha.png)
+*Fig: Grouped-query attention is why the middle factor is 8 KV heads rather than 32 query heads. Ainslie et al. (2023) showed you can train that sharing and keep most of the quality.*
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-04/papers/gqa-2023-abstract.png" alt="Title and abstract of GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints, Ainslie et al. 2023" />
+<figcaption>Ainslie, Lee, Ahuja, Patwary, Le, Kao, Shuster, Dodge, Yih, Lewis, Zettlemoyer &amp; Wu (2023), <em>GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</em>. <a href="https://arxiv.org/abs/2305.13245">arXiv:2305.13245</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-04/papers/gqa-2023-figure.png" alt="First figure of the GQA paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2305.13245">HTML version</a>.</figcaption>
+</figure>

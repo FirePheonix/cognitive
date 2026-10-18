@@ -175,3 +175,18 @@ llm = LLM(model="mistralai/Mistral-7B-v0.1")
 - Information still propagates through layers, so distant context is not fully lost
 - Ideal for conversations, streaming text, and tasks with strong local dependencies
 - Avoid for tasks requiring precise recall of content far back in the context
+
+![Token 1000 attends only to tokens 489 through 1000 when the window is 512](/part-02/chapter-04/sliding-window.png)
+*Fig: Full attention keeps a cache that grows with the document. A window of W keeps a cache that grows until W and then stops. Information can still travel further than W, one layer at a time.*
+
+Mistral 7B is the public model that made this the default people copy: window 4096, and a few layers that still look at the whole prefix so a fact from the start of the prompt is not stranded (Jiang et al., 2023).
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-04/papers/mistral-2023-abstract.png" alt="Title and abstract of the Mistral 7B paper, Jiang et al. 2023" />
+<figcaption>Jiang, Sablayrolles, Mensch, Bamford, Chaplot, de las Casas, Bressand, Lengyel, Lample, Saulnier, Lavaud, Lachaux, Stock, Le Scao, Lavril, Wang, Lacroix &amp; El Sayed (2023), <em>Mistral 7B</em>. <a href="https://arxiv.org/abs/2310.06825">arXiv:2310.06825</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-04/papers/mistral-2023-figure.png" alt="First figure of the Mistral 7B paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2310.06825">HTML version</a>.</figcaption>
+</figure>
