@@ -146,7 +146,13 @@ Subword tokenization — specifically **Byte Pair Encoding (BPE)** — solves bo
 
 How does the algorithm decide what to merge? It's beautifully simple: **start with characters, find the most frequent adjacent pair, merge it into a new token, repeat.**
 
-Let's watch it happen step by step.
+Let's watch it happen step by step. The three pictures below use a tiny corpus — just the words `the the` — so you can count the pairs by hand. The notebook after that runs the same algorithm on a slightly larger set of sentences.
+
+![BPE step 1. Corpus “the the” starts as seven character tokens. Adjacent pair counts: t h and h e each appear twice; e-space and space-t appear once. Frequency, not linguistics, picks the next merge.](/appendix-a/02-tokens/bpe-step-1-count-pairs.png)
+
+![BPE step 2. After merging t + h → th, the stream is th, e, space, th, e. The new winner is th + e → the, which is how the algorithm discovers the English word “the” from counts alone.](/appendix-a/02-tokens/bpe-step-2-merge.png)
+
+![BPE step 3. After the second merge the corpus is two copies of the token “the”. Encoding the unseen word “then” applies the same rules in order: letters → th e n → the n. No unknown-word crash.](/appendix-a/02-tokens/bpe-step-3-encode-unseen.png)
 
 ```notebook
 {
