@@ -15,23 +15,11 @@ The difference between a model that outputs boring, repetitive text and one that
 
 GPT generates text one token at a time. Each new token is appended to the sequence, and the whole sequence (prompt + generated tokens so far) is fed back through the model to predict the next one.
 
-```
-Generate loop:
+![Generate loop: prompt → forward (use last-position logits) → sample (greedy / temperature / top-k / top-p) → append and loop. A bar chart of an example distribution (the 0.70, a 0.20, my 0.06, purple 0.04) and a comparison of top-k vs top-p.](/appendix-d/14-inference-and-text-generation/generate-and-sample.png)
 
-Start:  context = [token_1, token_2, ..., token_N]    ← prompt
+![Generation softmaxes only the last logits row. A 3×4 matrix after “The cat sat”; the last row [2.1, 0.8, −0.4, −1.2] is divided by temperature T and softmaxed. T = 0.5 peaks on “the”; T = 2 flattens the same vector. Greedy is argmax of that row.](/appendix-d/14-inference-and-text-generation/sample-by-hand.png)
 
-Step 1: logits = model(context)                       ← full forward pass
-        next_token = sample_from(logits[:, -1, :])    ← only use LAST position
-        context = context + [next_token]              ← append
-
-Step 2: logits = model(context)                       ← forward pass on longer sequence
-        next_token = sample_from(logits[:, -1, :])
-        context = context + [next_token]
-
-Step 3: ... repeat until EOS token or max_length reached
-```
-
-Why do we use only the last position's logits? Because the causal mask means position `T` has seen all positions `0..T`. Its logits represent the distribution over the next token given everything that came before. That's exactly what we want.
+Why do we use only the last position's logits? Because the causal mask means position `T` has seen all positions `0..T`. Its logits represent the distribution over the next token given everything that came before. That's exactly what we want. The figure is that last row, written out.
 
 This is inefficient — we recompute attention for all previous tokens at every step. In practice, models use a **KV cache** that stores the key and value vectors from previous steps, so each new step only requires computing attention for the new token. But the logic is the same.
 

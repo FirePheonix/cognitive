@@ -15,13 +15,7 @@ The training loop is the mechanical heart of machine learning. It's a tight loop
 
 Every iteration of the training loop does exactly this:
 
-```
-Step 1 — Forward pass:   logits = model(x)
-Step 2 — Compute loss:   loss = cross_entropy(logits, y)
-Step 3 — Zero gradients: optimizer.zero_grad()
-Step 4 — Backward pass:  loss.backward()
-Step 5 — Update weights: optimizer.step()
-```
+![The five training steps — forward, loss, zero grads, backward, optimizer step — next to a learning-rate chart: linear warmup, then cosine decay from lr_max down to lr_min.](/appendix-d/13-the-training-loop/five-steps-and-lr.png)
 
 Step 3 might look odd — why zero the gradients before the backward pass? Because PyTorch **accumulates** gradients by default. If you don't zero them, gradients from the previous batch add to the current batch's gradients, which is almost never what you want.
 
@@ -33,22 +27,7 @@ The reason this default exists is that sometimes you *do* want gradient accumula
 
 The learning rate controls how big each weight update step is. Too large: the model overshoots, loss spikes, training can diverge. Too small: training is painfully slow.
 
-The solution is to vary the learning rate over time. Modern LLMs use a schedule with two phases:
-
-```
-Learning Rate Schedule
-
-lr_max ┤                  ╭──────────────╮
-       │               ╭──╯               ╲
-       │            ╭──╯                   ╲  cosine decay
-       │         ╭──╯                       ╲
-       │      ╭──╯                           ╲
-lr_min ┤  ──╮╯  warmup                        ╲────────────
-       │    │
-       └────┼──────────────────────────────────────────────►
-            │                                          steps
-         step 0        warmup_steps
-```
+The solution is to vary the learning rate over time. Modern LLMs use a schedule with two phases, drawn in the figure above.
 
 **Warmup phase**: Start with a very small learning rate and linearly increase it to `lr_max` over the first few thousand steps. Why? At initialization, the model's weights are random. The gradients are noisy and unreliable. A large initial learning rate would destabilize training. Starting small lets the model find its footing.
 

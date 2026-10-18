@@ -9,6 +9,18 @@ GPT stands for Generative Pre-trained Transformer. The architecture is simpler t
 
 That simplicity is the point. The decoder-only design is what makes GPT a language model — a machine that, given some tokens, predicts the next one.
 
+The 2018 paper that named the pattern is Radford, Narasimhan, Salimans and Sutskever, *Improving Language Understanding by Generative Pre-Training* — GPT-1. A Transformer decoder, language-model pre-training on BooksCorpus, then a small fine-tune on each GLUE-style task.
+
+<figure class="paper-shot">
+<img src="/appendix-d/11-gpt-architecture/papers/gpt-2018-abstract.png" alt="Title and abstract of Improving Language Understanding by Generative Pre-Training (Radford et al., 2018)" />
+<figcaption>Title and abstract of Radford, Narasimhan, Salimans &amp; Sutskever (2018), <em>Improving Language Understanding by Generative Pre-Training</em>. <a href="https://cdn.openai.com/research-covers/language-unsupervised/language_understanding_paper.pdf">OpenAI PDF</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/appendix-d/11-gpt-architecture/papers/gpt-2018-figure.png" alt="Figure 1 from GPT-1: a 12-layer Transformer decoder and the task-specific input layouts used at fine-tuning" />
+<figcaption>Figure 1 from the same paper: (left) the 12-layer decoder used as a language model; (right) how classification, entailment, similarity and multiple-choice were packed into the same token stream at fine-tuning time.</figcaption>
+</figure>
+
 ---
 
 ## What "Decoder-Only" Actually Means
@@ -19,46 +31,7 @@ GPT throws out the encoder entirely. There's no source sequence to read. The mod
 
 The "decoder" name is kept because GPT uses causal (masked) self-attention — the same attention mask used in the original decoder to prevent positions from attending to future positions. Each token can only see the tokens that came before it.
 
-```
-GPT / Decoder-Only Architecture
-
-           Token IDs
-               ↓
-     Token Embedding (vocab_size × d_model)
-               +
-   Positional Encoding (seq_len × d_model)
-               ↓
-     ┌─────────────────────┐
-     │   Transformer Block  │  ← repeated N times
-     │  ┌───────────────┐  │
-     │  │ LayerNorm      │  │
-     │  │ Causal MHA     │  │  ← can only attend to current and previous positions
-     │  │ + residual     │  │
-     │  ├───────────────┤  │
-     │  │ LayerNorm      │  │
-     │  │ FeedForward    │  │
-     │  │ + residual     │  │
-     │  └───────────────┘  │
-     └─────────────────────┘
-               ↓
-         Final LayerNorm
-               ↓
-        LM Head (d_model → vocab_size)
-               ↓
-       Logits (one score per token in vocabulary)
-```
-
-Compare this to the full encoder-decoder:
-
-```
-Encoder-Decoder (original transformer, T5)
-
-Source tokens → Encoder → Encoder output (full bidirectional attention)
-                                  ↓
-Target tokens → Decoder → Cross-Attention reads encoder output
-                        → Causal self-attention for generation
-                        → Generate next target token
-```
+![GPT as a stack of decoder blocks: token IDs through embeddings, N transformer blocks, final LayerNorm, a weight-tied LM head, and logits. Beside it, the original encoder–decoder: source through an encoder, target through a decoder, with K and V flowing across. A note on why decoder-only won: one stack, one unlabeled objective.](/appendix-d/11-gpt-architecture/decoder-only-stack.png)
 
 The encoder can see all positions in both directions (bidirectional attention). The GPT decoder can only see positions to its left (causal attention). That's the core structural difference.
 
@@ -82,28 +55,11 @@ The causal mask enforces this. At training time, position 5 can only see positio
 
 Let's trace a concrete example: the string `"The cat sat"` passed through a small GPT.
 
-```
-Input text:      "The cat sat"
-                      ↓  tokenize (GPT-2 BPE)
-Token IDs:       [464, 3797, 3332]
-                      ↓  embedding lookup (each ID → 768-dim vector)
-Token embeddings: shape [1, 3, 768]
-                      ↓  + positional encoding (learned position vectors)
-x:               shape [1, 3, 768]   ← each token now knows its position
-                      ↓  12 × transformer block (shape never changes)
-x:               shape [1, 3, 768]   ← same shape in, same shape out
-                      ↓  final LayerNorm
-                      ↓  LM head: 768 → 50257
-Logits:          shape [1, 3, 50257] ← 50257 scores per position
-                      ↓  softmax (optional — just for visualization)
-Probs:           shape [1, 3, 50257] ← probability distribution per position
+![One forward pass of “The cat sat”: text → token IDs [464, 3797, 3332] → embed + positions [1, 3, 768] → 12 blocks (same shape) → LM head [1, 3, 50,257]. A causal mask heatmap for length 4, and the three architecture families: encoder-only, decoder-only, encoder–decoder.](/appendix-d/11-gpt-architecture/forward-pass-and-mask.png)
 
-Position 0 logits → probability over next token given "The"
-Position 1 logits → probability over next token given "The cat"
-Position 2 logits → probability over next token given "The cat sat"
-```
+![The LM head is one matrix multiply. Tiny vocab {The, cat, sat, .}: embedding matrix E (4×3) looks up rows for token IDs [0,1,2] into X (3×3). Logits = X Eᵀ (3×4). Worked cell: logits[sat, cat] = [1,1,0]·[0,2,0] = 2. Generation softmaxes only the last row.](/appendix-d/11-gpt-architecture/lm-head-matmul.png)
 
-During training, we compare position 0's prediction to the actual token at position 1, position 1's prediction to position 2, and so on. This is the "shift by one" structure — one forward pass generates training signal for every position in the sequence simultaneously.
+During training, we compare position 0's prediction to the actual token at position 1, position 1's prediction to position 2, and so on. This is the "shift by one" structure — one forward pass generates training signal for every position in the sequence simultaneously. The figure is the same multiply with a 4-word vocab so you can check every cell.
 
 ---
 
@@ -151,21 +107,11 @@ The FFN holds nearly half the parameters. This isn't a surprise — each transfo
 
 ## The Causal Mask in Detail
 
-The causal mask is what enforces the "can only look backward" property. It's a lower-triangular matrix applied to the attention scores before softmax.
+The causal mask is what enforces the "can only look backward" property. It's a lower-triangular matrix applied to the attention scores before softmax. Zeros become −∞ before softmax, so future tokens get probability 0.
 
-```
-Causal mask for sequence length 4:
+![Causal attention by hand. Q and K for The/cat/sat, scores S = QKᵀ with S[cat,cat] = 4, future cells set to −∞, then softmax. “The” attends only to itself; “sat” may mix all three. Output is still O = AV — another matmul.](/appendix-d/11-gpt-architecture/causal-qk-matmul.png)
 
-       pos 0  pos 1  pos 2  pos 3
-pos 0 [  1      0      0      0  ]   ← position 0 sees only itself
-pos 1 [  1      1      0      0  ]   ← position 1 sees positions 0, 1
-pos 2 [  1      1      1      0  ]   ← position 2 sees positions 0, 1, 2
-pos 3 [  1      1      1      1  ]   ← position 3 sees all positions
-
-Values of 0 become -∞ before softmax → probability 0 after softmax
-```
-
-This is efficient: you can train on a sequence of 1024 tokens and get 1024 prediction targets simultaneously, all from one forward pass. Position 0 predicts position 1. Position 1 predicts position 2. And so on. No cheating — the mask guarantees position `i` only uses information from positions `0..i`.
+This is efficient: you can train on a sequence of 1024 tokens and get 1024 prediction targets simultaneously, all from one forward pass. Position 0 predicts position 1. Position 1 predicts position 2. And so on. No cheating — the mask guarantees position `i` only uses information from positions `0..i`. The grids above are that multiply for length 3; the earlier heatmap is the same mask for length 4.
 
 ---
 
@@ -203,6 +149,18 @@ There are three fundamentally different ways to build a Transformer, each with d
 | **Encoder-only** | Masked LM (predict masked tokens) | Bidirectional (sees all tokens) | BERT, RoBERTa | Classification, NER, embeddings |
 | **Decoder-only** | Causal LM (predict next token) | Causal (sees only past tokens) | GPT, Llama, Claude | Generation, chat, reasoning |
 | **Encoder-Decoder** | Denoising / seq-to-seq | Encoder: bidirectional; Decoder: causal + cross-attention | T5, BART | Translation, summarization |
+
+BERT (Devlin et al., 2018) is the encoder-only twin of GPT: same Transformer block, bidirectional attention, trained to fill in masked tokens and to classify sentence pairs.
+
+<figure class="paper-shot">
+<img src="/appendix-d/11-gpt-architecture/papers/bert-2018-abstract.png" alt="Title and abstract of BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding (Devlin et al., 2018)" />
+<figcaption>Title and abstract of Devlin, Chang, Lee &amp; Toutanova (2018), <em>BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding</em>. <a href="https://arxiv.org/abs/1810.04805">arXiv:1810.04805</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/appendix-d/11-gpt-architecture/papers/bert-2018-figure.png" alt="Figure 1 from BERT: pre-training with masked LM and next-sentence prediction, then fine-tuning on MNLI, NER and SQuAD" />
+<figcaption>Figure 1 from the same paper: one architecture for pre-training (masked LM + next-sentence prediction) and for fine-tuning (swap the output head). <a href="https://ar5iv.labs.arxiv.org/html/1810.04805">HTML version</a>.</figcaption>
+</figure>
 
 **The key insight about information visibility:**
 - Encoder models see the whole sentence at once — great for understanding a fixed input

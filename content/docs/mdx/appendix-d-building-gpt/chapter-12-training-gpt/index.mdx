@@ -34,18 +34,9 @@ The entire training corpus becomes one gigantic sequence of integers. GPT-3's 30
 
 The training objective is next-token prediction: given tokens 1 through N, predict token N+1. This means for every training sample, the **target is just the input shifted by one position**.
 
-```
-Input sequence:   [The,  cat,  sat,  on,  the,  mat]
-Token IDs:        [464, 3797, 3332,  319,  262, 2603]
+![Targets are the inputs shifted by one: “The cat sat on the mat” becomes x = [The, cat, sat, on, the] and y = [cat, sat, on, the, mat]. Beside it, cross-entropy as surprise: loss = −log P(correct), with examples 0.90 → 0.11, 0.10 → 2.30, 0.02 → 3.91, and a note that a random GPT-2 starts near 10.8.](/appendix-d/12-training-gpt/shift-and-cross-entropy.png)
 
-Input  (feed to model):  [464, 3797, 3332,  319,  262]
-Target (what to predict): [3797, 3332,  319,  262, 2603]
-```
-
-Position 0 of input is `464` ("The") → model should predict `3797` ("cat")  
-Position 1 of input is `3797` ("cat") → model should predict `3332` ("sat")  
-Position 2 of input is `3332` ("sat") → model should predict `319` ("on")  
-And so on.
+Position 0 of input is `464` ("The") → model should predict `3797` ("cat"). Position 1 of input is `3797` ("cat") → model should predict `3332` ("sat"). And so on.
 
 This is why one sentence generates multiple training examples: a sequence of length N gives N-1 input/target pairs, all computed in a single forward pass thanks to the causal mask.
 
@@ -102,23 +93,11 @@ This is why one sentence generates multiple training examples: a sequence of len
 
 After the forward pass, the model produces logits — one score per vocabulary token, per position. The training objective is to make the correct next-token score as high as possible.
 
-**Cross-entropy loss** formalizes this. It measures how "surprised" the model is at seeing the correct next token:
+**Cross-entropy loss** formalizes this. It measures how "surprised" the model is at seeing the correct next token: $\text{loss} = -\log P(\text{correct token})$.
 
-```
-loss = -log(P(correct_token))
+![Cross-entropy from one logits row. Scores [1, 0, 3, −1] over {The, cat, sat, on}; softmax; the true next token is sat. p_sat ≈ 0.83, loss = −log p_sat. If the model had put 0.90 on sat the loss would be 0.105; at 0.10 it would be 2.30.](/appendix-d/12-training-gpt/ce-by-hand.png)
 
-If P(correct_token) = 0.9  → loss = -log(0.9)  = 0.105  (not very surprised)
-If P(correct_token) = 0.1  → loss = -log(0.1)  = 2.303  (quite surprised)
-If P(correct_token) = 0.02 → loss = -log(0.02) = 3.912  (very surprised)
-```
-
-For a vocabulary of 50,000 tokens, a random model assigns probability ~1/50000 = 0.00002 to each token. That gives a loss of:
-
-```
--log(1/50000) = log(50000) ≈ 10.8
-```
-
-So a freshly initialized GPT-2 has a loss of roughly 10.8. After training on good data, a well-trained model achieves losses around 2-3. The difference in loss directly translates to probability: at loss 2.3, the model assigns average probability ~10% to the correct token, which means it has a genuine sense of what's likely to come next.
+A random GPT-2 (vocab 50,257) starts around $-\log(1/V) \approx 10.8$. After training, a good model lands near 2–3. At loss 2.3 the model puts about 10% probability on the true next token — a tight constraint among 50k options.
 
 ```notebook
 {
