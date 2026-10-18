@@ -86,6 +86,8 @@ Embedding vectors:
   row 374   → [-0.567, 0.219, 0.455, ...]    (768 values)
 ```
 
+![Embedding lookup is a gather, not a multiply. Token IDs 0 and 2 pick rows 0 and 2 of a tiny table E (vocab × d) and stack them into X (tokens × d). After this, the rest of the model only sees vectors.](/appendix-a/03-embeddings/embedding-row-lookup.png)
+
 After this step, the integer IDs disappear. Everything that follows in the model works entirely with these floating-point vectors.
 
 Let's build this from scratch and see exactly what the matrix looks like — first with random values, then with a structure that mimics what training produces.
@@ -335,6 +337,10 @@ The core intuition is called the **Distributional Hypothesis**: a word's meaning
 ### The Skip-gram Model
 
 Word2Vec's Skip-gram variant learns embeddings by training on a simple prediction task: given a center word, predict the surrounding words within a context window.
+
+![Skip-gram step 1. Sentence “the cat sat”, window m = 1. Three centers produce four training pairs: the → cat; cat → the and cat → sat; sat → cat. The only label is “these two words appeared next to each other.”](/appendix-a/03-embeddings/skipgram-step-1-window.png)
+
+![Skip-gram step 2. One pair, by hand: center cat v = (1, 1, 0) dotted with context sat u = (0, 2, 0) scores 2. Softmax over a three-word vocab with scores 0, 1, 2 gives P(sat | cat) ≈ 0.67. The loss is −log of that number.](/appendix-a/03-embeddings/skipgram-step-2-one-pair.png)
 
 For a center word $c$ and a context word $o$, the model defines the probability of seeing $o$ near $c$ as:
 
