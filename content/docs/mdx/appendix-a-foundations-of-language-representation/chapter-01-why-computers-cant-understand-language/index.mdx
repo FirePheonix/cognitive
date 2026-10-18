@@ -36,6 +36,8 @@ There's also problem number two: **words have variable length.** The word `cat` 
 
 And problem number three: **there's no relationship encoded between words.** `cat` and `kitten` are very related concepts — a kitten is literally just a baby cat. But their ASCII representations, `[99, 97, 116]` and `[107, 105, 116, 116, 101, 110]`, share almost nothing in common. How is a computer supposed to know these words are related?
 
+![ASCII codes are labels, not meaning. Left: cat is stored as 99, 97, 116 and dog as 100, 111, 103 — arbitrary 1960s integers. Right: what we actually need is a learned vector per word, so cat and dog sit nearby on an “animal” axis and algorithm does not.](/appendix-a/01-computer-lang/ascii-vs-meaning.png)
+
 ---
 
 ## What We Actually Need
