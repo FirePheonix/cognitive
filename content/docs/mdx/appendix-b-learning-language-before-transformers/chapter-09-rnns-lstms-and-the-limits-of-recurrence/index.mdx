@@ -146,6 +146,8 @@ Gradient decay over time steps (backprop from t=60 backward):
   Ratio at t=1: LSTM is ~10¹³× larger than RNN
 ```
 
+![Why gradients vanish in a long chain. Backprop through time multiplies one Jacobian per step. If each multiply is 0.5, twenty steps is 0.5²⁰ ≈ 10⁻⁶. |λ| < 1 dies; |λ| > 1 explodes; LSTM/GRU keep a nearly-linear highway so the product can stay near 1.](/appendix-b/09-rnns-lstms-and-the-limits-of-recurrence/vanish-product-of-halves.png)
+
 This is called **Backpropagation Through Time (BPTT)**, and the vanishing gradient it produces means the model can only "remember" the last few tokens well. Information from 50 or 100 steps back might as well not exist.
 
 ```notebook
