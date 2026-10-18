@@ -31,16 +31,6 @@ LLMs have two hard limits: knowledge cutoff and imprecise arithmetic. Tool calli
 
 ## The arc
 
-```
-Embedding model → semantic similarity → semantic search
-                                              ↓
-                              vector database (ANN/HNSW)
-                                              ↓
-                         RAG: retrieve context → stuff into prompt → LLM answers
-                                              ↓
-                   Tool calling: model decides which tools to call
-                                              ↓
-                     Agent loop: tool call → observe → next decision → ...
-```
+![Appendix F in four cards: semantic search, vector databases and RAG, tool calling, then the agent loop.](/appendix-f/beyond-the-model-arc.png)
 
 Each layer builds on the previous. Embeddings enable search. Search enables RAG. Tool calling enables agents. Together they transform a text generator into a system that can work with real-world data, real-time information, and external computation.

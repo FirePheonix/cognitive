@@ -40,17 +40,7 @@ The idea:
 
 Because the embedding model was trained on language, it learned that "Paris is the capital" and "capital of France" activate similar patterns — so their vectors end up close together. Distance in embedding space reflects semantic similarity.
 
-```mermaid
-flowchart LR
-    Q["🔍 Query\n'capital of France'"]
-    E1["Embedding\nModel"]
-    QV["Query vector\n[0.234, −0.512, ...]"]
-    DB[("Document\nVectors")]
-    R["Top-k\nmost similar\ndocuments"]
-
-    Q --> E1 --> QV
-    QV -->|cosine similarity| DB --> R
-```
+![Semantic search: query “capital of France” → a small embedding model → query vector → cosine similarity against precomputed document vectors → top-k neighbours. Keyword search would miss a page titled “Paris”.](/appendix-f/20-embeddings-for-search/semantic-search.png)
 
 This is not the same as asking an LLM to answer a question. The embedding model just converts text to vectors — it doesn't generate anything. It's a completely separate, much smaller model optimised purely for producing good similarity comparisons.
 
@@ -62,22 +52,9 @@ Two vectors can be compared in different ways. The most common:
 
 **Cosine similarity** — measures the angle between two vectors, ignoring their magnitude. Range: −1 (opposite) to 1 (identical direction).
 
-```text
-              A · B
-cos(θ) = ─────────────
-          ‖A‖ × ‖B‖
+$$\cos\theta = \frac{A \cdot B}{\|A\|\,\|B\|}$$
 
-  A · B  =  Σ (A_i × B_i)     ← dot product (sum of element-wise products)
-  ‖A‖    =  √(Σ A_i²)         ← L2 norm of A
-  ‖B‖    =  √(Σ B_i²)         ← L2 norm of B
-
-Example (2-dim vectors):
-  A = [3, 4]   B = [4, 3]
-  A · B = (3×4) + (4×3) = 24
-  ‖A‖   = √(9 + 16) = 5
-  ‖B‖   = √(16 + 9) = 5
-  cos   = 24 / (5 × 5) = 0.96   ← very similar direction
-```
+![Cosine is a dot product. A = [3, 4] (“capital of France”), B = [4, 3] (“Paris”), C = [3, −4] (“banana”). A·B = 24, ‖A‖ = ‖B‖ = 5, cos θ_AB = 0.96. A·C = −7, cos θ_AC = −0.28. Search at scale is q Dᵀ — one GEMM against a matrix of document rows.](/appendix-f/20-embeddings-for-search/cosine-dot.png)
 
 This is the dominant metric in NLP because it's insensitive to vector length. A short document and a long document about the same topic should have similar embeddings — cosine similarity correctly treats them as close even though their raw magnitudes differ.
 

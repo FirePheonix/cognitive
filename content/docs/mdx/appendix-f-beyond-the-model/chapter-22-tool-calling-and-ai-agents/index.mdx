@@ -41,6 +41,8 @@ Without tools:              With tools:
 
 ## The Six-Step Flow
 
+![Tool calling: the model emits JSON, an external program runs the function, the result is injected, then the model answers. Below: the agent loop — thought → action (tool or final answer) → observe → repeat.](/appendix-f/22-tool-calling-and-ai-agents/tools-and-agent-loop.png)
+
 Tool calling follows a fixed six-step protocol:
 
 ```text
@@ -300,17 +302,7 @@ Example — "Analyze Q3 sales and summarize top performers":
               in the North region, driven by Widget X sales..."
 ```
 
-```mermaid
-flowchart TD
-    U["User task"] --> T["Thought\n(what do I need?)"]
-    T --> A["Action\n(tool call OR final answer)"]
-    A -->|tool call| E["External execution"]
-    E --> O["Observe result"]
-    O --> T
-    A -->|final answer| R["Response to user"]
-```
-
-The key property: the model drives the loop. It decides at each step whether to call another tool or produce a final answer. This makes agents flexible — they can handle tasks that require an unknown number of steps.
+The key property: the model drives the loop. The figure at the start of the six-step section is that loop. It decides at each step whether to call another tool or produce a final answer. This makes agents flexible — they can handle tasks that require an unknown number of steps.
 
 ---
 
