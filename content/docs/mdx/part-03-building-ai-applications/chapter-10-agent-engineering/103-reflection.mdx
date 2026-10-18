@@ -126,3 +126,15 @@ revised = revise(draft, critique, model="claude-sonnet-4-5")  # expensive again
 ```
 
 This hybrid approach captures most of the quality benefit at roughly half the cost of running the full reflection loop on the expensive model.
+
+Reflexion (Shinn et al., 2023) is the paper form of “try, fail, write down why, try again.” The lesson is text in the next prompt. The weights do not move. That is also why a bad lesson poisons the next attempt: you are retrieving your own earlier mistake.
+
+<figure class="paper-shot">
+<img src="/part-03/chapter-10/papers/reflexion-2023-abstract.png" alt="Title and abstract of Reflexion: Language Agents with Verbal Reinforcement Learning, Shinn et al. 2023" />
+<figcaption>Shinn, Cassano, Berman, Gopinath, Narasimhan &amp; Yao (2023), <em>Reflexion: Language Agents with Verbal Reinforcement Learning</em>. <a href="https://arxiv.org/abs/2303.11366">arXiv:2303.11366</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-03/chapter-10/papers/reflexion-2023-figure.png" alt="First figure of the Reflexion paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2303.11366">HTML version</a>.</figcaption>
+</figure>
