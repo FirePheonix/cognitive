@@ -138,3 +138,16 @@ Don't use it when:
 - You're calling OpenAI, Anthropic, or Gemini APIs directly
 - Slightly occasional validation failures are acceptable and catchable
 - You need maximum throughput
+
+![Free generation can emit a trailing comma; a grammar mask sets that token's logit to negative infinity](/part-03/chapter-08/json-vs-grammar.png)
+*Fig: JSON mode asks the model to behave. A grammar makes the illegal token impossible. Retries still belong in the pipeline for values that are structurally valid and semantically wrong.*
+
+<figure class="paper-shot">
+<img src="/part-03/chapter-08/papers/guided-generation-2023-abstract.png" alt="Title and abstract of Efficient Guided Generation for Large Language Models, Willard and Louf 2023" />
+<figcaption>Willard &amp; Louf (2023), <em>Efficient Guided Generation for Large Language Models</em> — the Outlines / finite-state-machine approach to masking tokens that would break a grammar. <a href="https://arxiv.org/abs/2307.09702">arXiv:2307.09702</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-03/chapter-08/papers/guided-generation-2023-figure.png" alt="First figure of the guided generation paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2307.09702">HTML version</a>.</figcaption>
+</figure>
