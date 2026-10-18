@@ -216,3 +216,16 @@ The `health_report()` method exposes circuit state — useful for monitoring das
 | Circuit-breaker | ~0ms overhead | N/A (availability) | Low |
 
 In practice, use rule-based for obvious cases (token count), classification-based for general routing, and circuit-breaker for availability. These three work together, not as alternatives.
+
+![A request hits a small model first and escalates only if the score is below a threshold](/part-03/chapter-11/model-cascade.png)
+*Fig: A cascade spends the large model on the tail. FrugalGPT measured this as a cost cut with a quality floor: keep the cheap answer when a score says it is good enough.*
+
+<figure class="paper-shot">
+<img src="/part-03/chapter-11/papers/frugalgpt-2023-abstract.png" alt="Title and abstract of FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance, Chen et al. 2023" />
+<figcaption>Chen, Zaharia &amp; Zou (2023), <em>FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance</em>. <a href="https://arxiv.org/abs/2305.05176">arXiv:2305.05176</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-03/chapter-11/papers/frugalgpt-2023-figure.png" alt="First figure of the FrugalGPT paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2305.05176">HTML version</a>.</figcaption>
+</figure>
