@@ -190,3 +190,8 @@ If you're currently using static batching and considering switching:
 - Throughput improvement from continuous batching: 3–8× for mixed workloads
 - Use static batching for: overnight scoring jobs, evaluations, experiments
 - Use continuous batching for: all user-facing APIs, mixed-length workloads, high-throughput serving
+
+![Static batch holds A until B finishes; continuous batch frees A and admits C on the next step](/part-02/chapter-05/static-vs-continuous.png)
+*Fig: Static batching is one unit of work. Continuous batching, the iteration-level scheduling in Orca (Yu et al., OSDI 2022), changes who is in the batch at every decode step. vLLM’s scheduler is this idea plus the pager in the next section.*
+
+Orca is a USENIX paper, not an arXiv HTML page: [Yu et al., Orca: A Distributed Serving System for Transformer-Based Generative Models](https://www.usenix.org/conference/osdi22/presentation/yu). The claim that mattered: schedule at the iteration, not at the request, or short chats wait behind long ones.

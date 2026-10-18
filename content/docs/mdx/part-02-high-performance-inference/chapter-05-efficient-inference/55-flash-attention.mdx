@@ -191,3 +191,16 @@ FlashAttention requires CUDA and GPU SRAM — it's not applicable to CPU inferen
 - FlashAttention-2 adds better parallelism; FlashAttention-3 exploits H100-specific hardware
 - Used by default in vLLM, TGI, TensorRT-LLM, and PyTorch 2.0+'s `scaled_dot_product_attention`
 - Enable in HuggingFace with `attn_implementation="flash_attention_2"`
+
+![Standard attention writes an N by N score matrix to HBM; FlashAttention keeps tiles in SRAM](/part-02/chapter-05/flash-tiles.png)
+*Fig: The algorithm is exact attention. The change is which memory the N×N scores touch. Online softmax keeps a running max and a running denominator so a tile can be finished before the next tile arrives.*
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-05/papers/flashattention-2022-abstract.png" alt="Title and abstract of FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness, Dao et al. 2022" />
+<figcaption>Dao, Fu, Ermon, Rudra &amp; Ré (2022), <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>. <a href="https://arxiv.org/abs/2205.14135">arXiv:2205.14135</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-05/papers/flashattention-2022-figure.png" alt="First figure of the FlashAttention paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2205.14135">HTML version</a>.</figcaption>
+</figure>

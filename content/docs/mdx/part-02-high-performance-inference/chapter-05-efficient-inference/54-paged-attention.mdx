@@ -195,3 +195,16 @@ The 24× throughput improvement over HuggingFace comes from the combination of:
 - Copy-on-write enables physical block sharing for identical prefixes — 100 requests with the same system prompt use the same physical blocks
 - The modified attention kernel adds negligible overhead for the block table lookup
 - Combined with continuous batching, PagedAttention delivers 24× throughput improvement over naive serving
+
+![Logical KV blocks of 16 tokens mapped onto scattered physical GPU pages](/part-02/chapter-05/paged-blocks.png)
+*Fig: The sequence’s block table says block 0 lives at physical page 7. The GPU does not need a contiguous reservation of max_tokens. That is the difference between “650 MB free” and “400 MB contiguous free”.*
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-05/papers/paged-attention-2023-abstract.png" alt="Title and abstract of Efficient Memory Management for Large Language Model Serving with PagedAttention, Kwon et al. 2023" />
+<figcaption>Kwon, Li, Zhuang, Sheng, Zheng, Yu, Gonzalez, Zhang &amp; Stoica (2023), <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>. <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-05/papers/paged-attention-2023-figure.png" alt="Figure 1 of the PagedAttention paper: on an A100 40GB a 13B model leaves more than 30 percent of memory for the KV cache, and vLLM’s memory grows slower than existing systems as the batch grows" />
+<figcaption>Figure 1 from the same paper. Left: a 13B model on an A100 40GB spends 26 GB on weights and more than 30% on the KV cache. Right: existing systems run out of cache memory by batch size ~10; vLLM’s curve stays smooth out toward 40, and throughput follows. <a href="https://ar5iv.labs.arxiv.org/html/2309.06180">HTML version</a>.</figcaption>
+</figure>
