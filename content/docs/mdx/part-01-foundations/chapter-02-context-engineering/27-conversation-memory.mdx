@@ -13,6 +13,9 @@ Memory is how you fix this. Not by making the model "remember" things — the mo
 
 ## Three Tiers of Memory
 
+![Three tiers of memory: short-term messages, episodic facts, semantic search](/part-01/chapter-02/three-memory-tiers.png)
+*Fig: The weights store none of this. You store it, then inject a slice at session start. Short-term dies with the window. Episodic is extracted facts. Semantic is searchable knowledge.*
+
 ### Tier 1: Short-Term Memory (Current Conversation)
 
 This is the message list — the raw back-and-forth of the current session. The model can see everything in the current context window, so this "memory" is automatic. No special infrastructure needed.

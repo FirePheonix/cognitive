@@ -52,6 +52,9 @@ A context engineer asks: *"What does the model need to know right now to answer 
 
 The book organizes the context window into four layers, assembled in this order:
 
+![The context window is a stack: identity, instructions, injection, output constraints](/part-01/chapter-02/four-layer-stack.png)
+*Fig: Prompt engineering mostly words Layer 2. Context engineering fills the rest. Assemble top to bottom on every request. Section 2.3 draws the same stack with tools hanging off the side.*
+
 **Layer 1 — Identity**
 Who the agent is. Its name, role, capabilities, and hard limits. This sets the frame for everything else.
 

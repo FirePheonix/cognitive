@@ -65,6 +65,9 @@ def build_system_prompt(
     return f"{identity}\n\n{instructions}\n\n{context_block}\n\n{output_format}"
 ```
 
+![Build the prompt at request time from stable blocks plus this-request data](/part-01/chapter-02/assemble-at-request-time.png)
+*Fig: Identity and instructions are stable. User, top retrieved docs, and memory change every call. Log the assembled string. If a bug shows up, the first question is what the model actually received.*
+
 Every call to `build_system_prompt()` produces a prompt tailored to the exact state of that request. Nothing is stale. Nothing is hardcoded. The logic is testable.
 
 ---

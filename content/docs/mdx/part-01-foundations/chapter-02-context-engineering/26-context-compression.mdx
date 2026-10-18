@@ -43,6 +43,9 @@ def compress_history(
     return summary, recent
 ```
 
+![Compression step 1: keep the last four turns raw, summarize everything older](/part-01/chapter-02/rolling-summary.png)
+*Fig: Trigger at about 70% of the history budget, not after overflow. Failed retries collapse to one-line lessons.*
+
 The summary gets injected into the system prompt's context layer: "Conversation so far: [summary]". The recent messages stay as raw turns.
 
 ### Strategy 2: Selective Retention
@@ -112,6 +115,9 @@ The scratchpad accumulates facts across the entire session. Instead of keeping a
 ```
 
 This scratchpad costs ~400 tokens but replaces 3,000 tokens of raw history. And crucially, it contains *more* useful information than the raw history — the history includes all the false starts and filler; the scratchpad only has what matters.
+
+![Compression step 2: a structured scratchpad of task, decisions, and failed approaches](/part-01/chapter-02/scratchpad-facts.png)
+*Fig: Summarizing chat into more chat still wastes tokens. Extract facts. Four hundred tokens of structure can replace three thousand tokens of filler — and is easier for the next step to use.*
 
 ---
 

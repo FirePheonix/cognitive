@@ -120,3 +120,6 @@ Load only the three relevant files (3K tokens) + relevant doc sections loaded on
 Option B costs 20x less. For most requests, the model doesn't need the full repository — it needs the three files relevant to the current task. Retrieval and progressive disclosure let you get Option A quality at Option B cost, most of the time.
 
 The exception: tasks where you genuinely need holistic understanding of a large codebase. For those, the large context window earns its cost. For the majority of targeted tasks, it doesn't.
+
+![Fill the window by priority: whole-repo dump versus three files plus on-demand docs](/part-01/chapter-02/budget-targeted-vs-full.png)
+*Fig: Option A is ~120K tokens. Option B is ~6K. Same task, roughly 20× cheaper, usually the same quality. Always keep identity, current task, last tool result, and active errors. Load the rest on demand.*

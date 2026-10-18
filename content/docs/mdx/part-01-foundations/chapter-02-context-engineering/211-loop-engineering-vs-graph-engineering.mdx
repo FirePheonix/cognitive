@@ -156,6 +156,32 @@ The loop is simpler, faster to build, and easier to debug. The graph is more exp
 
 ---
 
+## How this is talked about in public
+
+The split is the same line Anthropic drew in [*Building effective agents*](https://www.anthropic.com/engineering/building-effective-agents): **workflows** are predefined code paths; **agents** are a model directing its own process. Their advice is still the right default — find the simplest structure that works, and only add topology when a single call (or a single loop) is demonstrably not enough. Anthropic's *orchestrator-workers* pattern is the graph picture people keep redrawing: one model breaks the job up, specialists run, results come back.
+
+On the Claude Code team, a loop is an agent repeating a cycle of work until a stop condition is met. Their [getting-started-with-loops](https://claude.com/resources/articles/getting-started-with-loops) note splits loops by trigger:
+
+| Loop | You hand off | Reach for |
+|------|----------------|-----------|
+| Turn-based | The check | A user prompt; Claude stops when it thinks it's done |
+| Goal-based | The stop condition | `/goal` — tests pass, score ≥ 90, stop after N tries |
+| Time-based | The trigger | `/loop`, `/schedule` — recurring or watching an external system |
+| Proactive | The prompt itself | Event or routine; no human in the room |
+
+Addy Osmani's *Loop Engineering* popularized a close taxonomy (heartbeat, cron, hook, goal). The line that stuck, from Boris Cherny, is: *I don't prompt Claude anymore. I write loops that prompt Claude.*
+
+Graphs showed up in public as a reaction, not a replacement. Peter Steinberger's July 2026 question — "Are we still talking loops or did we shift to graphs yet?" — and Hamel Husain's "Loop Engineering Is Dead. Enter Graph Engineering" named a practice LangGraph, AutoGen, and Anthropic's orchestrator-workers pattern had already been doing: specialized nodes, shared state, inspectable edges. A useful correction from that wave ([Dev Compass](https://devcompass.hashnode.dev/loop-engineering-vs-graph-engineering-part-1), [PALO IT](https://www.palo-it.com/en/blog/loop-and-graph-engineering)): **a loop is a graph with one node that points at itself.** Graph engineering composes loops. It does not retire them.
+
+Carlos E. Perez's control-theory version is worth keeping in view: a single loop fails by Goodhart (it will game its own metric), by never questioning its reference, by fighting neighboring loops, and by measurement decay. A graph of loops can watch, constrain, and audit other loops — but only if some edges still touch reality (tests that actually ran, customers who actually stayed). A graph of agents grading each other is "everything is consistent and nothing is verified."
+
+The picture that keeps showing up: one generalist Claude cycling until done, versus one orchestrator Claude dispatching other Claudes on *different lines* — solid dispatch, thick fan-out, dashed bounded retry, dotted escalate-to-human. PALO IT's minimal graph is four things a loop leaves implicit: a guarded route, a deterministic gate, a bounded retry, and a human node.
+
+![One Claude looping versus one Claude orchestrating other Claudes on solid dashed and dotted edges](/part-01/chapter-02/loop-vs-graph.png)
+*Fig: Same sparkle, different lines. Left: one agent, routing in its head, until verify says stop. Right: an orchestrator fans out to research / write / review; dashed is a bounded retry; dotted is a human. Start with the while-loop. Graduate to named edges when you need hard human gates, real parallelism, or an auditable state machine.*
+
+---
+
 ## The Practical Starting Point
 
 Start with a loop. It covers 80% of agent use cases. If you find yourself needing:

@@ -108,6 +108,9 @@ Most relevant sections:
 
 The summary gives the model structural context ("this is a 50-page contract about software licensing"). The chunks give it the specific content needed to answer the query. Together, they're more useful than either alone — and cheaper than loading the full document.
 
+![Long context versus RAG versus hybrid: summary plus retrieved chunks](/part-01/chapter-02/long-context-vs-rag.png)
+*Fig: Dump a long document when cross-references matter. Retrieve when you have thousands of pages and need three. Hybrid: a cheap overview of the whole thing plus the needles.*
+
 ---
 
 ## Practical Recommendations
@@ -117,5 +120,8 @@ The summary gives the model structural context ("this is a 50-page contract abou
 **Add long context for specific failure modes.** If you notice the model missing cross-document dependencies or failing on questions that require holistic understanding, then invest in larger context.
 
 **Watch the lost-in-the-middle problem.** Research has shown that models perform worse on information buried in the middle of a very long context. Put the most important content at the beginning or end of the window, not the middle.
+
+![Lost in the middle: start and end of a long prompt are used better than the buried middle](/part-01/chapter-02/lost-in-the-middle.png)
+*Fig: Put the question and the best evidence at the edges. Do not hide the answer in token 40,000 of 100,000. This is one reason pasting the whole corpus can lower quality.*
 
 **Budget aggressively.** Long context is expensive. A 100K-token prompt at GPT-4o pricing costs ~$0.25 in input tokens alone. At 10,000 requests per day, that's $2,500/day in input costs before you've generated a single token. Know what you're paying for.
