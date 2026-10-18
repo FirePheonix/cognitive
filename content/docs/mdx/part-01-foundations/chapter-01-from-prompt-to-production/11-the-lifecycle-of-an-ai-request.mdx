@@ -50,6 +50,9 @@ E --> C
 C --> F
 ```
 
+![An AI request has five stages: user, context, model, tools, response](/part-01/chapter-01/lifecycle-five-stages.png)
+*Fig: The same pipeline as the flowchart above. If a tool runs, its result is injected as fresh context and generation continues. From the user's seat it is one conversation; behind the scenes it is a loop.*
+
 Once the complete context has been assembled, it is sent to the language model. Contrary to popular belief, the model does not search a database for answers, nor does it browse the internet by default. Instead, it performs **inference**—a forward pass through a neural network containing billions of learned parameters.
 
 The text is first broken into smaller pieces called **tokens**, which are converted into numerical vectors. These vectors pass through multiple Transformer layers where attention mechanisms allow every token to interact with every other relevant token in the prompt. Rather than retrieving a stored sentence, the model continuously predicts the **most probable next token** based on everything it has seen so far.
@@ -119,6 +122,9 @@ LLM --> Backend
 Backend --> Frontend
 Frontend --> User
 ```
+
+![The model is not the application: frontend, orchestrator, then the LLM as a service](/part-01/chapter-01/architecture-layers.png)
+*Fig: Frontend, orchestrator, language model. The orchestrator decides what the model sees, which tools it may call, and how the answer is shown. Improving that layer often beats swapping models.*
 
 One important observation is that **the language model is no longer the center of modern AI applications**. Instead, the orchestrator has become equally important because it decides **what information the model receives**, **which tools it can access**, **what memories should be included**, and **how the final answer should be presented**. In many production systems, improving context engineering produces larger quality improvements than switching to a slightly larger language model.
 

@@ -83,6 +83,9 @@ D --> E
 E --> F
 ```
 
+![RAG: query, retrieve, inject into the prompt, then generate](/part-01/chapter-01/rag-informed.png)
+*Fig: The LLM does not become more knowledgeable. At request time you search a store, paste the hits into the prompt, and let the same frozen weights reason over fresh text. If the retriever misses, the model cannot invent the missing page.*
+
 ---
 
 # Tool Execution

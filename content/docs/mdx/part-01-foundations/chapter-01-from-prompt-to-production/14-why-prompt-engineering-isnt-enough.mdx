@@ -53,6 +53,9 @@ Instead, it becomes:
 
 > **"How do I ensure the model has the right information at the right time?"**
 
+![A perfect prompt cannot invent missing facts: instructions versus information](/part-01/chapter-01/prompt-vs-context.png)
+*Fig: Prompt engineering words the instructions. Context engineering decides what information the model is allowed to see. Most production quality bugs are the second kind.*
+
 That single change in perspective transforms the role of the engineer. Instead of focusing exclusively on instruction wording, developers begin designing retrieval pipelines, memory systems, prompt builders, tool orchestration, document processing, caching strategies, and evaluation frameworks. The quality of the application becomes increasingly determined by how effectively these components work together.
 
 This is why many production AI teams spend relatively little time experimenting with clever prompt wording and far more time improving context construction. Better retrieval often produces larger gains than a more elaborate prompt. Better memory improves personalization without changing the instructions. Better tool orchestration enables entirely new capabilities that prompts alone could never achieve.
