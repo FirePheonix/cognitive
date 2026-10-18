@@ -48,6 +48,8 @@ tensor_3d shape: (batch_size, seq_len, emb_dim)
              ← 32 sentences, each 128 tokens, each token a 768-dim vector
 ```
 
+![Tensors: add one axis at a time. 0-D scalar 42; 1-D vector of three floats; 2-D matrix of two tokens × three dims; 3-D batch of two sentences (“the cat”, “a dog”). The residual stream of a Transformer is (B, T, d) — batch × tokens × channels.](/appendix-a/04-tensors/ranks-0d-to-3d.png)
+
 Every number inside a neural network — every input, every weight, every intermediate result — lives in a tensor. The shape tells you exactly what the dimensions represent.
 
 ---
