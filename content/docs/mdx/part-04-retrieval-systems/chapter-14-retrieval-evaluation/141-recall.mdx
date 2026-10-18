@@ -142,3 +142,6 @@ When recall is low, the most effective interventions:
 Increasing K improves recall at the cost of more tokens in context (higher cost, lower precision). The practical ceiling: if you need Recall@5 > 0.85 but your current system achieves 0.85 at K=20, that's a signal to improve your retrieval quality rather than just increasing K.
 
 Track recall as a continuous metric in production. A drop in recall without a system change often indicates corpus drift — new documents that are being added but not retrieved, or embedding distribution shift.
+
+![Ten relevant chunks exist; five were returned and three of those are relevant, so recall is 0.30 and precision is 0.60](/part-04/chapter-14/recall-precision.png)
+*Fig: Recall asks whether the generator ever saw the passage. Precision asks whether the prompt is full of passages it should ignore. Raising k moves the first number up and the second one down. Reranking is the attempt to move both.*
