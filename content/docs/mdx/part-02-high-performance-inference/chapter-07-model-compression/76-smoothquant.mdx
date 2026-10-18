@@ -191,3 +191,15 @@ For serving on non-A100/H100 hardware: use weight-only quantization (GPTQ or AWQ
 - Quality: ~99% of fp16 — near-zero degradation
 - Compute benefit: up to 2× throughput on A100/H100 with native int8 GEMM
 - Best used with TensorRT-LLM for production deployment
+
+SmoothQuant (Xiao et al., 2022) is about activations, not only weights. Outlier activations make per-token int8 activation quantization inaccurate. The trick is a per-channel scale that moves difficulty from the activation into the weight, so both can be int8 and the matmul stays an integer GEMM (W8A8).
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-07/papers/smoothquant-2022-abstract.png" alt="Title and abstract of SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models, Xiao et al. 2022" />
+<figcaption>Xiao, Lin, Seznec, Wu, Demouth &amp; Han (2022), <em>SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models</em>. <a href="https://arxiv.org/abs/2211.10438">arXiv:2211.10438</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-07/papers/smoothquant-2022-figure.png" alt="First figure of the SmoothQuant paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2211.10438">HTML version</a>.</figcaption>
+</figure>

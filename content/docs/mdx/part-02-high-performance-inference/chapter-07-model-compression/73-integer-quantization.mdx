@@ -196,3 +196,6 @@ Math and complex reasoning are most sensitive to quantization. Code generation i
 - Outliers in weight matrices expand the scale and degrade quantization quality for all other weights
 - PTQ: quantize after training, no compute needed, within 1–2% for int8, 2–5% for int4 (with GPTQ/AWQ)
 - Math and reasoning are most sensitive to quantization; general conversation is most resilient
+
+![Four weights 0, 0.4, 0.8, 1.2 quantized to 4-bit codes 0, 5, 10, 15 with scale 0.08](/part-02/chapter-07/quant-scale.png)
+*Fig: Toy asymmetric 4-bit quantization. scale = (max − min) / 15 = 0.08. A weight of 0.42 would land on the same code as 0.40. GPTQ, AWQ, and SmoothQuant argue about how to choose that scale so the snap hurts the layer’s output less. They do not change this arithmetic.*

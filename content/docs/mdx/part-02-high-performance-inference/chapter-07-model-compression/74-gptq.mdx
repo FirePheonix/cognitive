@@ -205,3 +205,15 @@ This is a one-time cost — you quantize once and use the result forever. The ca
 - Pre-quantized models available on HuggingFace (TheBloke, etc.)
 - Supported in vLLM (`--quantization gptq`) and AutoGPTQ library
 - Quantization takes 30 min to 8 hours depending on model size — one-time cost
+
+GPTQ (Frantar et al., 2022) is post-training quantization that uses a second-order approximation — which weights, if snapped, move the layer output the most — and quantizes a column at a time while compensating the ones still in float. That is why it needs a calibration set and why it is slow relative to AWQ.
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-07/papers/gptq-2022-abstract.png" alt="Title and abstract of GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers, Frantar et al. 2022" />
+<figcaption>Frantar, Ashkboos, Hoefler &amp; Alistarh (2022), <em>GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</em>. <a href="https://arxiv.org/abs/2210.17323">arXiv:2210.17323</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-07/papers/gptq-2022-figure.png" alt="First figure of the GPTQ paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2210.17323">HTML version</a>.</figcaption>
+</figure>

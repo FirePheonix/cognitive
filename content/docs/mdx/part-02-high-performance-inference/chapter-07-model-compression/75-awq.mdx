@@ -198,3 +198,15 @@ The speedup comes from AWQ's simpler per-channel scaling approach vs GPTQ's sequ
 - Available via `autoawq` library and `--quantization awq` in vLLM
 - Pre-quantized AWQ models available on HuggingFace
 - Default choice for new int4 quantization deployments
+
+AWQ (Lin et al., 2023) starts from a different observation: a few channels have much larger activations, and quantizing those weights carelessly wrecks the output even if most weights were fine. It rescales the important channels so they keep more precision, and it does not need the Hessian GPTQ builds. That is the speed difference in the list above.
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-07/papers/awq-2023-abstract.png" alt="Title and abstract of AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration, Lin et al. 2023" />
+<figcaption>Lin, Tang, Tang, Yang, Dang, Gan &amp; Han (2023), <em>AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</em>. <a href="https://arxiv.org/abs/2306.00978">arXiv:2306.00978</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-07/papers/awq-2023-figure.png" alt="First figure of the AWQ paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2306.00978">HTML version</a>.</figcaption>
+</figure>
