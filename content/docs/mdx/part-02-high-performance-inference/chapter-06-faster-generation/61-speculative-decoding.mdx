@@ -165,3 +165,16 @@ The draft model's KV cache and weights add modest overhead. On the same hardware
 - Common pairs: Llama-3-70B + Llama-3-8B, Llama-3-8B + Llama-3.2-1B
 - Typical speedup: 2–4× for common tasks (summarization, code, factual Q&A)
 - vLLM: `--speculative-model` and `--num-speculative-tokens` flags
+
+![A draft of four tokens: three accepted, the fourth rejected, then one resampled token from the target](/part-02/chapter-06/speculative-step.png)
+*Fig: Four cheap draft steps, one target forward pass, three accepts, one correction. The acceptance test is min(1, p_target / p_draft). The chapter’s rule of thumb sits on top of this picture: tokens per big step ≈ γ·α + 1.*
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-06/papers/speculative-decoding-2023-abstract.png" alt="Title and abstract of Fast Inference from Transformers via Speculative Decoding, Leviathan et al. 2023" />
+<figcaption>Leviathan, Kalman &amp; Matias (2023), <em>Fast Inference from Transformers via Speculative Decoding</em>. <a href="https://arxiv.org/abs/2211.17192">arXiv:2211.17192</a>. The matching result from DeepMind is Chen et al., <a href="https://arxiv.org/abs/2302.01318">Accelerating Large Language Model Decoding with Speculative Sampling</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-02/chapter-06/papers/speculative-decoding-2023-figure.png" alt="First figure of the speculative decoding paper" />
+<figcaption>First figure of Leviathan et al. <a href="https://ar5iv.labs.arxiv.org/html/2211.17192">HTML version</a>.</figcaption>
+</figure>
