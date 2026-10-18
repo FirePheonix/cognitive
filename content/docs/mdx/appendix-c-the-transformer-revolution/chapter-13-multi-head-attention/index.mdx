@@ -1,165 +1,110 @@
 ---
 title: 13. Multi-Head Attention
-lastUpdatedDate: '2026-08-10'
+lastUpdatedDate: '2026-10-18'
 ---
 
 # 13. Multi-Head Attention
 
-Chapter 12 built a complete self-attention layer. But the transformer doesn't use just one attention operation — it uses several of them running in parallel. This is **multi-head attention**, and it's one of the ideas that makes the transformer significantly more expressive than a single attention head could be.
+Chapter 12 built one attention operation: every token produces one query, compares it with every key, and gets back one weighted average of values. That's a real limitation. A weighted average is a single blend, so a token can only follow **one kind of relationship at a time**.
 
-The intuition is simple: a single attention head has to produce one weighted average. But language has multiple simultaneous relationships worth tracking.
+Look at *it* in "The animal didn't cross the street because it was too tired." To understand *it*, a model wants several things at once: which noun *it* refers to (*animal*), which verb it belongs to (*was*), what came just before it (*because*), and roughly what the sentence is about. One softmax has to choose how to split a single unit of weight across all of those, and the answer ends up a muddy compromise.
 
----
-
-## Why One Head Isn't Enough
-
-Consider the sentence: "The animal didn't cross the street because it was too tired."
-
-To understand "it," a model needs to simultaneously resolve:
-
-1. **Coreference**: "it" refers to "animal" — a semantic relationship
-2. **Syntactic subject**: "it" is the subject of "was" — a grammatical relationship
-3. **Causal reasoning**: "it was too tired" explains "didn't cross" — a logical relationship
-
-A single attention head has to produce **one weighted average** of all positions. It can't simultaneously peak at "animal" (for coreference) AND spread evenly over the clause "didn't cross the street" (for causal reasoning). It has to average these competing signals, which weakens all of them.
-
-The original paper puts it this way:
-> "Multi-head attention allows the model to jointly attend to information from different representation subspaces at different positions. With a single attention head, averaging inhibits this."
-
-The solution: run multiple attention heads in parallel, each learning to attend to a different "type" of relationship. Then concatenate their outputs.
-
-```text
-Multi-head attention — same X feeds all heads in parallel:
-
-         Input X   (batch, seq, d_model)
-         ┌──────────────────────────────┐
-         │  tok0: [0.50, 0.86, -0.23 …] │
-         │  tok1: [-0.10, -0.41, 0.14…] │
-         └──────────────────────────────┘
-                  │          │          │          │
-                  ↓          ↓          ↓          ↓
-              W_Q₁,K₁,V₁  W_Q₂,K₂,V₂  W_Q₃,K₃,V₃   W_Qₕ,Kₕ,Vₕ
-              ┌────────┐  ┌────────┐  ┌────────┐    ┌────────┐
-              │ Head 1 │  │ Head 2 │  │ Head 3 │ …  │ Head h │
-              │ d_k=64 │  │ d_k=64 │  │ d_k=64 │    │ d_k=64 │
-              └────────┘  └────────┘  └────────┘    └────────┘
-                  │          │          │                │
-              out₁(seq,64) out₂(seq,64) out₃(seq,64) … outₕ(seq,64)
-                  └──────────┴──────────┴────────────────┘
-                                    │  concat
-                            (seq, h×64) = (seq, d_model)
-                                    │
-                                  × W_O   (d_model × d_model)
-                                    │
-                            Output  (seq, d_model)
-                         same shape as input ↑
-
-  d_model = h × d_k  →  total compute = same as one big head
-  but each head can specialize on a different relationship type.
-```
-
-```mermaid
-flowchart TB
-    X["Input X\n(batch, seq, d_model)"]
-    X --> h1["Head 1\n(Q₁K₁V₁)\nlearns: coreference"]
-    X --> h2["Head 2\n(Q₂K₂V₂)\nlearns: subject-verb"]
-    X --> h3["Head 3\n(Q₃K₃V₃)\nlearns: causal/logical"]
-    X --> h4["Head 4..h\n(Q₄K₄V₄)\nlearns: ..."]
-    h1 & h2 & h3 & h4 --> concat["Concatenate\n(batch, seq, h×d_k)"]
-    concat --> W_O["W_O projection\n(batch, seq, d_model)"]
-    W_O --> output["Output\n(batch, seq, d_model)"]
-```
+**Multi-head attention** (Vaswani et al., 2017) runs several smaller attention operations side by side, each with its own projections, so each can look for something different, and then merges what they found. It is the version of attention every Transformer actually uses.
 
 ---
 
-## The Reshape Trick, Drawn Out
+## The idea
 
-The big W_Q projection packs all heads' weights side by side. After the multiply you just slice the result to get per-head matrices. Here it is with actual numbers (2 tokens, `d_model=8`, 2 heads, `d_k=4`):
+Instead of one attention with $d_{\text{model}}$-dimensional queries and keys, use $h$ **heads**, each working in a smaller $d_k = d_{\text{model}} / h$ dimensional space. In the original Transformer, $d_{\text{model}} = 512$ and $h = 8$, so each head has $d_k = 64$.
 
-```text
-STEP 1 — Q_full = X @ W_Q   (one big matrix multiply for all heads at once)
+Each head has its own three projection matrices, so it asks its own question:
 
-  X  shape (2, 8)
-              d0      d1      d2      d3      d4      d5      d6      d7
-  tok0  ┌────────┬────────┬────────┬────────┬────────┬────────┬────────┬────────┐
-        │  −0.53 │  +0.40 │  +0.79 │  −1.74 │  +0.28 │  +0.46 │  −0.55 │  +0.30 │
-        ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
-  tok1  │  +1.18 │  −0.09 │  −0.35 │  +0.22 │  −0.89 │  +0.67 │  +0.71 │  −0.18 │
-        └────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┘
+$$
+\text{head}_i = \operatorname{Attention}\!\left( X W_i^{Q},\; X W_i^{K},\; X W_i^{V} \right),
+\qquad W_i^{Q}, W_i^{K}, W_i^{V} \in \mathbb{R}^{d_{\text{model}} \times d_k}
+$$
 
-  W_Q  shape (8, 8)  — columns 0-3 = head 0 weights,  columns 4-7 = head 1 weights
-  (8×8 shown abbreviated)
+Then the head outputs are placed side by side and mixed by one more matrix:
 
-  Q_full = X @ W_Q   shape (2, 8)
-  Left 4 cols = head 0 queries,  Right 4 cols = head 1 queries
+$$
+\operatorname{MultiHead}(X) = \operatorname{Concat}\!\left(\text{head}_1, \dots, \text{head}_h\right) W^{O},
+\qquad W^{O} \in \mathbb{R}^{h d_k \times d_{\text{model}}}
+$$
 
-         ┌── HEAD 0 queries ──────────────┬── HEAD 1 queries ──────────────┐
-         │  h0q0    h0q1    h0q2    h0q3  │  h1q0    h1q1    h1q2    h1q3  │
-  tok0   │  −0.83  +1.24   −0.41  +0.97  │  +1.52   −0.68  +0.33   −1.14  │
-  tok1   │  +0.49  −0.72   +1.03  −0.28  │  −0.61  +0.89   −1.24  +0.45   │
-         └────────────────────────────────┴────────────────────────────────┘
-```
+Each head produces an $n \times d_k$ output; concatenating $h$ of them gives $n \times d_{\text{model}}$ again, and $W^O$ maps it back into the model's space. Same shape in, same shape out.
 
-```text
-STEP 2 — Reshape Q_full  →  split into per-head matrices
+![Multi-head attention data flow with d_model = 512, h = 8, d_k = 64. The input X (batch, seq, 512) fans out to eight heads, each with its own W_Q, W_K, W_V projecting 512 → 64. Under each head is a small attention map showing a different pattern: head 1 looks at the previous word, head 2 links "it" to "animal", head 3 looks at the first token, head 8 averages the context. Their outputs are concatenated (8 × 64 = 512), multiplied by W_O (512 × 512) to mix the heads, giving an output of the same shape as X. Side panels give the equations and explain that the total parameters and FLOPs equal one 512-dimensional head.](/appendix-c/13-multi-head-attention/multi-head-overview.png)
 
-  .reshape(seq=2, heads=2, d_k=4)  then  .transpose(heads, seq)
-
-  HEAD 0 queries  Q₀   shape (2, 4)       HEAD 1 queries  Q₁   shape (2, 4)
-         q0      q1      q2      q3               q0      q1      q2      q3
-  tok0 ┌────────┬────────┬────────┬────────┐  tok0 ┌────────┬────────┬────────┬────────┐
-       │  −0.83 │  +1.24 │  −0.41 │  +0.97 │       │  +1.52 │  −0.68 │  +0.33 │  −1.14 │
-       ├────────┼────────┼────────┼────────┤       ├────────┼────────┼────────┼────────┤
-  tok1 │  +0.49 │  −0.72 │  +1.03 │  −0.28 │  tok1 │  −0.61 │  +0.89 │  −1.24 │  +0.45 │
-       └────────┴────────┴────────┴────────┘       └────────┴────────┴────────┴────────┘
-  Same split for K₀/K₁ and V₀/V₁.
-```
-
-```text
-STEP 3 — Each head computes attention independently (in parallel on GPU)
-
-  Head 0:  Q₀ @ K₀ᵀ / √d_k  →  softmax  →  × V₀   →  out₀  shape (2, 4)
-  Head 1:  Q₁ @ K₁ᵀ / √d_k  →  softmax  →  × V₁   →  out₁  shape (2, 4)
-
-STEP 4 — Concatenate head outputs
-
-  concat([out₀, out₁], dim=-1)  →  shape (2, 8) = (seq, d_model)
-
-         ┌── head 0 out ──────────────────┬── head 1 out ──────────────────┐
-         │  h0v0    h0v1    h0v2    h0v3  │  h1v0    h1v1    h1v2    h1v3  │
-  tok0   │  +0.31  −0.48   +0.73  −0.20  │  +0.89   −0.34  +0.13   −0.56  │
-  tok1   │  −0.21  +0.67   −0.89  +0.44  │  −0.11  +0.53   −0.39  +0.22   │
-         └────────────────────────────────┴────────────────────────────────┘
-
-STEP 5 — W_O projection   (d_model, d_model)  →  output shape (2, 8)
-
-  W_O mixes head outputs together into one coherent representation.
-  Output shape == Input shape   (seq, d_model)  ← always preserved
-```
-
-Same compute as one big single-head attention. More expressive because each head learned different patterns.
+Why does splitting help? Each head's queries and keys live in their own 64-dimensional subspace, learned independently. One head can learn "a pronoun's query matches a noun's key", another "every token's query matches the key of the token just before it". Each runs its own softmax, so they don't have to share one unit of attention. The output projection then combines their findings into one vector per token.
 
 ---
 
-## The Dimension Split: No Extra Compute
+## It costs (almost) nothing extra
 
-Here's the clever engineering: to keep the total computation the same as one big single-head attention, each head works in a **reduced** dimension.
+Splitting doesn't multiply the work; it divides one big attention into $h$ narrow ones. Count it for $d_{\text{model}} = d$, $h$ heads, $d_k = d/h$, sequence length $n$:
 
-If `d_model = 512` and we use `h = 8` heads, each head gets `d_k = d_model / h = 512 / 8 = 64` dimensions. The total work is `8 heads × 64 dims = 512 dims` — identical to one head at 512 dims. Same compute, more expressive.
+| | one head, $d_k = d$ | $h$ heads, $d_k = d/h$ |
+|---|---|---|
+| Q, K, V projection weights | $3d^2$ | $h \cdot 3 \cdot d \cdot (d/h) = 3d^2$ |
+| output projection $W^O$ | $d^2$ | $d^2$ |
+| score multiplications $QK^{\top}$ | $n^2 d$ | $h \cdot n^2 (d/h) = n^2 d$ |
+| mixing $AV$ | $n^2 d$ | $n^2 d$ |
+| attention maps stored | $n^2$ | $h \cdot n^2$ |
+
+Parameters are $4d^2$ either way, and the matrix-multiply FLOPs are identical. The one thing that grows is the number of $n \times n$ attention maps — $h$ of them instead of one. During training those maps are saved for the backward pass, which is part of why FlashAttention (Chapter 12), which never stores them, matters so much for long contexts. The softmax also runs $h$ times, but that is cheap next to the matrix multiplies.
+
+![Same cost, more views — and what W_O really does. Left: a table comparing one head with d_k = 512 against 8 heads with d_k = 64: Q, K, V projections 3·512² both ways, output W_O 512² both ways, score matmuls n²·512 both ways, AV n²·512 both ways, but attention maps stored 1 × n² versus 8 × n². Right: W_O drawn as eight horizontal slabs W_O^(1)…W_O^(8); each head's output multiplies only its own slab and the results are summed, so Concat(head_1…head_h) W_O = Σ_i head_i W_O^(i), the residual-stream view used in interpretability work (Elhage et al., 2021).](/appendix-c/13-multi-head-attention/same-cost-and-wo.png)
+
+### What $W^O$ really does
+
+The "concatenate, then multiply" step has a cleaner reading. Split $W^O$ into $h$ horizontal slabs of $d_k$ rows each, $W^O = \left[W^{O(1)}; \dots; W^{O(h)}\right]$. Matrix multiplication by blocks gives
+
+$$
+\operatorname{Concat}\!\left(\text{head}_1, \dots, \text{head}_h\right) W^{O} \;=\; \sum_{i=1}^{h} \text{head}_i\, W^{O(i)}
+$$
+
+So multi-head attention is literally **$h$ independent attention layers whose outputs are added together**. Each head reads from the token vectors, computes its own weighted average, projects it with its own $W^{O(i)}$, and adds the result back. "Concatenate" is just bookkeeping. This is the view that mechanistic-interpretability research uses (Elhage et al., 2021): every head *reads from* and *writes to* a shared residual stream (Chapter 15) independently.
+
+---
+
+## The reshape trick: all heads in one matrix multiply
+
+You could implement this with a Python loop over eight small attention modules. Nobody does, because GPUs are fastest on a few large matrix multiplies, not many small ones. Instead:
+
+1. **One projection for all heads.** Stack the eight $512 \times 64$ matrices $W_i^Q$ side by side into one $512 \times 512$ matrix $W^Q$. Then $Q = XW^Q$ computes every head's queries at once; columns 0–63 belong to head 1, columns 64–127 to head 2, and so on.
+2. **`.view(B, T, h, d_k)`** — cut each 512-vector into 8 chunks of 64. No data moves; the same memory is read differently.
+3. **`.transpose(1, 2)`** — move the head axis next to the batch axis: `(B, h, T, d_k)`. Now "heads" behaves like extra batch entries.
+4. **Attention as usual.** `Q @ K.transpose(-2, -1)` is a batched matrix multiply over $B \cdot h$ independent problems, giving scores of shape `(B, h, T, T)`.
+5. **Merge back:** transpose back, reshape to `(B, T, 512)`, multiply by $W^O$.
+
+![The reshape trick: eight heads, one matrix multiply. Step 1: one projection Q = X W_Q with W_Q of shape 512 × 512 — each token's 512-number query is eight 64-number head chunks side by side. Step 2: .view(B, T, h, d_k) cuts each vector into 8 chunks, (B, T, 512) → (B, T, 8, 64), with no data moving. Step 3: .transpose(1, 2) swaps token and head axes to (B, 8, T, 64). Step 4: attention for all heads at once as a batched matmul, scores (B, 8, T, T). Step 5: transpose back, reshape to (B, T, 512) and multiply by W_O; .contiguous() or .reshape is needed because the transpose left memory in head-major order.](/appendix-c/13-multi-head-attention/split-heads-reshape.png)
+
+Here's the full module, built exactly that way:
 
 ```notebook
 {
-  "title": "Multi-head attention — dimension splitting and parallel computation",
+  "title": "Multi-head attention with the reshape trick",
   "runtime": "Python · PyTorch",
   "cells": [
     {
-      "id": "cell-mha-dimensions",
+      "id": "ch13-mha-1",
       "type": "code",
-      "source": "import torch\nimport torch.nn as nn\nimport math\n\n# Parameters from the original 'Attention Is All You Need' paper\nd_model   = 512\nnum_heads = 8\nd_k       = d_model // num_heads   # = 64 per head\n\nprint('Multi-head attention dimension split:')\nprint(f'  d_model:    {d_model}  (full model dimension)')\nprint(f'  num_heads:  {num_heads}  (number of attention heads)')\nprint(f'  d_k per head: {d_k}  (d_model / num_heads)')\nprint()\nprint('Total computation:')\nprint(f'  Single head at d_model:  {d_model} × {d_model} = {d_model*d_model:,} operations')\nprint(f'  {num_heads} heads at d_k={d_k}:    {num_heads} × {d_k} × {d_k} = {num_heads*d_k*d_k:,} operations')\nprint(f'  Same! ({num_heads} × {d_k}² = {d_model}²/{num_heads})')\nprint()\nprint('Different d_model / num_heads ratios (common configurations):')\nprint(f'{\"Model\":<20} {\"d_model\":<10} {\"heads\":<8} {\"d_k per head\"}')\nprint('-' * 52)\nconfigs = [\n    ('Tiny demo',     64, 4),\n    ('GPT-2 small',  768, 12),\n    ('GPT-2 XL',    1600, 25),\n    ('Original T.', 512,  8),\n    ('GPT-3',       12288, 96),\n]\nfor name, dm, nh in configs:\n    print(f'{name:<20} {dm:<10} {nh:<8} {dm // nh}')",
+      "source": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nclass MultiHeadAttention(nn.Module):\n    def __init__(self, d_model, n_heads):\n        super().__init__()\n        assert d_model % n_heads == 0\n        self.h, self.d_k = n_heads, d_model // n_heads\n        # one big matrix per role = all heads' small matrices side by side\n        self.W_q = nn.Linear(d_model, d_model, bias=False)\n        self.W_k = nn.Linear(d_model, d_model, bias=False)\n        self.W_v = nn.Linear(d_model, d_model, bias=False)\n        self.W_o = nn.Linear(d_model, d_model, bias=False)\n\n    def split(self, t):                       # (B, T, d_model) -> (B, h, T, d_k)\n        B, T, _ = t.shape\n        return t.view(B, T, self.h, self.d_k).transpose(1, 2)\n\n    def forward(self, x, causal=False):\n        B, T, D = x.shape\n        q, k, v = self.split(self.W_q(x)), self.split(self.W_k(x)), self.split(self.W_v(x))\n        scores = q @ k.transpose(-2, -1) / math.sqrt(self.d_k)       # (B, h, T, T)\n        if causal:\n            mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))\n            scores = scores.masked_fill(~mask, float(\"-inf\"))\n        w = F.softmax(scores, dim=-1)\n        heads = w @ v                                                 # (B, h, T, d_k)\n        merged = heads.transpose(1, 2).reshape(B, T, D)               # concat the heads\n        return self.W_o(merged), w\n\n\ntorch.manual_seed(0)\nmha = MultiHeadAttention(d_model=512, n_heads=8)\nx = torch.randn(2, 10, 512)\nout, w = mha(x, causal=True)\nprint(\"input         :\", tuple(x.shape))\nprint(\"attention maps:\", tuple(w.shape), \"  <- (batch, heads, query, key)\")\nprint(\"output        :\", tuple(out.shape))\nprint(\"parameters    :\", f\"{sum(p.numel() for p in mha.parameters()):,}\", \"= 4 x 512^2\")",
       "outputs": [
         {
           "type": "text",
-          "content": "Multi-head attention dimension split:\n  d_model:    512  (full model dimension)\n  num_heads:  8  (number of attention heads)\n  d_k per head: 64  (d_model / num_heads)\n\nTotal computation:\n  Single head at d_model:  512 × 512 = 262,144 operations\n  8 heads at d_k=64:    8 × 64 × 64 = 32,768 operations\n  Same! (8 × 64² = 512²/8)\n\nDifferent d_model / num_heads ratios (common configurations):\nModel                d_model    heads    d_k per head\n----------------------------------------------------\nTiny demo            64         4        16\nGPT-2 small         768        12       64\nGPT-2 XL           1600        25       64\nOriginal T.         512         8        64\nGPT-3             12288        96       128"
+          "content": "input         : (2, 10, 512)\nattention maps: (2, 8, 10, 10)   <- (batch, heads, query, key)\noutput        : (2, 10, 512)\nparameters    : 1,048,576 = 4 x 512^2"
+        }
+      ]
+    },
+    {
+      "id": "ch13-mha-2",
+      "type": "code",
+      "source": "# Check 1: the reshape version equals a plain loop over 8 separate heads.\nouts = []\nfor i in range(mha.h):\n    cols = slice(i * mha.d_k, (i + 1) * mha.d_k)\n    q = x @ mha.W_q.weight[cols].T            # head i's own 512 x 64 projection\n    k = x @ mha.W_k.weight[cols].T\n    v = x @ mha.W_v.weight[cols].T\n    outs.append(F.scaled_dot_product_attention(q, k, v, is_causal=True))\nloop = mha.W_o(torch.cat(outs, dim=-1))\nprint(\"max |reshape - loop over heads|      =\", f\"{(out - loop).abs().max().item():.1e}\")\n\n# Check 2: it also matches PyTorch's nn.MultiheadAttention given the same weights.\nref = nn.MultiheadAttention(512, 8, bias=False, batch_first=True)\nwith torch.no_grad():\n    ref.in_proj_weight.copy_(torch.cat([mha.W_q.weight, mha.W_k.weight, mha.W_v.weight]))\n    ref.out_proj.weight.copy_(mha.W_o.weight)\nmask = torch.triu(torch.ones(10, 10, dtype=torch.bool), diagonal=1)   # True = blocked\nref_out, _ = ref(x, x, x, attn_mask=mask)\nprint(\"max |ours - nn.MultiheadAttention|   =\", f\"{(out - ref_out).abs().max().item():.1e}\")",
+      "outputs": [
+        {
+          "type": "text",
+          "content": "max |reshape - loop over heads|      = 4.8e-07\nmax |ours - nn.MultiheadAttention|   = 3.6e-07"
         }
       ]
     }
@@ -167,65 +112,114 @@ If `d_model = 512` and we use `h = 8` heads, each head gets `d_k = d_model / h =
 }
 ```
 
+Both differences are floating-point rounding: the reshape trick computes exactly the eight separate heads, and PyTorch's built-in layer computes exactly the same thing.
+
 ---
 
-## Implementation: Efficient Multi-Head via Reshape
+## Checking the cost and the $W^O$ identity
 
-You could implement multi-head attention by literally creating `num_heads` separate attention modules. But that's inefficient — it doesn't use the GPU's ability to compute large matrix operations in one shot.
-
-The efficient implementation does all heads' QKV projections in one large matrix multiply, then reshapes the result to separate the heads. This is the standard production approach and what you'll see in every serious transformer codebase.
+The next cell turns the cost table into numbers for $d = 512$, $n = 1{,}024$, and verifies the "sum of per-head writes" identity numerically.
 
 ```notebook
 {
-  "title": "Multi-head attention — efficient implementation with batch reshape",
+  "title": "Parameters, FLOPs, and W_O as a sum over heads",
+  "runtime": "Python · PyTorch (continues from above)",
+  "cells": [
+    {
+      "id": "ch13-cost-1",
+      "type": "code",
+      "source": "d, n = 512, 1024\nprint(f\"{'heads':>5} {'d_k':>5} {'params':>11} {'projection MACs':>16} {'QK^T + AV MACs':>15} {'map entries':>12}\")\nfor h in [1, 8, 16, 64]:\n    d_k = d // h\n    params = 4 * d * d                 # W_q, W_k, W_v, W_o: always d x d each\n    proj = 4 * n * d * d               # the four projections over n tokens\n    attn = 2 * h * n * n * d_k         # h heads x (scores + mixing)\n    maps = h * n * n                   # attention weights that must be stored\n    print(f\"{h:>5} {d_k:>5} {params:>11,} {proj:>16,} {attn:>15,} {maps:>12,}\")",
+      "outputs": [
+        {
+          "type": "text",
+          "content": "heads   d_k      params  projection MACs  QK^T + AV MACs  map entries\n    1   512   1,048,576    1,073,741,824   1,073,741,824    1,048,576\n    8    64   1,048,576    1,073,741,824   1,073,741,824    8,388,608\n   16    32   1,048,576    1,073,741,824   1,073,741,824   16,777,216\n   64     8   1,048,576    1,073,741,824   1,073,741,824   67,108,864"
+        }
+      ]
+    },
+    {
+      "id": "ch13-cost-2",
+      "type": "code",
+      "source": "# W_O as a sum of per-head writes:  Concat(head_1..head_h) W_O  ==  sum_i head_i W_O^(i)\nwith torch.no_grad():\n    _, w = mha(x, causal=True)\n    v = mha.split(mha.W_v(x))                         # (B, h, T, d_k)\n    heads = w @ v                                     # each head's output\n    concat = heads.transpose(1, 2).reshape(2, 10, 512) @ mha.W_o.weight.T\n    W_o_slabs = mha.W_o.weight.T.view(8, 64, 512)     # slab i: rows 64i .. 64i+63\n    summed = sum(heads[:, i] @ W_o_slabs[i] for i in range(8))\nprint(\"max |concat @ W_O - sum_i head_i @ W_O^(i)| =\", f\"{(concat - summed).abs().max().item():.1e}\")",
+      "outputs": [
+        {
+          "type": "text",
+          "content": "max |concat @ W_O - sum_i head_i @ W_O^(i)| = 4.8e-07"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Parameters and matrix-multiply work stay fixed however you split the 512 dimensions. Only the number of stored attention-map entries grows with the head count. That's also why heads can't be made arbitrarily narrow: with $d_k = 8$, each head's score matrix $QK^{\top}$ has rank at most 8, which limits the patterns a head can express (Bhojanapalli et al., 2020). In practice $d_k$ = 64 or 128 is the sweet spot, and most models scale up by adding heads rather than shrinking them.
+
+---
+
+## What heads actually learn
+
+Nobody tells a head what to do. Yet when researchers probe trained Transformers, many heads turn out to do recognisable, interpretable jobs:
+
+- **Previous-token heads** attend to the token right before the current one — a building block for reading short phrases.
+- **Induction heads** (Olsson et al., 2022) implement copying from context: seeing "Harry" again, attend to whatever followed the *last* "Harry" and predict it ("Potter"). They form from a previous-token head in one layer working with a matching head in a later layer, and their appearance during training coincides with a sudden jump in the model's ability to learn from examples in its prompt — **in-context learning**.
+- **Syntactic heads** (Clark et al., 2019; Voita et al., 2019) track specific grammatical relations — verbs to their subjects, determiners to their nouns, objects to their verbs — often more accurately than simple baselines.
+- **Coreference heads** link pronouns to the nouns they refer to.
+- **Attention sinks** (Xiao et al., 2023): many heads put most of their weight on the very first token whenever they have nothing useful to look at. Softmax weights must sum to 1, so a head that "wants" to attend nowhere parks its weight somewhere harmless. This turned out to matter in practice — streaming models that drop the first token from their cache fall apart, and keeping it (StreamingLLM) fixes them.
+- **Broad or averaging heads**, common in early layers, spread their weight evenly and build a bag-of-words summary of the context.
+
+![What trained heads actually learn: six illustrative attention maps of documented patterns. Previous-token head — each token attends to the one before it (Clark et al. 2019; Olsson et al. 2022). Induction head — on the second "Harry", attend to what followed the first "Harry", "Potter" (Olsson et al. 2022). Syntactic head — the verb "ran" attends to its subject "dog" (Clark et al. 2019; Voita et al. 2019). Coreference head — the pronoun "it" attends to the noun "dog". Attention sink — spare attention dumped on the first token (Xiao et al. 2023). Broad/averaging head — even spread over the context. A bottom panel notes that Michel et al. (2019) and Voita et al. (2019) could prune many heads with almost no loss.](/appendix-c/13-multi-head-attention/what-heads-learn.png)
+
+### But not every head matters
+
+Michel, Levy & Neubig ("Are Sixteen Heads Really Better than One?", 2019) removed heads from trained models one at a time. Many could be deleted with almost no loss, and some layers kept working with a single head left. Voita et al. (2019) found that a handful of specialised heads did most of the work in a translation model, and that the rest could be pruned. The lesson isn't that multi-head attention is wasteful. Having many heads gives the model **room to specialise** during training — it just doesn't use all of that room equally in the end.
+
+Interpreting heads also has limits: as Chapter 11 noted, attention weights show where information is *read from*, not *why* the model decided something. Modern interpretability work studies heads together with what they write back (their $W^{O(i)}$ slab), which is exactly the sum view above.
+
+---
+
+## Sharing keys and values: MQA and GQA
+
+Multi-head attention costs the same as one head during training. During **generation** it has a different cost, and that cost drove the biggest change to attention since 2017.
+
+Chapter 12 introduced the **KV cache**: while generating, every past token's keys and values are stored so they don't have to be recomputed for each new token. With $L$ layers, $h_{kv}$ key/value heads of size $d_{\text{head}}$, a context of $n$ tokens, and $b$ bytes per number, the cache for one sequence is
+
+$$
+\text{KV cache bytes} = 2 \cdot L \cdot h_{kv} \cdot d_{\text{head}} \cdot n \cdot b
+$$
+
+The 2 is for keys and values. For Llama-2-7B (32 layers, 32 heads of 128, fp16) that's 0.5 MiB per token — 2 GiB for a 4,096-token conversation, per user. At long contexts and large batches the cache, not the weights, fills GPU memory, and reading it at every step limits generation speed.
+
+**Multi-query attention** (MQA; Shazeer, 2019) keeps all $h$ query heads but gives them **one shared** key head and value head. The cache shrinks by a factor of $h$. Quality drops a little, and training can be less stable.
+
+**Grouped-query attention** (GQA; Ainslie et al., 2023) is the compromise: split the query heads into $g$ groups and give each group one key/value head. With 32 query heads and 8 KV heads, every 4 query heads share one key/value pair. Quality is close to full MHA, the cache shrinks 4×, and existing MHA checkpoints can be converted by averaging their KV heads and briefly fine-tuning. Llama 2 70B, Llama 3, Mistral and Qwen all use GQA.
+
+Each query head still has its own $W^Q_i$, so it still asks its own question; it just reads the answer from a key/value table shared with its group.
+
+![MHA → GQA → MQA: sharing keys and values. Multi-head: 8 query heads each with their own K/V head (original Transformer, GPT-2/3, Llama-2-7B). Grouped-query: 8 query heads sharing 2 K/V heads in groups of 4 (Llama-2-70B, Llama-3, Mistral). Multi-query: all 8 query heads share one K/V head (PaLM, Falcon). Below: the KV-cache formula bytes = 2 · L · h_kv · d_head · n · b, and a table of real fp16 cache sizes at 4k tokens — Llama-2-7B (MHA) 2.00 GiB, Llama-3-8B (GQA) 0.50 GiB, Llama-2-70B (GQA) 1.25 GiB, and the same 70B model if it used MHA, 10.00 GiB.](/appendix-c/13-multi-head-attention/mha-gqa-mqa.png)
+
+```notebook
+{
+  "title": "KV-cache sizes for real models, and grouped-query attention in code",
   "runtime": "Python · PyTorch",
   "cells": [
     {
-      "id": "cell-mha-impl",
+      "id": "ch13-gqa-1",
       "type": "code",
-      "source": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport math\n\nclass MultiHeadAttention(nn.Module):\n    \"\"\"\n    Multi-head self-attention.\n\n    Key implementation trick: instead of running num_heads separate attention\n    operations, we project into (num_heads × d_k) all at once, then reshape\n    to treat the heads as a batch dimension. One large matmul is much faster\n    than many small ones on GPU.\n\n    Args:\n        d_model:   input/output dimension (e.g. 512)\n        num_heads: number of attention heads (e.g. 8)\n    \"\"\"\n    def __init__(self, d_model, num_heads):\n        super().__init__()\n        assert d_model % num_heads == 0, 'd_model must be divisible by num_heads'\n\n        self.d_model   = d_model\n        self.num_heads = num_heads\n        self.d_k       = d_model // num_heads\n\n        # Single large projection for all heads combined\n        # shape: (d_model, d_model) = (d_model, num_heads × d_k)\n        self.W_Q = nn.Linear(d_model, d_model, bias=False)\n        self.W_K = nn.Linear(d_model, d_model, bias=False)\n        self.W_V = nn.Linear(d_model, d_model, bias=False)\n\n        # Output projection: combines all heads back to d_model\n        self.W_O = nn.Linear(d_model, d_model, bias=False)\n\n    def split_heads(self, x):\n        \"\"\"\n        Reshape (batch, seq_len, d_model) → (batch, num_heads, seq_len, d_k)\n        so we can compute all heads in parallel as a batch.\n        \"\"\"\n        B, T, _ = x.shape\n        x = x.view(B, T, self.num_heads, self.d_k)  # (B, T, h, d_k)\n        return x.transpose(1, 2)                     # (B, h, T, d_k)\n\n    def forward(self, X, causal=False):\n        \"\"\"\n        X: (batch, seq_len, d_model)\n        Returns: (batch, seq_len, d_model)\n        \"\"\"\n        B, T, _ = X.shape\n\n        # Step 1: Project → split into heads\n        Q = self.split_heads(self.W_Q(X))   # (B, h, T, d_k)\n        K = self.split_heads(self.W_K(X))   # (B, h, T, d_k)\n        V = self.split_heads(self.W_V(X))   # (B, h, T, d_k)\n\n        # Step 2: Scaled dot-product attention — for ALL heads simultaneously\n        scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.d_k)  # (B, h, T, T)\n\n        if causal:\n            mask   = torch.tril(torch.ones(T, T, device=X.device)).bool()\n            scores = scores.masked_fill(~mask, float('-inf'))\n\n        weights = F.softmax(scores, dim=-1)   # (B, h, T, T)\n        attn    = weights @ V                  # (B, h, T, d_k)\n\n        # Step 3: Merge heads back → project to d_model\n        # (B, h, T, d_k) → (B, T, h*d_k) = (B, T, d_model)\n        attn = attn.transpose(1, 2).contiguous().view(B, T, self.d_model)\n        return self.W_O(attn), weights\n\n\n# Test\ntorch.manual_seed(42)\nd_model, num_heads = 64, 4\nmha = MultiHeadAttention(d_model, num_heads)\n\nX = torch.randn(2, 6, d_model)   # batch=2, seq=6\nout, weights = mha(X, causal=True)\n\nprint(f'Input shape:  {X.shape}')\nprint(f'Output shape: {out.shape}  (same as input — attention preserves shape)')\nprint(f'Weights shape:{weights.shape}  (batch, heads, seq, seq)')\nprint()\nprint('Head-specific attention patterns (what each head focuses on):')\nfor h in range(num_heads):\n    # Which position does token 5 attend to most in each head?\n    top_pos = weights[0, h, -1].argmax().item()\n    top_val = weights[0, h, -1].max().item()\n    print(f'  Head {h}: token 5 attends most to position {top_pos} (weight={top_val:.3f})')",
+      "source": "def kv_cache_gib(layers, kv_heads, head_dim, tokens, bytes_per=2):\n    return 2 * layers * kv_heads * head_dim * tokens * bytes_per / 2**30\n\nmodels = [\n    # name,                    layers, q heads, kv heads, head dim\n    (\"Llama-2-7B   (MHA)\",       32,     32,      32,     128),\n    (\"Llama-3-8B   (GQA)\",       32,     32,       8,     128),\n    (\"Llama-2-70B  (GQA)\",       80,     64,       8,     128),\n    (\"Llama-2-70B  if MHA\",      80,     64,      64,     128),\n]\nprint(f\"{'model':<22}{'q/kv heads':>11}{'cache @ 4k':>12}{'cache @ 128k':>14}\")\nfor name, L, hq, hkv, dh in models:\n    print(f\"{name:<22}{f'{hq}/{hkv}':>11}{kv_cache_gib(L, hkv, dh, 4096):>10.2f} GiB\"\n          f\"{kv_cache_gib(L, hkv, dh, 131072):>10.2f} GiB\")\nprint(\"\\nfp16, one sequence. Multiply by the batch size when serving many users.\")",
       "outputs": [
         {
           "type": "text",
-          "content": "Input shape:  torch.Size([2, 6, 64])\nOutput shape: torch.Size([2, 6, 64])  (same as input — attention preserves shape)\nWeights shape:torch.Size([2, 4, 6, 6])  (batch, heads, seq, seq)\n\nHead-specific attention patterns (what each head focuses on):\n  Head 0: token 5 attends most to position 4 (weight=0.291)\n  Head 1: token 5 attends most to position 5 (weight=0.234)\n  Head 2: token 5 attends most to position 2 (weight=0.289)\n  Head 3: token 5 attends most to position 1 (weight=0.247)"
+          "content": "model                  q/kv heads  cache @ 4k  cache @ 128k\nLlama-2-7B   (MHA)          32/32      2.00 GiB     64.00 GiB\nLlama-3-8B   (GQA)           32/8      0.50 GiB     16.00 GiB\nLlama-2-70B  (GQA)           64/8      1.25 GiB     40.00 GiB\nLlama-2-70B  if MHA         64/64     10.00 GiB    320.00 GiB\n\nfp16, one sequence. Multiply by the batch size when serving many users."
         }
       ]
-    }
-  ]
-}
-```
-
-With random weights, each head focuses on a different position — already showing the diversity of patterns that multiple heads can capture. After training on real data, these heads would specialize into linguistically meaningful patterns.
-
----
-
-## What Heads Actually Learn
-
-Multiple researchers have probed trained transformer heads to understand what they capture. The patterns are remarkably consistent across different models and architectures (Clark et al. 2019, Voita et al. 2019, Vig & Belinkov 2019):
-
-| Head type | What it attends to | Example |
-|:---|:---|:---|
-| **Positional** | Adjacent tokens (prev/next) | Token 5 puts 80%+ weight on token 4 or 6 |
-| **Syntactic** | Subject→verb, noun→adjective | "ran" attends to "dog" in "the dog ran quickly" |
-| **Coreference** | Pronouns → antecedents | "it" attends to "animal" in Winograd schemas |
-| **Rare token** | Named entities, numbers | Proper nouns attract attention from surrounding words |
-| **Semantic** | Contextually related words | "bank" in finance context attends to "money", "deposit" |
-
-Nobody programmed any of this. To see how different heads naturally diverge even before training, we can look at the attention entropy per head — a trained model would show much stronger, sharper patterns, but even with random weights we can verify that each head is operating independently:
-
-```notebook
-{
-  "title": "Head diversity — measuring per-head attention entropy",
-  "runtime": "Python · PyTorch",
-  "cells": [
+    },
     {
-      "id": "cell-head-types",
+      "id": "ch13-gqa-2",
       "type": "code",
-      "source": "import torch\nimport torch.nn.functional as F\nimport math\n\ntorch.manual_seed(99)\n\n# Simulate 4 independent attention heads on a 6-token sequence\n# (random weights — in a trained model these would specialize further)\nbatch, seq, d_k = 1, 6, 16\nnum_heads = 4\n\n# Each head has its own Q and K projection weights\nQ_heads = [torch.randn(batch, seq, d_k) for _ in range(num_heads)]\nK_heads = [torch.randn(batch, seq, d_k) for _ in range(num_heads)]\n\nprint('Per-head attention weight distributions (last token attending to all positions):')\nprint(f'  Entropy = 0 means perfectly focused on one position.')\nprint(f'  Entropy = {math.log(seq):.2f} (log {seq}) means perfectly uniform.')\nprint()\n\nfor h, (Q, K) in enumerate(zip(Q_heads, K_heads)):\n    scores = (Q @ K.transpose(-2, -1)) / math.sqrt(d_k)   # (1, seq, seq)\n    weights = F.softmax(scores, dim=-1)[0, -1]              # last token's weights\n    entropy = -(weights * weights.log()).sum().item()        # information entropy\n    peak_pos = weights.argmax().item()\n    print(f'  Head {h}: weights = {weights.detach().numpy().round(3)}')\n    print(f'           peak at position {peak_pos}, entropy = {entropy:.3f}')\n\nprint()\nprint('With random weights, heads already focus on different positions.')\nprint('After training, each head would sharpen to a specific linguistic pattern.')",
+      "source": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nclass GroupedQueryAttention(nn.Module):\n    \"\"\"n_kv_heads == n_heads -> MHA,  n_kv_heads == 1 -> MQA,  in between -> GQA.\"\"\"\n\n    def __init__(self, d_model, n_heads, n_kv_heads):\n        super().__init__()\n        assert n_heads % n_kv_heads == 0\n        self.h, self.h_kv, self.d_k = n_heads, n_kv_heads, d_model // n_heads\n        self.W_q = nn.Linear(d_model, n_heads * self.d_k, bias=False)\n        self.W_k = nn.Linear(d_model, n_kv_heads * self.d_k, bias=False)   # smaller!\n        self.W_v = nn.Linear(d_model, n_kv_heads * self.d_k, bias=False)   # smaller!\n        self.W_o = nn.Linear(n_heads * self.d_k, d_model, bias=False)\n\n    def forward(self, x):\n        B, T, _ = x.shape\n        q = self.W_q(x).view(B, T, self.h, self.d_k).transpose(1, 2)       # (B, h,    T, d_k)\n        k = self.W_k(x).view(B, T, self.h_kv, self.d_k).transpose(1, 2)    # (B, h_kv, T, d_k)\n        v = self.W_v(x).view(B, T, self.h_kv, self.d_k).transpose(1, 2)\n        # what goes in the KV cache is k and v: h_kv heads, not h\n        group = self.h // self.h_kv\n        k = k.repeat_interleave(group, dim=1)                               # share within groups\n        v = v.repeat_interleave(group, dim=1)\n        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)\n        return self.W_o(out.transpose(1, 2).reshape(B, T, -1))\n\n\nx = torch.randn(1, 16, 512)\nfor name, kv in [(\"MHA\", 8), (\"GQA\", 2), (\"MQA\", 1)]:\n    layer = GroupedQueryAttention(512, n_heads=8, n_kv_heads=kv)\n    params = sum(p.numel() for p in layer.parameters())\n    print(f\"{name}: 8 query heads, {kv} kv heads  ->  output {tuple(layer(x).shape)}, \"\n          f\"{params:,} params, cached numbers per token per layer: {2 * kv * 64}\")",
       "outputs": [
         {
           "type": "text",
-          "content": "Per-head attention weight distributions (last token attending to all positions):\n  Entropy = 0 means perfectly focused on one position.\n  Entropy = 1.79 (log 6) means perfectly uniform.\n\n  Head 0: weights = [0.074 0.198 0.261 0.072 0.304 0.091]\n           peak at position 4, entropy = 1.693\n  Head 1: weights = [0.083 0.062 0.044 0.569 0.155 0.087]\n           peak at position 3, entropy = 1.378\n  Head 2: weights = [0.291 0.123 0.087 0.183 0.241 0.075]\n           peak at position 0, entropy = 1.649\n  Head 3: weights = [0.062 0.341 0.198 0.094 0.121 0.184]\n           peak at position 1, entropy = 1.589\n\nWith random weights, heads already focus on different positions.\nAfter training, each head would sharpen to a specific linguistic pattern."
+          "content": "MHA: 8 query heads, 8 kv heads  ->  output (1, 16, 512), 1,048,576 params, cached numbers per token per layer: 1024\nGQA: 8 query heads, 2 kv heads  ->  output (1, 16, 512), 655,360 params, cached numbers per token per layer: 256\nMQA: 8 query heads, 1 kv heads  ->  output (1, 16, 512), 589,824 params, cached numbers per token per layer: 128"
         }
       ]
     }
@@ -233,103 +227,31 @@ Nobody programmed any of this. To see how different heads naturally diverge even
 }
 ```
 
-These patterns emerged purely from training on next-token prediction. The model found that different attention patterns were useful for predicting different aspects of text — so it developed them.
+The output shape never changes; what changes is how much has to be cached per token. GQA with 2 KV heads caches a quarter of what MHA does here; MQA an eighth.
+
+The idea keeps going. DeepSeek-V2 (2024) introduced **multi-head latent attention** (MLA), which caches one small compressed vector per token and reconstructs every head's keys and values from it, shrinking the cache further while keeping per-head keys and values.
 
 ---
 
-## Comparing Single-Head vs Multi-Head: An Experiment
+## Key papers
 
-```notebook
-{
-  "title": "Single-head vs multi-head — expressiveness comparison",
-  "runtime": "Python · PyTorch (continued)",
-  "cells": [
-    {
-      "id": "cell-sh-vs-mh",
-      "type": "code",
-      "source": "import torch\nimport torch.nn as nn\nimport math\n\ntorch.manual_seed(42)\n\nd_model = 64\n\n# Single-head attention at full d_model\nclass SingleHeadAttn(nn.Module):\n    def __init__(self, d_model):\n        super().__init__()\n        self.W_Q = nn.Linear(d_model, d_model, bias=False)\n        self.W_K = nn.Linear(d_model, d_model, bias=False)\n        self.W_V = nn.Linear(d_model, d_model, bias=False)\n        self.W_O = nn.Linear(d_model, d_model, bias=False)\n\n    def forward(self, X):\n        Q, K, V = self.W_Q(X), self.W_K(X), self.W_V(X)\n        scores  = (Q @ K.transpose(-2,-1)) / math.sqrt(d_model)\n        weights = torch.softmax(scores, dim=-1)\n        return self.W_O(weights @ V)\n\nsh  = SingleHeadAttn(d_model)\nmha = MultiHeadAttention(d_model, num_heads=8)\n\nsh_params  = sum(p.numel() for p in sh.parameters())\nmha_params = sum(p.numel() for p in mha.parameters())\n\nprint('Parameters comparison:')\nprint(f'  Single-head (d_model={d_model}):      {sh_params:,} parameters')\nprint(f'  Multi-head  (d_model={d_model}, h=8): {mha_params:,} parameters')\nprint()\nprint('Both have the same parameter count!')\nprint('Multi-head is NOT more expensive — same total compute, more expressiveness.')\nprint()\n\n# Compare outputs\nX = torch.randn(1, 8, d_model)\nout_sh  = sh(X)\nout_mha, _ = mha(X)\n\nprint(f'Single-head output variance: {out_sh.var().item():.4f}')\nprint(f'Multi-head output variance:  {out_mha.var().item():.4f}')\nprint()\nprint('Multi-head tends to produce more diverse representations')\nprint('because different heads can specialize on different patterns.')\nprint('The W_O projection then combines them into a rich composite representation.')",
-      "outputs": [
-        {
-          "type": "text",
-          "content": "Parameters comparison:\n  Single-head (d_model=64):      16,384 parameters\n  Multi-head  (d_model=64, h=8): 16,384 parameters\n\nBoth have the same parameter count!\nMulti-head is NOT more expensive — same total compute, more expressiveness.\n\nSingle-head output variance: 0.0042\nMulti-head output variance:  0.0051\n\nMulti-head tends to produce more diverse representations\nbecause different heads can specialize on different patterns.\nThe W_O projection then combines them into a rich composite representation."
-        }
-      ]
-    }
-  ]
-}
-```
-
-Same parameters, same compute, more expressive. That's the multi-head advantage.
+- Vaswani et al. (2017). *Attention Is All You Need.* — multi-head attention.
+- Shazeer (2019). *Fast Transformer Decoding: One Write-Head is All You Need.* — multi-query attention.
+- Ainslie et al. (2023). *GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints.*
+- Michel, Levy & Neubig (2019). *Are Sixteen Heads Really Better than One?* / Voita et al. (2019). *Analyzing Multi-Head Self-Attention: Specialized Heads Do the Heavy Lifting, the Rest Can Be Pruned.*
+- Clark et al. (2019). *What Does BERT Look At? An Analysis of BERT's Attention.*
+- Elhage et al. (2021). *A Mathematical Framework for Transformer Circuits.* / Olsson et al. (2022). *In-context Learning and Induction Heads.*
+- Xiao et al. (2023). *Efficient Streaming Language Models with Attention Sinks.*
+- Bhojanapalli et al. (2020). *Low-Rank Bottleneck in Multi-head Attention Models.*
+- DeepSeek-AI (2024). *DeepSeek-V2* — multi-head latent attention.
 
 ---
 
-## The Output Projection W_O: Combining the Heads
+## Quick recap
 
-After all heads compute their attention outputs and we concatenate them back to `(batch, seq, d_model)`, we apply one more linear layer — the **output projection** `W_O`.
-
-This is often overlooked but it's doing something important. Each head produced a representation in a different `d_k`-dimensional subspace. Raw concatenation stacks those subspaces; `W_O` learns how to **mix** them into a coherent joint representation. It's the synthesis step — combining the diverse perspectives from different heads into one integrated output.
-
-With `d_model = 512` and `num_heads = 8`, the shapes through the output step are:
-- Each head output: `(batch, seq, 64)` — head operates in its `d_k = 64` subspace
-- After concatenating all 8 heads: `(batch, seq, 512)` — stacked subspaces, not yet mixed
-- After `W_O` projection `(512 × 512)`: `(batch, seq, 512)` — mixed into one coherent representation
-
-Without `W_O`, the heads' outputs would remain in incompatible subspaces — head 3's coreference dimensions and head 7's syntax dimensions would just be side by side with no integration. `W_O` is what turns "8 independent perspectives" into "one enriched representation."
-
-```notebook
-{
-  "title": "The W_O output projection — measuring its effect",
-  "runtime": "Python · PyTorch",
-  "cells": [
-    {
-      "id": "cell-wo",
-      "type": "code",
-      "source": "import torch\nimport torch.nn as nn\nimport math\n\ntorch.manual_seed(42)\n\nd_model, num_heads = 64, 4\nd_k = d_model // num_heads   # 16 dims per head\n\n# Simulate 4 head outputs, each in a d_k-dimensional subspace\nbatch, seq = 1, 6\nhead_outputs = [torch.randn(batch, seq, d_k) for _ in range(num_heads)]\n\n# Step 1: raw concatenation — stacks subspaces side by side\nconcat = torch.cat(head_outputs, dim=-1)   # (batch, seq, d_model)\nprint(f'After concat:  shape = {concat.shape}')\n\n# Step 2: W_O mixes the concatenated heads\nW_O = nn.Linear(d_model, d_model, bias=False)\noutput = W_O(concat)   # (batch, seq, d_model)\nprint(f'After W_O:     shape = {output.shape}')\nprint()\n\n# Verify W_O is doing non-trivial mixing:\n# If W_O were identity, head 0's dims would not affect head 1's output slice.\n# With a learned W_O, every output dimension depends on ALL input dims.\nprint('W_O weight shape:', W_O.weight.shape, '← (d_model, d_model)')\nprint()\nprint('Fraction of W_O columns with cross-head signal (|w| > 0.1):')\nfor h in range(num_heads):\n    start, end = h * d_k, (h + 1) * d_k\n    # Look at how much each head's input dims contribute to ALL output dims\n    cross_contribution = W_O.weight[:, start:end].abs().mean().item()\n    print(f'  Head {h} dims [{start}:{end}] → avg |weight| to all outputs: {cross_contribution:.4f}')\n\nprint()\nprint('All heads contribute roughly equally to all output dimensions —')\nprint('W_O synthesizes them into one representation, not just passes each head through.')",
-      "outputs": [
-        {
-          "type": "text",
-          "content": "After concat:  shape = torch.Size([1, 6, 64])\nAfter W_O:     shape = torch.Size([1, 6, 64])\n\nW_O weight shape: torch.Size([64, 64]) ← (d_model, d_model)\n\nFraction of W_O columns with cross-head signal (|w| > 0.1):\n  Head 0 dims [0:16] → avg |weight| to all outputs: 0.1272\n  Head 1 dims [16:32] → avg |weight| to all outputs: 0.1246\n  Head 2 dims [32:48] → avg |weight| to all outputs: 0.1258\n  Head 3 dims [48:64] → avg |weight| to all outputs: 0.1254\n\nAll heads contribute roughly equally to all output dimensions —\nW_O synthesizes them into one representation, not just passes each head through."
-        }
-      ]
-    }
-  ]
-}
-```
-
----
-
-## Quick Recap
-
-- **Multi-head attention** runs `h` independent attention operations in parallel, each operating in a reduced dimension `d_k = d_model / h`.
-- The total compute is the same as single-head attention — you get more expressiveness for free.
-- Each head can specialize on a different type of relationship: positional, syntactic, coreference, semantic. This specialization emerges from training.
-- Implementation: project into `(batch, num_heads, seq, d_k)`, compute attention for all heads in one batch operation, merge back via concatenation, then apply the output projection `W_O`.
-- `W_O` synthesizes the diverse head perspectives into one coherent representation.
-- The original transformer used 8 heads with d_k=64. GPT-2 uses 12 heads with d_k=64. The pattern scales up consistently.
-
----
-
-## Multi-Head Attention: The Formal Equations
-
-**Why multiple heads?**
-Single-head attention computes one set of attention patterns — one "perspective" on the sequence. But language has many types of relationships happening simultaneously: syntactic (subject-verb agreement), semantic (pronoun reference), positional (is this word near the start?), and more. Multiple heads let the model attend to all of these at once, in parallel.
-
-**The math:**
-Each head $i$ gets its own set of projection matrices and computes attention independently:
-$$\text{head}_i = \text{Attention}(XW_i^Q, XW_i^K, XW_i^V)$$
-Where each $W_i^Q, W_i^K, W_i^V$ is a different learned projection — head $i$ learns to "look for" a different kind of pattern.
-
-The outputs of all heads are concatenated and projected back:
-$$\text{MHA}(X) = \text{Concat}(\text{head}_1, \dots, \text{head}_h) W_O$$
-
-**The parameter cost:**
-With $h$ heads each of dimension $d_k = d_{\text{model}} / h$, the total parameter count stays the same as single-head attention with dimension $d_{\text{model}}$. You get multiple perspectives for free — no added parameters.
-
-**Empirically, different heads specialize:**
-Research has shown that different attention heads do learn to specialize:
-- Some heads track syntactic dependencies (subject-verb)
-- Some track coreference (linking "it" back to "the cat")
-- Some focus on positional patterns (attending to the previous token)
-- Some track rare, specific patterns for specific token types
-
-This is emergent — not programmed. The model discovers these specializations through training.
+- One attention head produces one weighted average per token, so it can follow only one relationship at a time. **Multi-head attention** runs $h$ heads in parallel, each with its own $W_i^Q, W_i^K, W_i^V$ in a $d_k = d_{\text{model}}/h$ subspace.
+- $\operatorname{MultiHead}(X) = \operatorname{Concat}(\text{head}_1, \dots, \text{head}_h)\,W^O$, which equals $\sum_i \text{head}_i W^{O(i)}$: $h$ independent heads whose outputs are **added**.
+- Parameters ($4d^2$) and matrix-multiply FLOPs are the same as one full-width head; only the number of stored $n \times n$ attention maps grows with $h$.
+- In practice all heads run as **one** batched matrix multiply via `view` → `transpose` → attention → `transpose` → `reshape` → $W^O$.
+- Trained heads specialise — previous-token, induction, syntactic, coreference, attention sinks — but many can be pruned afterwards.
+- During generation the **KV cache** dominates memory. **MQA** shares one K/V head across all queries, and **GQA** shares one per group, cutting the cache 4–8× with little quality loss. That's why modern LLMs use GQA.

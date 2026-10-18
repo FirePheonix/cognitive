@@ -1,62 +1,44 @@
 ---
 title: Appendix C — The Transformer Revolution
-description: 'From attention to self-attention, positional encoding, multi-head attention, and the full transformer architecture'
+description: 'From attention to self-attention, multi-head attention, positional encoding, and the full transformer block'
 isChapterOverview: true
-lastUpdatedDate: '2026-08-10'
+lastUpdatedDate: '2026-10-18'
 ---
 
 # Appendix C — The Transformer Revolution
 
-Appendix B ended with LSTMs hitting a wall: sequential computation, a fixed-size information bottleneck, and gradients that vanished over long sequences. Researchers were stuck. The best they could do was bolt attention mechanisms onto RNNs as a workaround.
+Appendix B ended with LSTMs hitting a wall. They read one word at a time, so they couldn't use a GPU's parallelism. Seq2seq models squeezed a whole sentence into one fixed-size vector. And gradients still faded over long distances. The best fix anyone had was to bolt attention onto an RNN.
 
-Then in 2017, a paper called "Attention Is All You Need" made a radical bet: throw away the recurrence entirely. No RNN. No hidden state. Just attention — applied in parallel across all positions simultaneously.
+Then in 2017, "Attention Is All You Need" made a radical bet: throw the recurrence away entirely. No RNN, no hidden state carried from step to step — just attention, applied to every position at once.
 
-It worked. Within two years, transformers held every NLP benchmark. Within five years, transformers were generating images, protein structures, and code. Today, every major language model — GPT, Claude, LLaMA, Gemini, Mistral — runs on transformer architecture.
+It worked. Within two years Transformers held nearly every language benchmark; within five they were generating images, predicting protein structures and writing code. Every major language model today — GPT, Claude, Llama, Gemini, Mistral — is a stack of the block this appendix builds.
 
-This appendix covers the full story: from Bahdanau's original attention mechanism through self-attention, multi-head attention, positional encoding, layer normalization, and the complete transformer block.
+![The Transformer revolution in six steps, as a hand-drawn flow of cards: 2014 seq2seq with one fixed context vector (Ch 10) → 2015 Bahdanau/Luong attention, a fresh weighted context at every step (Ch 11) → 2017 self-attention, dropping the RNN (Ch 12) → multi-head attention, many smaller heads each with its own question (Ch 13) → positional encoding from sinusoids to RoPE (Ch 14) → the Transformer block of attention, FFN, residuals and norms stacked N times (Ch 15). Below: the problems fixed along the way, what you'll build, and where it leads — decoder-only models like GPT, Llama, Claude and Gemini.](/appendix-c/transformer-revolution-arc.png)
 
 ---
 
 ## What's in this appendix
 
+Every chapter has hand-drawn diagrams, the math written out properly, worked examples you can check by hand, and runnable PyTorch code.
+
 **Chapter 11 — Attention: The Fix for the Bottleneck**
 
-How Bahdanau attention (2015) solved the seq2seq context vector bottleneck by giving the decoder access to all encoder states simultaneously. The alignment mechanism, its interpretable visualization, and why it still wasn't enough because the RNN underneath was still sequential.
+How Bahdanau attention (2015) gave the decoder a fresh, weighted look at every encoder state at each step. The full equations, a worked example, the alignment heatmaps that showed the model learning word order on its own, and the BLEU results. Then Luong's simpler score functions, a small model you can train to watch an alignment appear, how attention shortens gradient paths, and why attention weights aren't explanations.
 
 **Chapter 12 — Self-Attention and Scaled Dot-Product Attention**
 
-The leap from encoder-decoder attention to self-attention: a sequence attending to itself. Query, Key, Value — what they are, why three separate projections, and why that design choice matters. The four steps of scaled dot-product attention in full working code. Why √d_k scaling is non-negotiable. Causal masking for GPT-style decoders.
+A sequence attending to itself. Queries, keys and values as a soft dictionary lookup; $\operatorname{softmax}(QK^{\top}/\sqrt{d_k})\,V$ worked out by hand on a three-token example; the variance argument and softmax gradient behind $\sqrt{d_k}$; causal and padding masks; the $O(n^2)$ cost, and how FlashAttention computes the same thing without storing the $n \times n$ matrix.
 
 **Chapter 13 — Multi-Head Attention**
 
-One attention head has to average all the relationships it finds. Multiple heads can specialize — one for coreference, one for syntax, one for semantics. How the dimension split works (same compute, more expressive), the efficient batch implementation via reshape, what heads actually learn in practice, and what the output projection W_O is doing.
+Why one head isn't enough, and how $h$ heads cost the same as one. The reshape trick that runs every head in a single matrix multiply, $W^O$ as a sum of per-head writes, and what trained heads learn — induction heads, syntactic heads, attention sinks. Then the KV cache, and how multi-query and grouped-query attention shrink it 4–8×.
 
 **Chapter 14 — Positional Encoding**
 
-Attention is permutation-invariant — it doesn't know about order. This chapter covers how to inject position: sinusoidal encoding (fixed, generalizes to any length, elegant relative-position property), learned positional embeddings (GPT-2's approach), and RoPE (modern LLMs — encodes relative positions directly into attention scores).
+A proof that attention is blind to word order, then the fixes: sinusoidal encoding and why shifts are rotations, learned positions, relative biases, **RoPE** (the rotation trick inside nearly every modern LLM, with its proof), ALiBi, and how position interpolation, NTK scaling and YaRN stretch models to longer contexts.
 
 **Chapter 15 — Inside a Transformer Block**
 
-All the pieces assembled: LayerNorm (stabilizing activations), the Feed-Forward Network (per-token knowledge storage), residual connections (gradient highway), and how they combine into one transformer block. Encoder vs decoder: the one structural difference. Cross-attention: how full encoder-decoders work. The complete GPT-style model from scratch, parameter counts at real scale.
+Residual connections and the residual stream, LayerNorm vs RMSNorm, why Pre-LN replaced Post-LN, the FFN and SwiGLU, encoder vs decoder and cross-attention. A complete GPT-2 in about forty lines with exactly 124,439,808 parameters, every one accounted for — and how the 2024 Llama 3 block differs from the 2019 one.
 
----
-
-## The conceptual arc
-
-```
-Seq2Seq (2014)          → fixed context vector bottleneck
-  ↓
-Bahdanau Attention (2015) → dynamic context, soft alignment
-  ↓
-Self-Attention (2017)     → no RNN, every position attends to every other
-  ↓
-Multi-Head Attention      → multiple specialized attention patterns in parallel
-  ↓
-Positional Encoding       → inject position information into the order-blind mechanism
-  ↓
-Transformer Block         → attention + FFN + residuals + LayerNorm, stacked N times
-  ↓
-GPT / LLaMA / Claude      → decoder-only stacks trained on next-token prediction
-```
-
-By the end of this appendix, you'll have built every component from scratch and understand exactly how a modern language model processes text.
+By the end of this appendix you'll have built every component from scratch and know exactly what happens to a token on its way through a modern language model.

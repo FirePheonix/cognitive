@@ -1,113 +1,135 @@
 ---
 title: 11. Attention — The Fix for the Bottleneck
-lastUpdatedDate: '2026-08-10'
+lastUpdatedDate: '2026-10-18'
 ---
 
 # 11. Attention — The Fix for the Bottleneck
 
-Chapter 10 ended with a confession: seq2seq had a bottleneck problem. The entire source sentence had to be squeezed into a single fixed-size context vector. Long sentences lost information. Translation quality fell off a cliff past 20 words.
+Chapter 10 ended on an uncomfortable fact. A seq2seq model reads the whole source sentence and then has to squeeze everything it read into **one fixed-size vector** before the decoder writes a single word. A five-word sentence and a fifty-word sentence get the same 1,000 numbers. Cho et al. (2014) measured what you would expect: translation quality held up for short sentences and fell steadily once they grew past about 20 words.
 
-The fix was something called **attention**. But before the transformer's self-attention mechanism — which processes everything at once in parallel — the world first got encoder-decoder attention, introduced by Bahdanau, Cho, and Bengio in their 2015 paper "Neural Machine Translation by Jointly Learning to Align and Translate." That paper is worth understanding in detail, because it establishes the intuition that everything else builds on.
+In 2014, Dzmitry Bahdanau, then an intern in Yoshua Bengio's lab, asked a simple question: *why make the decoder work from memory at all?* The encoder has already produced one hidden state per source word. Keep all of them, and at every step let the decoder **look back** and choose which ones it needs right now. The paper — "Neural Machine Translation by Jointly Learning to Align and Translate" (Bahdanau, Cho & Bengio, ICLR 2015) — called this soft alignment. Everyone else came to call it **attention**, and three years later it became the only thing left in the Transformer.
 
----
+This chapter builds that mechanism from the ground up: the equations, a worked example you can check by hand, the variants that followed, and a small model you can train yourself to watch attention discover an alignment no one programmed.
 
-## The Core Idea: Don't Compress Everything into One Vector
+<figure class="paper-shot">
+<img src="/appendix-c/11-attention-the-fix-for-the-bottleneck/papers/bahdanau-2014-abstract.png" alt="Title and abstract of Neural Machine Translation by Jointly Learning to Align and Translate (Bahdanau, Cho and Bengio, 2014)" />
+<figcaption>Title and abstract of Bahdanau, Cho &amp; Bengio (2014/2015), <em>Neural Machine Translation by Jointly Learning to Align and Translate</em>. <a href="https://arxiv.org/abs/1409.0473">arXiv:1409.0473</a>.</figcaption>
+</figure>
 
-The seq2seq bottleneck exists because the decoder has access to exactly one thing from the encoder: the final hidden state. All 50 words of the source sentence must fit in that one vector.
-
-Bahdanau's insight: what if the decoder had access to *all* the encoder's hidden states — one for each source token — and could dynamically decide which ones to focus on at each decoding step?
-
-```mermaid
-flowchart TB
-    subgraph Encoder ["Encoder (reads source, left-to-right)"]
-        direction LR
-        w1["I"] --> h1["h₁"]
-        w2["am"] --> h2["h₂"]
-        w3["a"] --> h3["h₃"]
-        w4["student"] --> h4["h₄"]
-        h1 --> h2 --> h3 --> h4
-    end
-
-    subgraph Attention ["Attention Mechanism (per decoder step)"]
-        direction TB
-        h1 --> score1["score₁"]
-        h2 --> score2["score₂"]
-        h3 --> score3["score₃"]
-        h4 --> score4["score₄"]
-        score1 & score2 & score3 & score4 --> softmax["softmax\n(α₁, α₂, α₃, α₄)"]
-        softmax --> ctx["context vector c_t\n= Σ αᵢ × hᵢ"]
-    end
-
-    subgraph Decoder ["Decoder (generates target)"]
-        direction LR
-        ctx --> ds["Decoder state s_t"]
-        ds --> out["Je"]
-    end
-```
-
-At each decoder step, a small network looks at the current decoder state and every encoder hidden state, produces a score for each, normalizes them with softmax, and returns a weighted sum. The weights tell you: "how much does this decoder step care about each source position?"
-
-This weighted sum is a **dynamic context vector** — fresh for each output word, computed based on what the decoder currently needs.
+<figure class="paper-shot">
+<img src="/appendix-c/11-attention-the-fix-for-the-bottleneck/papers/bahdanau-2014-figure.png" alt="Figure 1 from Bahdanau et al.: bidirectional encoder annotations h_j weighted by alpha_t,j into a context vector for decoder state s_t" />
+<figcaption>Figure 1 from the same paper: every source annotation $h_j$ is still there at decode time. The weights $\alpha_{t,j}$ pick which ones matter for the word about to be written. <a href="https://ar5iv.labs.arxiv.org/html/1409.0473">HTML version</a>.</figcaption>
+</figure>
 
 ---
 
-## The Alignment Score
+## The idea in one picture
 
-The heart of Bahdanau attention is the **alignment score** function. For decoder step `t` and encoder position `j`, the score is:
+Picture a human translator working on "The agreement on the European Economic Area was signed in August 1992." They don't memorise the sentence, close the book and write French. While writing each French word they glance back at the part of the English that matters for it. When they get to *zone* they are looking at *Area*; for *européenne* they look back at *European*.
 
-```
-e_tj = alignment_network(s_{t-1}, h_j)
-```
+Attention gives the decoder exactly that glance. At every output step it:
 
-Where `s_{t-1}` is the decoder's previous hidden state and `h_j` is the encoder's hidden state at position `j`. The alignment network is a tiny feedforward neural network — just a linear layer + tanh — that learns to detect when source position `j` is relevant to what the decoder is currently generating.
+1. **scores** every source position — "how useful is word $j$ for what I'm about to write?";
+2. turns the scores into **weights** that are positive and sum to 1 (a softmax);
+3. builds a **context vector**: the weighted average of the encoder states;
+4. uses that context, together with its own state, to produce the next word.
 
-```text
-Bahdanau attention — one decoder step (generating word "zone"):
+The context vector is rebuilt at every step, so the decoder is never forced to rely on one summary of the entire sentence.
 
-  ENCODER hidden states (one per source word):
-  h₁="The"  h₂="European"  h₃="Economic"  h₄="Area"
+![Bahdanau attention at one decoder step, drawn in the site's hand-drawn style. Left panel: a bidirectional encoder reads "The European Economic Area"; each word gets a forward and a backward state concatenated into an annotation h_j. Middle: the decoder state s_{t-1} is compared with each h_j by a small network, giving scores e = 0.2, 0.9, 1.6, 3.9; a softmax turns them into weights 0.02, 0.04, 0.09, 0.85. Right: the context vector c_t is the weighted sum, dominated by "Area", and the decoder uses it to output "zone". An equations panel lists the four formulas.](/appendix-c/11-attention-the-fix-for-the-bottleneck/bahdanau-one-decoder-step.png)
 
-      │           │             │             │
-      ↓           ↓             ↓             ↓
-  ┌───────────────────────────────────────────────────┐
-  │  alignment_network(s_{t-1}, h_j)  for each j      │
-  │                                                   │
-  │  e₁ = tanh(W_s·s + W_h·h₁) → v   =  0.12        │
-  │  e₂ = tanh(W_s·s + W_h·h₂) → v   =  0.31        │
-  │  e₃ = tanh(W_s·s + W_h·h₃) → v   =  0.29        │
-  │  e₄ = tanh(W_s·s + W_h·h₄) → v   =  5.88  ←high │
-  └───────────────────────────────────────────────────┘
-      │           │             │             │
-      ↓                softmax(e₁..e₄)        ↓
-      α₁=0.03    α₂=0.04      α₃=0.09       α₄=0.84
+---
 
-      │           │             │             │    weights sum to 1
-      └───────────┴─────────────┴─────────────┘
-                            │
-                     context vector c_t
-                   = α₁·h₁ + α₂·h₂ + α₃·h₃ + α₄·h₄
-                   ≈ 0.84 × h₄  (mostly "Area")
-                            │
-                            ↓
-                   decoder state s_t  →  output: "zone"
+## The math, one line at a time
 
-  The decoder "looked at" position 4 to generate "zone"
-  even though French word order differs from English.
-```
+The notation follows the original paper. Source words are $x_1, \dots, x_{T_x}$, the decoder writes $y_1, y_2, \dots$, and $t$ counts decoder steps.
+
+### 1. Annotate every source word (bidirectional encoder)
+
+A left-to-right RNN state $\overrightarrow{h}_j$ only knows the words up to $j$. Bahdanau runs a second RNN right-to-left and concatenates the two, so each **annotation** summarises the whole sentence with the focus on word $j$:
+
+$$
+h_j = \left[\, \overrightarrow{h}_j \,;\, \overleftarrow{h}_j \,\right]
+$$
+
+This detail matters more than it looks. When the decoder later "looks at" position $j$, it isn't looking at one isolated word — it's looking at that word *in context*.
+
+### 2. Score each annotation against the decoder's state
+
+The decoder's previous state $s_{t-1}$ encodes what it has written so far and, implicitly, what it needs next. A tiny one-hidden-layer network — the **alignment model** — scores how well each annotation fits:
+
+$$
+e_{tj} = v_a^{\top} \tanh\!\left( W_a\, s_{t-1} + U_a\, h_j \right)
+$$
+
+$W_a$ and $U_a$ project both vectors into a shared space, $\tanh$ lets them interact, and $v_a$ collapses the result to one number. Because the two projections are **added**, this is called **additive attention**. Note that $U_a h_j$ doesn't depend on $t$, so it can be computed once per sentence and reused at every step.
+
+### 3. Turn scores into weights
+
+$$
+\alpha_{tj} = \frac{\exp(e_{tj})}{\sum_{k=1}^{T_x} \exp(e_{tk})}
+$$
+
+Every $\alpha_{tj}$ is positive and they sum to 1 over the source — a probability distribution over "where to look".
+
+### 4. Build the context vector
+
+$$
+c_t = \sum_{j=1}^{T_x} \alpha_{tj}\, h_j
+$$
+
+A weighted average of annotations. If one weight is close to 1, $c_t$ is essentially that one annotation; if the weights are spread out, it blends several.
+
+### 5. Update the decoder and predict
+
+$$
+s_t = f\!\left(s_{t-1},\; y_{t-1},\; c_t\right), \qquad p(y_t \mid y_{<t}, x) = g\!\left(y_{t-1},\; s_t,\; c_t\right)
+$$
+
+$f$ is a GRU cell; $g$ is a small output network ending in a softmax over the vocabulary. The only change from Chapter 10 is that the context is now $c_t$ — different at every step — instead of a single fixed $c$.
+
+Everything here is differentiable, so the alignment model is trained jointly with the encoder and decoder from nothing but translation pairs. No one ever supplies the "right" alignment.
+
+### Worked example — check it by hand
+
+Take the step where the decoder writes *zone*, with scores against "The European Economic Area" of $e = [0.2,\ 0.9,\ 1.6,\ 3.9]$.
+
+| | The | European | Economic | Area |
+|---|---|---|---|---|
+| score $e_j$ | 0.2 | 0.9 | 1.6 | 3.9 |
+| $\exp(e_j)$ | 1.22 | 2.46 | 4.95 | 49.40 |
+| weight $\alpha_j$ = exp ÷ 58.03 | **0.02** | **0.04** | **0.09** | **0.85** |
+
+So $c_t \approx 0.02\,h_1 + 0.04\,h_2 + 0.09\,h_3 + 0.85\,h_4$ — mostly *Area*. Notice how the exponential amplifies differences: a score only 2.3 higher than the runner-up wins 85% of the weight.
+
+### The same thing in code
+
+The module below is the whole mechanism in about fifteen lines. The batch holds two sentences of different lengths, so it also shows a detail every real implementation needs: a **padding mask** that sets the scores of padding positions to $-\infty$ before the softmax, so they get exactly zero weight.
 
 ```notebook
 {
-  "title": "Bahdanau attention from scratch — alignment scores to context vector",
+  "title": "Bahdanau (additive) attention from scratch",
   "runtime": "Python · PyTorch",
   "cells": [
     {
-      "id": "cell-bahdanau",
+      "id": "ch11-bahdanau-1",
       "type": "code",
-      "source": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\ntorch.manual_seed(42)\n\nencoder_dim = 8\ndecoder_dim = 8\nattn_dim    = 16   # alignment network hidden size\n\nclass BahdanauAttention(nn.Module):\n    \"\"\"\n    Bahdanau (additive) attention.\n    Given all encoder hidden states and current decoder state,\n    computes a context vector as a weighted sum of encoder states.\n    \"\"\"\n    def __init__(self, encoder_dim, decoder_dim, attn_dim):\n        super().__init__()\n        # The alignment network: learns to score (encoder_h, decoder_h) pairs\n        self.W_encoder = nn.Linear(encoder_dim, attn_dim)\n        self.W_decoder = nn.Linear(decoder_dim, attn_dim)\n        self.v         = nn.Linear(attn_dim, 1)    # scalar score per position\n\n    def forward(self, encoder_outputs, decoder_hidden):\n        \"\"\"\n        encoder_outputs: (batch, src_len, encoder_dim)\n        decoder_hidden:  (batch, 1, decoder_dim)  — current decoder state\n\n        Returns:\n            context:  (batch, encoder_dim)  — weighted sum of encoder states\n            weights:  (batch, src_len)      — attention weights (sum to 1)\n        \"\"\"\n        # Step 1: Project both states into shared 'attention space'\n        enc_proj = self.W_encoder(encoder_outputs)    # (batch, src_len, attn_dim)\n        dec_proj = self.W_decoder(decoder_hidden)     # (batch, 1, attn_dim)\n\n        # Step 2: Add them + tanh → raw alignment energy\n        energy = torch.tanh(enc_proj + dec_proj)      # (batch, src_len, attn_dim)\n\n        # Step 3: Project to scalar score per source position\n        scores = self.v(energy).squeeze(-1)           # (batch, src_len)\n\n        # Step 4: Softmax → attention weights (sum to 1.0 over src_len)\n        weights = F.softmax(scores, dim=1)            # (batch, src_len)\n\n        # Step 5: Weighted sum of encoder outputs → context vector\n        context = torch.bmm(weights.unsqueeze(1), encoder_outputs).squeeze(1)\n        #         (batch, 1, src_len) @ (batch, src_len, enc_dim) = (batch, 1, enc_dim)\n\n        return context, weights\n\n\n# --- Test it ---\nbatch_size = 1\nsrc_len    = 5   # 'I am a student today'\n\nattn = BahdanauAttention(encoder_dim, decoder_dim, attn_dim)\n\n# Simulate encoder having processed 5 source tokens\nencoder_outputs = torch.randn(batch_size, src_len, encoder_dim)\n\n# Simulate decoder being at step 1 (predicting first target word)\ndecoder_hidden  = torch.randn(batch_size, 1, decoder_dim)\n\ncontext, weights = attn(encoder_outputs, decoder_hidden)\n\nprint(f'Encoder outputs shape: {encoder_outputs.shape}')\nprint(f'Decoder hidden shape:  {decoder_hidden.shape}')\nprint()\nprint(f'Context vector shape:  {context.shape}  (one vector, weighted blend)')\nprint(f'Attention weights:     {weights.detach().numpy().round(3)}')\nprint(f'Weights sum to:        {weights.sum().item():.4f}  (always 1.0)')\nprint()\nprint('Each weight tells us: how much does the decoder care about each source position?')\nprint('After training: these weights would show meaningful alignment patterns.')",
+      "source": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\ntorch.manual_seed(0)\n\n\nclass BahdanauAttention(nn.Module):\n    \"\"\"Additive attention: e_tj = v^T tanh(W s_{t-1} + U h_j).\"\"\"\n\n    def __init__(self, enc_dim, dec_dim, attn_dim):\n        super().__init__()\n        self.W = nn.Linear(dec_dim, attn_dim, bias=False)  # projects the decoder state\n        self.U = nn.Linear(enc_dim, attn_dim, bias=True)   # projects every encoder state\n        self.v = nn.Linear(attn_dim, 1, bias=False)        # collapses to one score\n\n    def forward(self, s_prev, H, src_mask=None):\n        \"\"\"\n        s_prev:   (batch, dec_dim)          decoder state before this step\n        H:        (batch, src_len, enc_dim) all encoder states\n        src_mask: (batch, src_len) bool     False marks padding\n        \"\"\"\n        # 1. score every source position against the decoder state\n        e = self.v(torch.tanh(self.W(s_prev).unsqueeze(1) + self.U(H))).squeeze(-1)  # (B, S)\n        # padded positions must never receive attention\n        if src_mask is not None:\n            e = e.masked_fill(~src_mask, float(\"-inf\"))\n        # 2. softmax turns scores into weights that sum to 1\n        alpha = F.softmax(e, dim=-1)                                                    # (B, S)\n        # 3. context = weighted sum of encoder states\n        c = torch.bmm(alpha.unsqueeze(1), H).squeeze(1)                                 # (B, enc_dim)\n        return c, alpha\n\n\nenc_dim, dec_dim, attn_dim = 16, 12, 10\nattn = BahdanauAttention(enc_dim, dec_dim, attn_dim)\n\n# two source sentences in one batch: lengths 5 and 3 (the second is padded)\nH = torch.randn(2, 5, enc_dim)\ns_prev = torch.randn(2, dec_dim)\nsrc_mask = torch.tensor([[1, 1, 1, 1, 1],\n                         [1, 1, 1, 0, 0]], dtype=torch.bool)\n\nc, alpha = attn(s_prev, H, src_mask)\nprint(\"encoder states H :\", tuple(H.shape))\nprint(\"decoder state    :\", tuple(s_prev.shape))\nprint(\"context c_t      :\", tuple(c.shape), \" <- one vector per sentence, rebuilt every step\")\nprint()\nprint(\"attention weights (rows = sentences, cols = source positions):\")\nprint(alpha.detach().numpy().round(3))\nprint(\"row sums:\", alpha.sum(-1).detach().numpy().round(4))",
       "outputs": [
         {
           "type": "text",
-          "content": "Encoder outputs shape: torch.Size([1, 5, 8])\nDecoder hidden shape:  torch.Size([1, 1, 8])\n\nContext vector shape:  torch.Size([1, 8])  (one vector, weighted blend)\nAttention weights:     [[0.183 0.241 0.198 0.172 0.206]]\nWeights sum to:        1.0000  (always 1.0)\n\nEach weight tells us: how much does the decoder care about each source position?\nAfter training: these weights would show meaningful alignment patterns."
+          "content": "encoder states H : (2, 5, 16)\ndecoder state    : (2, 12)\ncontext c_t      : (2, 16)  <- one vector per sentence, rebuilt every step\n\nattention weights (rows = sentences, cols = source positions):\n[[0.215 0.2   0.198 0.197 0.191]\n [0.266 0.356 0.378 0.    0.   ]]\nrow sums: [1. 1.]"
+        }
+      ]
+    },
+    {
+      "id": "ch11-bahdanau-2",
+      "type": "code",
+      "source": "# The context vector really is a convex combination of encoder states:\nmanual = (alpha.unsqueeze(-1) * H).sum(1)\nprint(\"max |c - sum_j alpha_j h_j| =\", f\"{(manual - c).abs().max().item():.2e}\")\n\n# Parameter count: tiny compared to the RNNs around it\nn_params = sum(p.numel() for p in attn.parameters())\nprint(f\"attention parameters: {n_params}  (W: {dec_dim}x{attn_dim}, U: {enc_dim}x{attn_dim}+{attn_dim}, v: {attn_dim})\")",
+      "outputs": [
+        {
+          "type": "text",
+          "content": "max |c - sum_j alpha_j h_j| = 1.19e-07\nattention parameters: 300  (W: 12x10, U: 16x10+10, v: 10)"
         }
       ]
     }
@@ -115,27 +137,87 @@ Bahdanau attention — one decoder step (generating word "zone"):
 }
 ```
 
-With random weights, the attention is approximately uniform — about 0.2 per source position. After training on translation data, the weights would form meaningful patterns: when generating the French word "étudiant," the attention weights would peak strongly on "student" in the English source.
+Two things to notice. With random weights the attention is nearly uniform (about 0.2 everywhere in the first row) — an untrained alignment model has no opinion yet. And the padded sentence puts exactly 0 on its last two positions, while its three real weights still sum to 1.
 
 ---
 
-## Attention as Alignment: What the Weights Reveal
+## What the weights revealed
 
-One of the most striking results from the Bahdanau paper was that the attention weights were interpretable. When you visualized them as a heatmap, they formed an alignment matrix: rows are output positions, columns are input positions, and bright cells show where the decoder was "looking" when generating each output word.
+Bahdanau's most striking figure wasn't the BLEU score; it was a picture. Plot $\alpha_{tj}$ as a grid — French output words down the side, English source words across the top — and the trained model's weights trace out a **word alignment**, the thing statistical translation systems had needed separate, hand-engineered models to estimate.
+
+![Attention alignment for "The agreement on the European Economic Area was signed in August 1992" translated to "L'accord sur la zone économique européenne a été signé en août 1992", redrawn from Figure 3 of Bahdanau et al. 2015. Mostly a diagonal, with a reversed block where "European Economic Area" becomes "zone économique européenne". Side notes point out the reversal, a many-to-one case ("a été signé" spread over "was signed"), and that soft attention spreads weight rather than picking a single word.](/appendix-c/11-attention-the-fix-for-the-bottleneck/alignment-heatmap.png)
+
+Three things stand out:
+
+- **Mostly diagonal.** English and French usually keep the same word order, so output word $t$ looks near source word $t$.
+- **A reversed block.** French puts the adjective after the noun, so "European Economic Area" becomes "zone économique européenne". The weights flip to follow it. Nothing told the model about adjective order; it discovered the alignment because looking in the right place made the translation loss go down.
+- **Soft, not hard.** Where one English word maps to several French words, or the reverse ("was signed" → "a été signé"), the weight spreads across neighbours. A hard alignment would have to pick one; a weighted average doesn't.
+
+### Does it actually help?
+
+Bahdanau trained the same encoder–decoder with and without attention, on sentences up to 30 or 50 words, and reported BLEU on English→French (WMT'14, Table 1 of the paper):
+
+| model | trained on ≤ 30 words | trained on ≤ 50 words |
+|---|---|---|
+| RNNencdec (fixed context vector) | 13.93 | 17.82 |
+| **RNNsearch (attention)** | **21.50** | **26.75** |
+
+Nearly 9 BLEU points at the same size and data. More telling was the paper's plot of BLEU against sentence length: the fixed-vector model collapsed on long sentences, while RNNsearch-50 barely dropped. The bottleneck was gone.
+
+---
+
+## Train it yourself: watch an alignment appear
+
+Real translation data takes days to train on. **Reversing a string** isolates the same problem in a couple of minutes on a laptop CPU: given `c g a b i b f j`, output `j f b i b a g c`. Output letter $t$ must come from source position $n-1-t$, so the "correct" alignment is a perfect anti-diagonal, and a fixed-context model has to memorise the entire string in one vector.
+
+The notebook trains two otherwise identical seq2seq models — a bidirectional GRU encoder, a GRU decoder, the same sizes and the same 1,200 steps — one with a fixed context vector, one with Bahdanau attention.
 
 ```notebook
 {
-  "title": "Visualizing attention weights as an alignment matrix",
-  "runtime": "Python · NumPy",
+  "title": "Train it — attention vs a fixed context vector on sequence reversal",
+  "runtime": "Python · PyTorch · ~2 min on CPU",
   "cells": [
     {
-      "id": "cell-alignment",
+      "id": "ch11-train-1",
       "type": "code",
-      "source": "import numpy as np\n\n# Simulated attention weights for translating\n# 'The European Economic Area' → 'la zone économique européenne'\n# (a real example from Bahdanau et al. — word order is REVERSED in French)\n\n# Rows = French output words, Columns = English input words\nsource_words = ['The', 'European', 'Economic', 'Area']\ntarget_words = ['la', 'zone', 'économique', 'européenne']\n\n# What the trained attention learned (approximate):\n# 'la'           focuses on 'The'\n# 'zone'         focuses on 'Area'\n# 'économique'   focuses on 'Economic'\n# 'européenne'   focuses on 'European'\n#\n# Notice: French reverses the order of the last three words!\n# The attention matrix is NOT diagonal — it shows the actual learned alignment.\n\nalignment = np.array([\n    [0.87, 0.04, 0.05, 0.04],  # 'la'          → 'The'\n    [0.03, 0.04, 0.09, 0.84],  # 'zone'         → 'Area'\n    [0.02, 0.06, 0.81, 0.11],  # 'économique'   → 'Economic'\n    [0.03, 0.83, 0.08, 0.06],  # 'européenne'   → 'European'\n])\n\nprint('Attention weight matrix (rows=French output, columns=English input):')\nprint()\nprint(f'{\"\":15}', end='')\nfor w in source_words:\n    print(f'{w:>12}', end='')\nprint()\nprint('-' * 63)\n\nfor i, (fr_word, row) in enumerate(zip(target_words, alignment)):\n    print(f'{fr_word:<15}', end='')\n    for val in row:\n        # Visual bar\n        bar_len = int(val * 10)\n        bar = '█' * bar_len + '░' * (10 - bar_len)\n        print(f'  {val:.2f} {bar[:5]}', end='')\n    print()\n\nprint()\nprint('Key observation: the alignment is NOT diagonal!')\nprint('English \"Economic Area\" → French \"zone économique européenne\"')\nprint('The model learned to reverse word order without being told to.')\nprint()\nprint('This emerged purely from training on paired translation examples.')\nprint('No explicit alignment rules were programmed.')",
+      "source": "# Task: reverse a random string, e.g.  \"c a h e b\"  ->  \"b e h a c\".\n# Output letter t must come from source position (n - 1 - t): a perfect anti-diagonal\n# alignment. A fixed context vector has to memorise the whole string; attention can\n# simply look it up. We train both models with identical budgets and compare.\nimport random\nimport time\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\ntorch.manual_seed(0)\nrandom.seed(0)\ntorch.set_num_threads(4)   # tiny tensors: more threads only add overhead\n\nLETTERS = list(\"abcdefghij\")\nPAD, BOS, EOS = 0, 1, 2\nstoi = {ch: i + 3 for i, ch in enumerate(LETTERS)}\nitos = {i: ch for ch, i in stoi.items()}\nV = len(LETTERS) + 3\nMIN_LEN, MAX_LEN = 3, 10   # training lengths\n\ndef make_batch(n, lo=MIN_LEN, hi=MAX_LEN):\n    # One length per batch: no padding, so the backward GRU never reads PAD tokens.\n    L = random.randint(lo, hi)\n    src = torch.full((n, L), PAD)\n    tgt_in = torch.full((n, L + 1), PAD)\n    tgt_out = torch.full((n, L + 1), PAD)\n    for b in range(n):\n        ids = [stoi[random.choice(LETTERS)] for _ in range(L)]\n        rev = ids[::-1]\n        src[b] = torch.tensor(ids)\n        tgt_in[b] = torch.tensor([BOS] + rev)\n        tgt_out[b] = torch.tensor(rev + [EOS])\n    return src, tgt_in, tgt_out\n\nsrc, tin, tout = make_batch(1, 5, 5)\nprint(\"example source :\", \" \".join(itos[i] for i in src[0].tolist()))\nprint(\"example target :\", \" \".join(itos.get(i, \"<eos>\") for i in tout[0].tolist()))",
       "outputs": [
         {
           "type": "text",
-          "content": "Attention weight matrix (rows=French output, columns=English input):\n\n                     The    European    Economic        Area\n---------------------------------------------------------------\nla               0.87 ████░  0.04 ░░░░░  0.05 ░░░░░  0.04 ░░░░░\nzone             0.03 ░░░░░  0.04 ░░░░░  0.09 ░░░░░  0.84 ████░\néconomique       0.02 ░░░░░  0.06 ░░░░░  0.81 ████░  0.11 ░░░░░\neurop​éenne       0.03 ░░░░░  0.83 ████░  0.08 ░░░░░  0.06 ░░░░░\n\nKey observation: the alignment is NOT diagonal!\nEnglish \"Economic Area\" → French \"zone économique européenne\"\nThe model learned to reverse word order without being told to.\n\nThis emerged purely from training on paired translation examples.\nNo explicit alignment rules were programmed."
+          "content": "example source : g a e i h\nexample target : h i e a g <eos>"
+        }
+      ]
+    },
+    {
+      "id": "ch11-train-2",
+      "type": "code",
+      "source": "class Seq2Seq(nn.Module):\n    \"\"\"use_attention=False gives classic seq2seq: one fixed context for every step.\"\"\"\n\n    def __init__(self, use_attention, emb=32, enc_hid=48, dec_hid=96, attn=48):\n        super().__init__()\n        self.use_attention = use_attention\n        enc = 2 * enc_hid\n        self.src_emb = nn.Embedding(V, emb, padding_idx=PAD)\n        self.encoder = nn.GRU(emb, enc_hid, batch_first=True, bidirectional=True)\n        self.tgt_emb = nn.Embedding(V, emb, padding_idx=PAD)\n        self.cell = nn.GRUCell(emb + enc, dec_hid)\n        self.init = nn.Linear(enc, dec_hid)\n        # additive attention: e = v^T tanh(W s + U h)\n        self.W = nn.Linear(dec_hid, attn, bias=False)\n        self.U = nn.Linear(enc, attn)\n        self.v = nn.Linear(attn, 1, bias=False)\n        self.out = nn.Linear(dec_hid + enc, V)\n\n    def encode(self, src):\n        H, h_n = self.encoder(self.src_emb(src))\n        h_final = torch.cat([h_n[0], h_n[1]], -1)\n        return H, h_final, self.U(H), src != PAD\n\n    def step(self, y_prev, s, H, h_final, UH, mask):\n        if self.use_attention:\n            e = self.v(torch.tanh(self.W(s).unsqueeze(1) + UH)).squeeze(-1)\n            alpha = F.softmax(e.masked_fill(~mask, -1e9), -1)\n            c = torch.bmm(alpha.unsqueeze(1), H).squeeze(1)\n        else:\n            alpha, c = None, h_final          # the bottleneck: same vector every step\n        s = self.cell(torch.cat([self.tgt_emb(y_prev), c], -1), s)\n        return self.out(torch.cat([s, c], -1)), s, alpha\n\n    def forward(self, src, tgt_in):           # teacher forcing\n        H, h_final, UH, mask = self.encode(src)\n        s = torch.tanh(self.init(h_final))\n        logits = []\n        for t in range(tgt_in.shape[1]):\n            lg, s, _ = self.step(tgt_in[:, t], s, H, h_final, UH, mask)\n            logits.append(lg)\n        return torch.stack(logits, 1)\n\n    @torch.no_grad()\n    def greedy(self, src, steps):\n        H, h_final, UH, mask = self.encode(src)\n        s = torch.tanh(self.init(h_final))\n        y = torch.full((src.shape[0],), BOS)\n        preds, alphas = [], []\n        for _ in range(steps):\n            lg, s, a = self.step(y, s, H, h_final, UH, mask)\n            y = lg.argmax(-1)\n            preds.append(y)\n            alphas.append(a)\n        return torch.stack(preds, 1), (torch.stack(alphas, 1) if self.use_attention else None)\n\n\ndef train(model, steps=1200, bs=64):\n    opt = torch.optim.Adam(model.parameters(), lr=3e-3)\n    t0 = time.time()\n    for step in range(1, steps + 1):\n        src, tin, tout = make_batch(bs)\n        logits = model(src, tin)\n        loss = F.cross_entropy(logits.reshape(-1, V), tout.reshape(-1), ignore_index=PAD)\n        opt.zero_grad()\n        loss.backward()\n        nn.utils.clip_grad_norm_(model.parameters(), 1.0)\n        opt.step()\n        if step % 300 == 0:\n            print(f\"  step {step:>4}  loss {loss.item():.3f}\")\n    print(f\"  ({time.time() - t0:.0f}s)\")\n    return model\n\n\nprint(\"Training seq2seq WITHOUT attention (fixed context vector)...\")\nplain = train(Seq2Seq(use_attention=False))\nprint(\"Training seq2seq WITH Bahdanau attention...\")\nattentive = train(Seq2Seq(use_attention=True))",
+      "outputs": [
+        {
+          "type": "text",
+          "content": "Training seq2seq WITHOUT attention (fixed context vector)...\n  step  300  loss 0.025\n  step  600  loss 0.488\n  step  900  loss 0.019\n  step 1200  loss 0.038\n  (50s)\nTraining seq2seq WITH Bahdanau attention...\n  step  300  loss 0.152\n  step  600  loss 0.001\n  step  900  loss 0.000\n  step 1200  loss 0.000\n  (77s)"
+        }
+      ]
+    },
+    {
+      "id": "ch11-train-3",
+      "type": "code",
+      "source": "# Exact-match accuracy on fresh random strings, bucketed by length.\n# Lengths above 10 were never seen during training.\nrandom.seed(123)\n\ndef exact_match(model, L, n=500):\n    src, _, tout = make_batch(n, L, L)\n    pred, _ = model.greedy(src, L + 1)\n    return (pred == tout).all(1).float().mean().item()\n\nprint(f\"{'length':>7} {'no attention':>14} {'attention':>11}\")\nfor L in [3, 5, 7, 10, 12, 14]:\n    note = \"   <- longer than anything in training\" if L > MAX_LEN else \"\"\n    print(f\"{L:>7} {exact_match(plain, L):>13.0%} {exact_match(attentive, L):>11.0%}{note}\")",
+      "outputs": [
+        {
+          "type": "text",
+          "content": " length   no attention   attention\n      3          100%        100%\n      5           97%        100%\n      7           77%        100%\n     10           13%        100%\n     12            1%         86%   <- longer than anything in training\n     14            0%          5%   <- longer than anything in training"
+        }
+      ]
+    },
+    {
+      "id": "ch11-train-4",
+      "type": "code",
+      "source": "# Look inside: the learned attention weights for one string.\nrandom.seed(7)\nsrc, _, _ = make_batch(1, 8, 8)\npred, alphas = attentive.greedy(src, 8)\nA = alphas[0]\nsrc_txt = [itos[i] for i in src[0].tolist()]\nout_txt = [itos.get(i, \"?\") for i in pred[0].tolist()]\n\nshades = \" .:-=+*#%@\"\nprint(\"rows = output letters, columns = source letters; denser symbol = more attention\\n\")\nprint(\"        \" + \"  \".join(src_txt))\nfor t, row in enumerate(A):\n    cells = \"  \".join(shades[min(9, int(w * 10))] for w in row.tolist())\n    print(f\"  {out_txt[t]}  ->  {cells}    looks at position {row.argmax().item()}  ({row.max().item():.2f})\")\nprint()\nprint(\"The dense cells run along the anti-diagonal: to write output letter t the decoder\")\nprint(\"looks at source position 7 - t. Nobody told it to; the alignment was learned.\")",
+      "outputs": [
+        {
+          "type": "text",
+          "content": "rows = output letters, columns = source letters; denser symbol = more attention\n\n        c  g  a  b  i  b  f  j\n  j  ->                    -  +    looks at position 7  (0.57)\n  f  ->                    +  -    looks at position 6  (0.51)\n  b  ->                 *  -       looks at position 5  (0.61)\n  i  ->              *  :          looks at position 4  (0.63)\n  b  ->           +  -             looks at position 3  (0.54)\n  a  ->        #  .                looks at position 2  (0.79)\n  g  ->     +  -                   looks at position 1  (0.58)\n  c  ->  *  :                      looks at position 0  (0.68)\n\nThe dense cells run along the anti-diagonal: to write output letter t the decoder\nlooks at source position 7 - t. Nobody told it to; the alignment was learned."
         }
       ]
     }
@@ -143,31 +225,76 @@ One of the most striking results from the Bahdanau paper was that the attention 
 }
 ```
 
-This was remarkable. Nobody told the model that "Economic" in English corresponds to "économique" in French — and that their positions in the sentence are reversed. The model discovered this alignment automatically, as a side effect of learning to translate. The attention weights are a window into what the model "knows" about the relationship between languages.
+How to read the results:
+
+- **The fixed-vector model degrades with length**, exactly as Cho et al. saw on real translation: perfect at 3 letters, 77% at 7, 13% at 10 — even though 10 is inside its training range. One vector can't hold ten letters in order.
+- **The attention model is perfect on every length it trained on**, and still gets 86% of 12-letter strings it has never seen. It doesn't need to memorise the string; it only needs to know *where to look next*.
+- **The weights form the anti-diagonal.** Each output letter puts most of its weight on the source letter it copies. The weight is shared with a neighbour because each annotation $h_j$ comes from a bidirectional RNN and already carries information about adjacent letters.
+- **It isn't magic.** At 14 letters even the attention model falls to 5%. The decoder's recurrent state has never had to count that far. Generalising to longer inputs than you trained on remains hard, and it comes back in Chapter 14.
 
 ---
 
-## The Remaining Problem: Still Sequential
+## Variations: Luong attention (2015)
 
-Bahdanau attention was a massive improvement over fixed context vectors. Translation quality on long sentences improved dramatically — BLEU scores jumped 12+ points on 50-word sentences.
+A few months after Bahdanau, Luong, Pham and Manning ("Effective Approaches to Attention-based Neural Machine Translation", EMNLP 2015) simplified and systematised the idea. Three contributions stuck.
 
-But there was still a fundamental problem: the underlying architecture was still an RNN. The encoder read the source sentence sequentially. The decoder generated output sequentially. Everything was still serial — step `t` had to wait for step `t-1`.
+<figure class="paper-shot">
+<img src="/appendix-c/11-attention-the-fix-for-the-bottleneck/papers/luong-2015-abstract.png" alt="Title and abstract of Effective Approaches to Attention-based Neural Machine Translation (Luong, Pham and Manning, 2015)" />
+<figcaption>Title and abstract of Luong, Pham &amp; Manning (2015), <em>Effective Approaches to Attention-based Neural Machine Translation</em>. <a href="https://arxiv.org/abs/1508.04025">arXiv:1508.04025</a>.</figcaption>
+</figure>
 
-The attention mechanism didn't remove the recurrence. It just added a better information-passing mechanism on top of it.
+<figure class="paper-shot">
+<img src="/appendix-c/11-attention-the-fix-for-the-bottleneck/papers/luong-2015-figure.png" alt="Figure 2 from Luong et al. 2015: global attention over all encoder states producing a context vector for the current decoder step" />
+<figcaption>Figure 2 from the same paper: <em>global</em> attention — at step $t$ the decoder looks at every source state, not a predicted window. Local attention (a sliding window around a predicted centre) is in the paper as well. <a href="https://ar5iv.labs.arxiv.org/html/1508.04025">HTML version</a>.</figcaption>
+</figure>
+
+**1. Simpler score functions.** The additive score needs a small neural network per pair. Luong compared it with cheaper alternatives:
+
+$$
+\text{score}(s_t, h_j) =
+\begin{cases}
+v_a^{\top} \tanh\!\left(W_a [s_t ; h_j]\right) & \text{concat (additive)}\\[4pt]
+s_t^{\top} W_a\, h_j & \text{general (bilinear)}\\[4pt]
+s_t^{\top} h_j & \text{dot}
+\end{cases}
+$$
+
+The **dot** score has no parameters at all and turns scoring every position into one matrix multiplication — the operation GPUs are fastest at.
+
+![Four score functions side by side in the hand-drawn style: additive (Bahdanau), general and dot (Luong), and scaled dot (Vaswani 2017). Each box shows its formula, parameter count and cost. A note explains that as the dimension d grows, dot products grow like √d, which saturates the softmax; dividing by √d keeps scores near unit size.](/appendix-c/11-attention-the-fix-for-the-bottleneck/score-functions.png)
+
+**2. Attend with the current state.** Luong computes attention from $s_t$, the decoder state *after* this step's update, and then combines it: $\tilde{s}_t = \tanh\!\left(W_c [c_t ; s_t]\right)$, predicting from $\tilde{s}_t$. Bahdanau used $s_{t-1}$ and fed $c_t$ *into* the update. Both work; Luong's version is simpler to implement.
+
+**3. Global vs local attention.** *Global* attention looks at every source word, as above. *Local* attention first predicts a centre position $p_t$ and attends only to a window $[p_t - D,\ p_t + D]$ around it, weighting by a Gaussian. It's cheaper on long inputs, and an early ancestor of today's sliding-window attention.
+
+Luong also introduced **input feeding**: pass the previous $\tilde{s}_{t-1}$ into the next step's input, so the model knows what it attended to last time and doesn't translate the same word twice.
+
+The notebook compares the three score functions in practice, and measures the one weakness of the dot product that the Transformer will have to fix.
 
 ```notebook
 {
-  "title": "Still sequential — the remaining bottleneck after Bahdanau attention",
-  "runtime": "Python",
+  "title": "Three ways to score a match — additive, general, dot (Luong et al. 2015)",
+  "runtime": "Python · PyTorch",
   "cells": [
     {
-      "id": "cell-still-sequential",
+      "id": "ch11-scores-1",
       "type": "code",
-      "source": "# Structural comparison: what attention fixed vs what it didn't\n\nproblems = {\n    'Fixed context vector (information bottleneck)': {\n        'Seq2Seq (2014)':       'BROKEN — all context must fit in one vector',\n        'Bahdanau Att (2015)':  'FIXED  — decoder accesses all encoder states',\n        'Transformer (2017)':   'FIXED  — direct access to all positions',\n    },\n    'Long-range dependencies (gradient decay)': {\n        'Seq2Seq (2014)':       'BROKEN — gradient path scales with O(n)',\n        'Bahdanau Att (2015)':  'IMPROVED — attention provides shortcut paths',\n        'Transformer (2017)':   'FIXED  — direct connections between all pairs',\n    },\n    'Sequential computation (no parallelism)': {\n        'Seq2Seq (2014)':       'BROKEN — fully sequential RNN',\n        'Bahdanau Att (2015)':  'BROKEN — still an RNN underneath',\n        'Transformer (2017)':   'FIXED  — all positions computed in parallel',\n    },\n    'Training speed at scale': {\n        'Seq2Seq (2014)':       'SLOW  — sequential processing',\n        'Bahdanau Att (2015)':  'SLOW  — sequential processing',\n        'Transformer (2017)':   'FAST  — full GPU parallelization',\n    },\n}\n\nfor problem, statuses in problems.items():\n    print(f'Problem: {problem}')\n    for model, status in statuses.items():\n        emoji = '✓' if 'FIXED' in status or 'FAST' in status else ('~' if 'IMPROVED' in status else '✗')\n        print(f'  {emoji} {model:<22} {status}')\n    print()",
+      "source": "import time\nimport torch\nimport torch.nn as nn\n\ntorch.manual_seed(0)\nd = 256          # hidden size of both encoder and decoder\nS = 50           # source length\nB = 64           # batch\n\ns = torch.randn(B, d)      # decoder state (the \"query\")\nH = torch.randn(B, S, d)   # encoder states (the \"keys\")\n\n# additive / concat (Bahdanau): v^T tanh(W s + U h)\nW, U, v = nn.Linear(d, d, bias=False), nn.Linear(d, d), nn.Linear(d, 1, bias=False)\ndef additive(s, H):\n    return v(torch.tanh(W(s).unsqueeze(1) + U(H))).squeeze(-1)\n\n# general (Luong): s^T W_a h  — one bilinear form\nW_a = nn.Linear(d, d, bias=False)\ndef general(s, H):\n    return torch.bmm(H, W_a(s).unsqueeze(-1)).squeeze(-1)\n\n# dot (Luong): s^T h  — no parameters at all\ndef dot(s, H):\n    return torch.bmm(H, s.unsqueeze(-1)).squeeze(-1)\n\ndef params(*mods):\n    return sum(p.numel() for m in mods for p in m.parameters())\n\ndef bench(fn, reps=200):\n    with torch.no_grad():\n        fn(s, H)\n        t = time.perf_counter()\n        for _ in range(reps):\n            fn(s, H)\n    return (time.perf_counter() - t) / reps * 1e3\n\nprint(f\"{'score':<10}{'formula':<26}{'params':>9}{'ms / call':>11}\")\nprint(\"-\" * 56)\nfor name, formula, fn, n in [\n    (\"additive\", \"v^T tanh(W s + U h)\", additive, params(W, U, v)),\n    (\"general\", \"s^T W_a h\", general, params(W_a)),\n    (\"dot\", \"s^T h\", dot, 0),\n]:\n    print(f\"{name:<10}{formula:<26}{n:>9,}{bench(fn):>11.3f}\")",
       "outputs": [
         {
           "type": "text",
-          "content": "Problem: Fixed context vector (information bottleneck)\n  ✗ Seq2Seq (2014)        BROKEN — all context must fit in one vector\n  ✓ Bahdanau Att (2015)   FIXED  — decoder accesses all encoder states\n  ✓ Transformer (2017)    FIXED  — direct access to all positions\n\nProblem: Long-range dependencies (gradient decay)\n  ✗ Seq2Seq (2014)        BROKEN — gradient path scales with O(n)\n  ~ Bahdanau Att (2015)   IMPROVED — attention provides shortcut paths\n  ✓ Transformer (2017)    FIXED  — direct connections between all pairs\n\nProblem: Sequential computation (no parallelism)\n  ✗ Seq2Seq (2014)        BROKEN — fully sequential RNN\n  ✗ Bahdanau Att (2015)   BROKEN — still an RNN underneath\n  ✓ Transformer (2017)    FIXED  — all positions computed in parallel\n\nProblem: Training speed at scale\n  ✗ Seq2Seq (2014)        SLOW  — sequential processing\n  ✗ Bahdanau Att (2015)   SLOW  — sequential processing\n  ✓ Transformer (2017)    FAST  — full GPU parallelization"
+          "content": "score     formula                      params  ms / call\n--------------------------------------------------------\nadditive  v^T tanh(W s + U h)         131,584      9.762\ngeneral   s^T W_a h                    65,536      0.760\ndot       s^T h                             0      0.297"
+        }
+      ]
+    },
+    {
+      "id": "ch11-scores-2",
+      "type": "code",
+      "source": "# The dot product is a batched matrix multiply — the operation GPUs are built for.\n# Its weakness shows up as the dimension grows: scores get larger and larger.\nfor d_ in [16, 64, 256, 1024]:\n    q, k = torch.randn(10000, d_), torch.randn(10000, d_)\n    scores = (q * k).sum(-1)\n    print(f\"d = {d_:>4}:  std of s.h = {scores.std():6.2f}   std of s.h / sqrt(d) = {(scores / d_**0.5).std():.2f}\")\nprint()\nprint(\"Scaling by sqrt(d) is exactly the fix the Transformer adopts in the next chapter.\")",
+      "outputs": [
+        {
+          "type": "text",
+          "content": "d =   16:  std of s.h =   4.05   std of s.h / sqrt(d) = 1.01\nd =   64:  std of s.h =   7.97   std of s.h / sqrt(d) = 1.00\nd =  256:  std of s.h =  16.00   std of s.h / sqrt(d) = 1.00\nd = 1024:  std of s.h =  32.02   std of s.h / sqrt(d) = 1.00\n\nScaling by sqrt(d) is exactly the fix the Transformer adopts in the next chapter."
         }
       ]
     }
@@ -175,31 +302,35 @@ The attention mechanism didn't remove the recurrence. It just added a better inf
 }
 ```
 
-The transformer's core idea: what if you took the attention mechanism, threw away the RNN, and used attention alone to process the entire sequence? No more sequential bottleneck. Every position could attend to every other position in a single parallelizable operation.
-
-That's the claim of the 2017 paper "Attention Is All You Need." The title is literal.
+The dot score is about 30× faster than additive here, with no parameters. The catch is the second table: for random vectors the dot product's spread grows like $\sqrt{d}$ — 4 at $d = 16$, 32 at $d = 1024$. Feed scores that large into a softmax and it puts nearly all the weight on one position, with gradients close to zero everywhere else. Vaswani et al. noticed that additive attention beat plain dot-product attention at large $d$ for exactly this reason, and fixed it by dividing by $\sqrt{d_k}$. That's the "scaled" in scaled dot-product attention, and Chapter 12 derives it properly.
 
 ---
 
-## Why Removing Recurrence Works: The O(1) Path Length
+## Why attention also fixes the gradient problem
 
-In an RNN, for position 1 to influence position 100, information must travel through 99 sequential steps. Every step multiplies the gradient by something less than 1. By the time the gradient reaches position 1, it's almost nothing.
+The bottleneck wasn't the only problem with RNNs. To learn that the first word affects the last, the gradient has to travel back through every step in between. By the chain rule:
 
-With attention, position 1 and position 100 have a **direct connection**. Position 100 can attend directly to position 1 with a single dot product. The gradient path has length 1 regardless of how far apart the positions are.
+$$
+\frac{\partial h_n}{\partial h_1} = \prod_{k=2}^{n} \frac{\partial h_k}{\partial h_{k-1}}
+$$
+
+That is a product of $n-1$ Jacobian matrices. If their typical size is a bit below 1, the product shrinks **exponentially** with $n$ — the vanishing gradient from Chapter 9. LSTMs and GRUs slow the decay, but they don't remove it.
+
+Attention adds a **shortcut**. The context $c_t$ depends on every $h_j$ directly through one weighted sum, so there's always a path from any source position to any output that is a single step long, however far apart they are. The notebook measures this: it computes how much the last output of a sequence changes when you nudge the first input, for a vanilla RNN and for a single attention layer.
 
 ```notebook
 {
-  "title": "Path length comparison: RNN vs Attention for long-range dependencies",
-  "runtime": "Python",
+  "title": "Path length, measured — how much does token 1 affect the last output?",
+  "runtime": "Python · PyTorch",
   "cells": [
     {
-      "id": "cell-path-length",
+      "id": "ch11-paths-1",
       "type": "code",
-      "source": "# Comparing gradient path lengths between architectures\n\nsequence_lengths = [10, 50, 100, 500, 1000, 4096]\n\nprint('Maximum gradient path length (steps) to connect two distant positions:')\nprint()\nprint(f'{\"Seq len\":<12} {\"RNN/LSTM\":>10} {\"Self-Attention\":>16}')\nprint('-' * 42)\n\nfor n in sequence_lengths:\n    rnn_path    = n - 1         # must traverse n-1 time steps\n    attn_path   = 1             # direct connection always\n    print(f'{n:<12} {rnn_path:>10} {attn_path:>16}')\n\nprint()\nprint('RNN: path length scales with sequence length → gradients vanish')\nprint('Attention: path length is always 1 → gradients flow cleanly')\nprint()\nprint('This is why you can train transformers on contexts of 4096+ tokens')\nprint('while LSTMs practically top out at ~200 tokens of usable context.')\nprint()\nprint('The price: attention is O(n²) in compute and memory.')\nprint('For n=1000 tokens: 1,000,000 attention scores to compute per layer.')\nprint('RNNs are O(n). This tradeoff was worth it for almost every NLP task.')",
+      "source": "# We feed a random sequence through (a) a vanilla RNN and (b) one self-attention layer,\n# then measure the gradient of the LAST output with respect to the FIRST input.\n# In the RNN that signal must survive n-1 multiplications; in attention it is one hop.\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\ntorch.manual_seed(0)\nd = 32\nrnn = nn.RNN(d, d, batch_first=True, nonlinearity=\"tanh\")\nWq, Wk, Wv = (nn.Linear(d, d, bias=False) for _ in range(3))\n\ndef self_attention(x):\n    q, k, v = Wq(x), Wk(x), Wv(x)\n    w = F.softmax(q @ k.transpose(-2, -1) / d**0.5, -1)\n    return w @ v\n\nprint(f\"{'seq len':>8} {'RNN  |d out_n / d x_1|':>24} {'attention':>12}\")\nfor n in [5, 10, 25, 50, 100, 200]:\n    res = []\n    for model in (\"rnn\", \"attn\"):\n        x = torch.randn(1, n, d, requires_grad=True)\n        y = rnn(x)[0] if model == \"rnn\" else self_attention(x)\n        y[0, -1].sum().backward()\n        res.append(x.grad[0, 0].norm().item())\n    print(f\"{n:>8} {res[0]:>24.2e} {res[1]:>12.2e}\")\nprint()\nprint(\"RNN: the gradient from the first token collapses exponentially with distance.\")\nprint(\"Attention: it shrinks only slowly — roughly like 1/n, because softmax spreads its\")\nprint(\"weight over more tokens — never exponentially. There is always a direct, one-step path.\")",
       "outputs": [
         {
           "type": "text",
-          "content": "Maximum gradient path length (steps) to connect two distant positions:\n\nSeq len        RNN/LSTM  Self-Attention\n------------------------------------------\n10                    9               1\n50                   49               1\n100                  99               1\n500                 499               1\n1000                999               1\n4096               4095               1\n\nRNN: path length scales with sequence length → gradients vanish\nAttention: path length is always 1 → gradients flow cleanly\n\nThis is why you can train transformers on contexts of 4096+ tokens\nwhile LSTMs practically top out at ~200 tokens of usable context.\n\nThe price: attention is O(n²) in compute and memory.\nFor n=1000 tokens: 1,000,000 attention scores to compute per layer.\nRNNs are O(n). This tradeoff was worth it for almost every NLP task."
+          "content": " seq len   RNN  |d out_n / d x_1|    attention\n       5                 6.31e-02     7.63e-01\n      10                 1.65e-03     2.04e-01\n      25                 1.36e-09     1.57e-01\n      50                 8.85e-19     5.67e-02\n     100                 0.00e+00     3.09e-02\n     200                 0.00e+00     2.57e-02\n\nRNN: the gradient from the first token collapses exponentially with distance.\nAttention: it shrinks only slowly — roughly like 1/n, because softmax spreads its\nweight over more tokens — never exponentially. There is always a direct, one-step path."
         }
       ]
     }
@@ -207,15 +338,59 @@ With attention, position 1 and position 100 have a **direct connection**. Positi
 }
 ```
 
-The O(n²) cost is real — and it's why context window lengths were limited for years and why recent research (e.g., Flash Attention, linear attention variants) focuses on making attention more efficient. But for the task of understanding language, the quality improvement from O(1) gradient paths was overwhelmingly worth the compute cost.
+At 50 tokens the RNN's signal from the first token is around $10^{-18}$, and by 100 it underflows to exactly zero in 32-bit floats. Through attention it is still about 0.03 at 200 tokens.
 
 ---
 
-## Quick Recap
+## Attention beyond translation
 
-- **Bahdanau attention** (2015) fixed the seq2seq bottleneck by giving the decoder access to all encoder hidden states, weighted dynamically at each decoding step.
-- The **alignment mechanism** produces a score for each source position at each decoder step, normalizes with softmax, and returns a weighted context vector.
-- The weights are interpretable: they reveal the model's learned alignment between source and target languages, including non-trivial ones like word order reversal.
-- Bahdanau attention fixed the information bottleneck but didn't fix the sequential computation problem — the RNN was still there underneath.
-- The **transformer** (2017) removed the RNN entirely: attention alone, applied in parallel across all positions simultaneously, with O(1) gradient paths between any two positions.
-- The next chapters cover how that attention mechanism works in detail.
+Once people saw that "learn where to look" worked for translation, it spread fast:
+
+- **Show, Attend and Tell** (Xu et al., 2015) captioned images by attending over a grid of CNN features. The weights showed the model looking at the frisbee while it wrote "frisbee".
+- **Pointer Networks** (Vinyals et al., 2015) used the attention weights themselves as the output — "point at input item $j$" — to solve sorting and convex-hull problems, and later to copy rare words in summarisation.
+- **Speech recognition** — Listen, Attend and Spell (Chan et al., 2016) — aligned audio frames with characters the same way.
+- **Memory networks and the Neural Turing Machine** (Graves et al., 2014) used content-based attention to read from an external memory, a close relative of the same idea.
+
+### A caution: attention weights are not explanations
+
+The alignment heatmaps are so readable that it's tempting to treat attention as the model's *reason*. Jain & Wallace ("Attention is not Explanation", 2019) showed that you can often swap a trained model's attention for a very different distribution and get the same prediction, so high weight doesn't prove a token mattered. Wiegreffe & Pinter ("Attention is not not Explanation", 2019) replied that adversarial weights are harder to find than that suggests, and that attention does carry real signal. The fair summary: attention weights show where information was *read from*, not *why* the model decided. Proper attribution needs other tools, such as gradients or ablations — Chapter 13 returns to this with interpretability research on heads.
+
+---
+
+## What attention fixed — and what it didn't
+
+![Summary panel in hand-drawn style. Left: a table of three problems (fixed bottleneck, vanishing long-range gradients, sequential computation) and how seq2seq, Bahdanau attention and the 2017 Transformer each fare. Middle: a bar chart of BLEU scores, RNNencdec-30 13.93, RNNsearch-30 21.50, RNNencdec-50 17.82, RNNsearch-50 26.75. Right: the complexity table from Vaswani et al. — recurrent layers O(n·d²) compute, O(n) sequential steps, O(n) path length; self-attention O(n²·d), O(1), O(1) — with a sketch of path lengths.](/appendix-c/11-attention-the-fix-for-the-bottleneck/what-attention-fixed.png)
+
+Bahdanau attention fixed the **information bottleneck** and gave gradients a **shortcut**. It didn't fix the third problem: the encoder and decoder were still RNNs. Step $t$ still waited for step $t-1$, so a 50-word sentence took 50 sequential steps however many GPU cores you had. As datasets grew to billions of words, that serial loop was the limit.
+
+The obvious next question was the one Vaswani et al. asked in 2017: if attention is doing the useful work, why keep the RNN at all? Let every position attend to every other position — the source to itself, the target to itself — and process all of them at once. The table from their paper makes the trade-off precise ($n$ = sequence length, $d$ = width):
+
+| layer type | compute per layer | sequential steps | longest path between two tokens |
+|---|---|---|---|
+| recurrent | $O(n \cdot d^2)$ | $O(n)$ | $O(n)$ |
+| self-attention | $O(n^2 \cdot d)$ | $O(1)$ | $O(1)$ |
+
+Self-attention pays for comparing all pairs — quadratic in $n$ — but every position is computed in parallel and any two tokens are one step apart. For sentences, where $n$ is usually smaller than $d$, it is even cheaper. That bet is "Attention Is All You Need", and it is what the rest of this appendix unpacks, starting with self-attention in Chapter 12.
+
+---
+
+## Key papers
+
+- Cho et al. (2014). *On the Properties of Neural Machine Translation: Encoder–Decoder Approaches.* — measured the bottleneck.
+- Bahdanau, Cho & Bengio (2015). *Neural Machine Translation by Jointly Learning to Align and Translate.* ICLR. — additive attention.
+- Luong, Pham & Manning (2015). *Effective Approaches to Attention-based Neural Machine Translation.* EMNLP. — dot/general scores, local attention, input feeding.
+- Xu et al. (2015). *Show, Attend and Tell.* ICML. — attention for images.
+- Vinyals, Fortunato & Jaitly (2015). *Pointer Networks.* NeurIPS.
+- Jain & Wallace (2019). *Attention is not Explanation.* / Wiegreffe & Pinter (2019). *Attention is not not Explanation.* NAACL / EMNLP.
+- Vaswani et al. (2017). *Attention Is All You Need.* NeurIPS. — where this is heading.
+
+---
+
+## Quick recap
+
+- The seq2seq **bottleneck** forced a whole sentence into one vector, and quality fell with length.
+- **Bahdanau attention** keeps every encoder annotation $h_j$ and builds a fresh context $c_t = \sum_j \alpha_{tj} h_j$ at each step, with weights $\alpha_{tj} = \operatorname{softmax}_j(e_{tj})$ from a small learned score $e_{tj} = v_a^{\top}\tanh(W_a s_{t-1} + U_a h_j)$.
+- The weights learn a **soft alignment** — including reorderings — with no alignment supervision. On WMT'14 English→French that was worth about 9 BLEU points.
+- **Luong** added cheaper scores (general, dot), global vs local attention and input feeding. Dot-product scores grow like $\sqrt{d}$, which is why the Transformer scales them.
+- Attention gives a **one-step gradient path** between any two positions, but attention weights are not proof of *why* a model decided something.
+- What remained was the **sequential RNN**. Removing it entirely is the Transformer.

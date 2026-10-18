@@ -684,4 +684,48 @@ html.dark .md .shiki-wrapper {
   .plotly-chart > div {
     width: 100% !important;
   }
+
+  img {
+    @apply max-w-full h-auto;
+  }
+
+  /* ── Original-paper screenshots ───────────────────────────────────────────── */
+  figure.paper-shot {
+    margin: 1.75rem 0;
+    overflow: hidden;
+    border-radius: 0.75rem;
+    border: 1px solid var(--color-fd-border);
+    background: #ffffff;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.04);
+  }
+
+  figure.paper-shot img {
+    display: block;
+    width: 100%;
+    height: auto;
+    margin: 0;
+    background: #ffffff;
+  }
+
+  figure.paper-shot figcaption {
+    margin: 0;
+    padding: 0.7rem 1rem 0.85rem;
+    font-size: 0.82rem;
+    line-height: 1.5;
+    color: var(--color-fd-muted-foreground);
+    background: var(--color-fd-secondary);
+    border-top: 1px solid var(--color-fd-border);
+  }
+
+  figure.paper-shot figcaption a {
+    @apply text-brand underline underline-offset-4;
+  }
+}
+
+html.dark .md figure.paper-shot {
+  border-color: hsl(0 0% 22%);
+}
+
+html.dark .md figure.paper-shot figcaption {
+  background: hsl(0 0% 12%);
 }
