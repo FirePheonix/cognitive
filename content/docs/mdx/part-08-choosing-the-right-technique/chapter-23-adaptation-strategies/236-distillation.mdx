@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 23.6 Distillation.
 
+Distillation trains a small model to imitate a large one. Hinton, Vinyals & Dean (2015), *Distilling the Knowledge in a Neural Network* ([arXiv:1503.02531](https://arxiv.org/abs/1503.02531)), is the original argument: match the teacher’s soft probabilities, not only the hard label, because the soft targets carry which wrong answers were almost right. For LLMs the “soft target” is often just the teacher’s text: you generate a large set of traces with the big model and supervise the small model on those traces. Chapter 7.8 is the inference-side view of the same idea.
+
+Use it when you already have a large model that does the task and you need the task cheaper or on-device. Do not use it to invent a capability the teacher lacks. The student cannot exceed the teacher on the behavior you distilled, and it will copy the teacher’s bad habits unless you filter the traces.
+
+The bill is the teacher’s generations. Distilling a coding agent means paying the large model to solve thousands of tasks once, then serving the small model forever. If the task mix changes every week, you are re-distilling every week, and a cascade (11.1, FrugalGPT) — small model first, large model only on the misses — is usually the better trade.
+

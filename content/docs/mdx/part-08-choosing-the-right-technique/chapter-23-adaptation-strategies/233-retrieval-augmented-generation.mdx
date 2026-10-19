@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 23.3 Retrieval-Augmented Generation.
 
+RAG is how you change what the model knows without changing what it is. At request time you fetch passages and put them in the window. Lewis et al. (2020) is the paper; chapter 12 is the engineering. Reach for it when the answer depends on private data, on anything newer than the training cutoff, or on a citation you can point at.
+
+Do not reach for it to fix style. A retriever will not make the model write in your voice, obey a JSON schema, or stop using a deprecated function name if that name is what the weights prefer. Those are prompt, grammar (8.3), or adapter problems. A retriever also will not rescue a question whose answer is not in the corpus. Measure recall (14.1) before you blame the generator.
+
+The failure mode people skip is “lost in the middle” (Liu et al., 2023, on 13.5): a correct chunk buried in a long paste is used less than the same chunk placed at the end. Retrieval is not only cheaper than a 100k-token prompt. It is often more accurate, because the needle is no longer in the middle of the haystack.
+

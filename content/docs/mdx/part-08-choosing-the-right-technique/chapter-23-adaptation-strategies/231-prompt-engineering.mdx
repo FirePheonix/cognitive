@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 23.1 Prompt Engineering.
 
+Prompt engineering is the first adaptation because it is the only one you can undo by editing a string. You are changing what the model is asked, not what it weights. That is enough when the model already knows the skill and you are failing at instructions: output shape, tone, what to refuse, which tool to prefer.
+
+It stops being enough in three places. The fact is not in the weights and changes every week — that is retrieval, chapter 12. The format is a dialect the model has never seen and a prompt full of examples still drifts — that is a small adapter, 23.5. The task is a new capability, not a new wording — fine-tuning or a different model, and you should have an eval that shows the prompt actually plateaued before you pay for either.
+
+Write the instruction as a contract: role, steps, output schema, and one or two examples of the failure you keep seeing. Version it (2.10). If two prompts are close, the difference belongs on a golden set (15.1), not in a vibe check. Brown et al. (2020) showed that a handful of in-context examples already move GPT-3 a long way; that is the next section, and it is still a prompt.
+

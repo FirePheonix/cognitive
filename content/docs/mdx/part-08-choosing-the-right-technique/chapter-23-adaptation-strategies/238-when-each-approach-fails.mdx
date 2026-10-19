@@ -7,3 +7,15 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 23.8 When Each Approach Fails.
 
+Each step on the ladder fails in a way that looks like “the model is dumb” and is not.
+
+A prompt fails when the constraint is too soft for sampling. “Reply in JSON” at temperature 0.7 will eventually emit a trailing comma. That is a grammar problem (8.3), and more adjectives will not fix it.
+
+In-context examples fail when they disagree with each other, or when the live input is not like any of them. The model averages the pattern. One sloppy example teaches the sloppiness.
+
+RAG fails closed-book: the passage is absent, the chunk split the fact from its subject (12.2), or the passage is present and the model answers from memory anyway. Check recall and citation (14.5) before you retrain anything.
+
+LoRA and full fine-tunes fail by forgetting the thing you did not put in the training mix, and by going stale the day the base model is upgraded. They also fail at facts, because a weight cannot be grepped. If the production bug is “it does not know about Tuesday’s deploy,” no adapter will keep up with Tuesday.
+
+Distillation fails when you filter nothing: the student learns the teacher’s hallucinations at lower latency. Keep a slice of traces scored by the same judge you trust for the teacher, and drop the rest.
+

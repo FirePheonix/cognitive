@@ -7,3 +7,30 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 23.5 Parameter-Efficient Fine-Tuning (PEFT).
 
+PEFT trains a small add-on and leaves the base model frozen. LoRA (Hu et al., 2021) is the one that stuck. A weight matrix W stays as it is. The update is a product of two thin matrices, B and A, with rank r much smaller than the hidden size. For a 4096×4096 matrix and r = 8 you train 2 × 4096 × 8 = 65,536 numbers instead of about 16 million, and at inference you can fold BA back into W so there is no extra matmul.
+
+![A frozen weight W plus a low-rank product B times A](/part-08/chapter-23/lora-ba.png)
+*Fig: Hu et al. draw the same picture: x goes through W and through BA, and the outputs add. Only A and B get gradients.*
+
+QLoRA (Dettmers et al., 2023) quantizes the frozen W to 4-bit so the base fits on one GPU, and still trains the LoRA in 16-bit. That is how a 65B-class adapter became a single-GPU experiment. The adapter still does not store your wiki. It stores a direction in weight space: style, format, a preference. Swap adapters per tenant if you must; do not bake tenant documents into one.
+
+<figure class="paper-shot">
+<img src="/part-08/chapter-23/papers/lora-2021-abstract.png" alt="Title and abstract of LoRA: Low-Rank Adaptation of Large Language Models, Hu et al. 2021" />
+<figcaption>Hu, Shen, Wallis, Allen-Zhu, Li, Wang, Wang &amp; Chen (2021), <em>LoRA: Low-Rank Adaptation of Large Language Models</em>. <a href="https://arxiv.org/abs/2106.09685">arXiv:2106.09685</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-08/chapter-23/papers/lora-2021-figure.png" alt="Figure 1 of the LoRA paper: pretrained weights W stay frozen while low-rank matrices A and B are trained" />
+<figcaption>Figure 1 from the same paper. Only A and B are trained. <a href="https://ar5iv.labs.arxiv.org/html/2106.09685">HTML version</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-08/chapter-23/papers/qlora-2023-abstract.png" alt="Title and abstract of QLoRA: Efficient Finetuning of Quantized Language Models, Dettmers et al. 2023" />
+<figcaption>Dettmers, Pagnoni, Holtzman &amp; Zettlemoyer (2023), <em>QLoRA: Efficient Finetuning of Quantized Language Models</em>. <a href="https://arxiv.org/abs/2305.14314">arXiv:2305.14314</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-08/chapter-23/papers/qlora-2023-figure.png" alt="First figure of the QLoRA paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2305.14314">HTML version</a>.</figcaption>
+</figure>
+

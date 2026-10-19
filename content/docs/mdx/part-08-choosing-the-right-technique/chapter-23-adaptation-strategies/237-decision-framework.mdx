@@ -7,3 +7,17 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 23.7 Decision Framework.
 
+Stop at the first step that moves the eval. Each later step costs more to build and more to undo.
+
+![Adaptation ladder: prompt, in-context examples, RAG, LoRA, full fine-tune](/part-08/chapter-23/adaptation-ladder.png)
+*Fig: Prompt and examples are hours. RAG is an index. LoRA is a small training run. Full fine-tuning is the one you have to repeat when the base model is replaced.*
+
+Ask four questions, in order.
+
+1. Does a clearer instruction or five examples fix it on the golden set? Stay in the prompt (23.1, 23.2).
+2. Is the miss a missing or stale fact? Retrieve it (23.3). If recall is already high and the model ignores the passage, the bug is grounding, not the index.
+3. Is the miss a stable behavior — format, tone, tool style — that survives a good prompt? Train an adapter (23.5).
+4. Is the capability absent from the base model, with thousands of consistent demonstrations? Full fine-tuning (23.4), or a bigger base, which is often cheaper than a bad fine-tune.
+
+Write the answer down next to the eval delta. “We fine-tuned” is not a result. “The prompt scored 61, retrieval scored 84, LoRA scored 86, and we shipped retrieval” is.
+

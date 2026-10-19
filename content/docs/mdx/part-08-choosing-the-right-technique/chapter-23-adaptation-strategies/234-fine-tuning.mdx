@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 23.4 Fine-Tuning.
 
+Fine-tuning continues training on your pairs: input, desired output, and a loss. The weights move. You pay for data, for a training run, and for every future base-model upgrade, which invalidates the run. You do this when the behavior is the product and a prompt cannot hold it: a domain dialect, a tool-call style, a ranking preference you can show with thousands of consistent examples.
+
+You do not do this to insert facts. A fact in a weight is a fact you cannot delete, cite, or update on Tuesday. Put facts in an index. OpenAI’s own fine-tuning guide says the same thing in product language: fine-tune for form, retrieve for knowledge ([platform.openai.com/docs/guides/fine-tuning](https://platform.openai.com/docs/guides/fine-tuning)).
+
+Start from a model that already almost does the task. A fine-tune on a weak base teaches the base’s mistakes more fluently. Hold out a test set the prompt was also scored on, or you cannot tell whether the weights beat the prompt you already had. If the win is real but the full weight update is too expensive, the next section is the cheaper version of the same idea.
+

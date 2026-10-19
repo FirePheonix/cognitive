@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 23.2 In-Context Learning.
 
+In-context learning is adaptation that lives entirely in the prompt. You show the model a few input–output pairs, then the real input, and it continues the pattern. No gradient runs. The “training set” is whatever still fits in the window after the instructions.
+
+Brown et al., *Language Models are Few-Shot Learners* ([arXiv:2005.14165](https://arxiv.org/abs/2005.14165)), measured this on GPT-3: zero-shot, one-shot, and few-shot on the same frozen model, with the gap often as large as a model-size jump. The practical reading is narrower than the abstract. Examples teach format and decision boundary. They do not reliably teach a fact the model has never stored, and they compete with the user’s own context for tokens.
+
+Use three to eight examples that cover the edge you actually fail: the empty field, the ambiguous name, the refusal. Put the examples before the live input so the live input is what attention sees last. When the example set itself becomes a corpus — dozens of cases, updated weekly — you have reinvented retrieval. Move those cases to an index (12.1) instead of pasting a longer and longer prompt.
+
