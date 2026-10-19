@@ -126,3 +126,6 @@ Raw traces are large. Compress and aggregate after the short-term retention wind
 - [17.3 Spans](./173-spans) — the individual units of work within a trace
 - [17.10 Agent Tracing](./1710-agent-tracing) — LangSmith for automatic tracing
 - [17.1 Why Observability Matters](./171-why-observability-matters) — the case for tracing
+
+![One request trace with a retrieve span, a model span, and a tool span](/part-06/chapter-17/trace-spans.png)
+*Fig: Put tokens and milliseconds on the span that spent them. An average latency chart cannot tell a slow retriever from a slow model. The OpenTelemetry GenAI semantic conventions are the names those spans should already have: [opentelemetry.io/docs/specs/semconv/gen-ai](https://opentelemetry.io/docs/specs/semconv/gen-ai/).*
