@@ -150,3 +150,6 @@ class RetryBudget:
 - [19.3 Circuit Breakers](./193-circuit-breakers) — stopping retries when a provider is down
 - [19.2 Timeouts](./192-timeouts) — what to set as the timeout on each retry attempt
 - [17.6 Error Analysis](../chapter-17-observability/176-error-analysis) — classifying errors before deciding whether to retry
+
+![A 500 retries twice with longer waits, then the circuit opens and one probe is allowed through](/part-06/chapter-19/retry-circuit.png)
+*Fig: Retry the failures that might be transient. Do not retry a 400. Jitter the wait so every client does not come back on the same millisecond. The circuit breaker in 19.3 is what stops the retry from becoming the outage.*
