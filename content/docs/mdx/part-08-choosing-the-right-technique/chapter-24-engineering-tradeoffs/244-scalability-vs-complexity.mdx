@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 24.4 Scalability vs Complexity.
 
+The serving stack that does 100 requests a day can be a single process and a lock. The stack that does 100 a second wants continuous batching, paged KV cache, and a queue (chapter 5). Each of those is a new way to be wrong: a block-size bug, a scheduler that starves long requests, a queue with no depth limit.
+
+Add the piece when a measurement forces it. GPU utilization stuck at 30% with a queue of waiting users is the continuous-batching signal. Cache memory wasted on max_tokens reservations is the paging signal. “We might need to scale” is not a signal. Anthropic’s *Building effective agents* note is the same advice one layer up: start with the simplest structure that works, and add topology when a single call is demonstrably not enough ([anthropic.com/engineering/building-effective-agents](https://www.anthropic.com/engineering/building-effective-agents)).
+
+Complexity you adopted early becomes the thing you cannot debug at 2 a.m., because nobody remembers which of the six mechanisms was supposed to fire.
+

@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 24.5 Build vs Buy.
 
+Buy the model API when the task is general, the data may leave your network, and you would rather pay per token than staff a GPU cluster. Build (or self-host an open weight) when the data cannot leave, when unit economics at your volume beat the API, or when you need a behavior the vendor’s model will not do and will not fine-tune for you.
+
+The expensive mistake is building the serving stack and buying none of the product knowledge. vLLM will not design your eval, your permission layer, or your chunker. The other expensive mistake is buying three agent frameworks and still not knowing which prompt is in production. Frameworks hide the prompt. Hidden prompts are how you ship a regression you cannot diff.
+
+A workable split: buy the model and the GPU pool, build the harness — retrieval, tools, traces, evals — because the harness is the product. If the harness is also generic, you have not found the product yet.
+

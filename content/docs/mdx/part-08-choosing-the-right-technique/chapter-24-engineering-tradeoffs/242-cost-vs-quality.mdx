@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 24.2 Cost vs Quality.
 
+Cost in an LLM product is mostly tokens, and tokens are mostly repeated context. A single expensive call is rarely the bill. Ten turns of an agent that re-sends the whole transcript are the bill (18.1). Cutting cost by dropping the retrieved chunk that contained the answer is a quality cut you will measure as “the model got worse,” which is true and misleading.
+
+The cuts that usually survive an eval: cache a stable prefix (3.3), route easy calls to a smaller model (11.3), compact history before the window fills (2.6), and quantize the weights you serve yourself (chapter 7) rather than the prompt. The cut that fails the eval: lowering max tokens until the answer is truncated, then calling the truncation a summary.
+
+Put a dollar figure next to the quality number. “Reranking costs $0.002 more per query and lifts citation precision from 0.7 to 0.9” is a decision. “Reranking is slower” is not.
+

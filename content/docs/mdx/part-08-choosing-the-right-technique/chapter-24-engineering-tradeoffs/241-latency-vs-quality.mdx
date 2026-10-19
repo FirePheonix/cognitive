@@ -7,3 +7,10 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 24.1 Latency vs Quality.
 
+A slower answer can be a better answer: a reranker, a second pass, a larger model. A faster answer can be a worse one: a draft model that the target rejects, a prompt you shortened until the instruction fell off. Write down which axis this feature is allowed to lose before you tune either.
+
+![Latency, cost, and quality: name the axis this feature is allowed to lose](/part-08/chapter-24/three-axes.png)
+*Fig: Speculative decoding (6.1) tries to buy latency without spending quality, and only succeeds while the acceptance rate holds. A cascade (11.1) buys cost the same way. If you cannot measure quality, you will not notice when the trick stops working.*
+
+For interactive chat, time-to-first-token matters more than total time, which is why streaming (3.5) changes the product even when the model is unchanged. For a batch job overnight, latency is almost free and quality is the only axis. Do not copy a chat configuration into a batch job, or the reverse.
+

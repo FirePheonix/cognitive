@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 24.6 Open Source vs API Models.
 
+An API model is a versioned behavior you do not own. The vendor changes it, and your golden set is how you notice (16.5). You get rate limits, a data-processing agreement, and no view of the KV cache. An open weight is a file. You choose the quantization, the attention kernel, and the log line. You also own the GPU bill, the security patches, and the day the architecture needs a new kernel.
+
+Compare them on your set, not on a public leaderboard. A model that wins MMLU and fails your tool schema is the wrong model. HELM’s point (15.2) applies here: publish the slice. “Llama is cheaper” is incomplete until you include the engineer who keeps the server up and the quality delta on the ten tasks that are the product.
+
+Weights that are open are not automatically weights you may ship. Read the license. Some “open” checkpoints forbid use in a competing model or require a revenue clause. The Hugging Face model card is the first page of that reading, not the last.
+

@@ -7,3 +7,7 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 24.3 Reliability vs Speed.
 
+Retries, timeouts, and a second provider add latency on the failure path and remove outages on the success path of the next day. The mistake is retrying the happy path. A 200 that took 2 seconds does not need a hedge request that also takes 2 seconds and doubles the bill. A timeout at the client’s deadline does.
+
+Hedge only when the tail is the product problem: send a second request at p95, take the first success, cancel the other. That is a reliability buy paid for in cost, not in median latency. Circuit breakers (19.3) do the opposite trade on purpose: they make new requests fail fast so the ones already running can finish. Fast failure is a reliability feature. Users forgive a quick error more often than a spinner that ends in the same error.
+

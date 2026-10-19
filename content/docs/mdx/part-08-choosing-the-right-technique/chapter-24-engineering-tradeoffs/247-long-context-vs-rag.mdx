@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 24.7 Long Context vs RAG.
 
+Long context means: put the documents in the prompt and hope attention finds the line. RAG means: put only the lines a retriever picked. Long context wins when the corpus is small enough to fit, the question needs several passages at once, and you have not yet built an index. RAG wins when the corpus is larger than the window, when you need a citation, or when paying for 100k input tokens per question is absurd.
+
+Liu et al. (2023) is the reason “it fits” is not “it will be used.” Accuracy in their experiments drops when the relevant passage sits in the middle of a long context. Chapter 13.5 already has the paper. The engineering consequence: if you do paste a long document, put the question at the end and do not bury the one paragraph that matters.
+
+A hybrid is allowed. Retrieve twenty chunks, then let a long-context model read those twenty rather than the whole wiki. You pay for focus, not for the archive. Revisit the choice when the model’s usable context grows; the index does not become useless, it becomes the way you decide what enters the window.
+
