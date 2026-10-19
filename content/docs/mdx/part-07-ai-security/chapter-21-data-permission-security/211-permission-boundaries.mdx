@@ -152,3 +152,6 @@ Python code cannot be overridden by any of these.
 - [20.5 Tool Injection](../chapter-20-prompt-security/205-tool-injection) — malicious arguments passed to tools
 - [21.5 Secure Tool Execution](./215-secure-tool-execution) — the full enforcement harness
 - [21.6 Sandboxing](./216-sandboxing) — OS-level isolation for high-privilege agents
+
+![The model proposes a delete; policy denies it; the sandbox has no network; the denial is logged](/part-07/chapter-21/policy-outside.png)
+*Fig: A sentence in the system prompt is not a permission. The allow-list lives in code that runs before the side effect, and the denial is a tool result the model has to read.*
