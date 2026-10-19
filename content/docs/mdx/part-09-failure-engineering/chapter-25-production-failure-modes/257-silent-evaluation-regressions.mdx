@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 25.7 Silent Evaluation Regressions.
 
+The aggregate score stays at 78%. Safety on the slice that matters moved from 90% to 75%, and the easy items moved up enough to hide it. Nothing pages you. Users notice first. Chapter 16.1 already says to break the report down. This failure mode is what happens when you do not.
+
+A silent regression also happens when the judge moves and the system did not. You edited the rubric (15.8), the judge is now harsher, and a deploy looks like a model failure. Pin the judge model and the rubric hash next to the score. A score without those two is not comparable to last week’s score.
+
+Run the golden set on the prompt that is about to ship and on a schedule against production, because the provider can change the model behind a stable name. Alert on a slice, not on the mean. A 2% mean drop can be noise. A safety slice dropping 15 points is not.
+

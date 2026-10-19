@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 25.4 Context Overflow.
 
+The window is finite. An agent that appends every tool result will hit the limit in the middle of a task, usually on the turn that mattered. The provider then errors, or silently truncates the front, which is where the system prompt and the original goal often live. Truncating the goal and keeping the latest stack trace is how an agent “forgets” what it was doing and keeps editing.
+
+Compact before you are full (2.6): a rolling summary of old turns, a scratchpad of facts, and the last few raw messages. Trigger it at a fraction of the budget, around 70%, not on the exception. Count tokens with the same tokenizer the model uses. A character estimate will overflow a model whose tokenizer is harsh on your language (3.1).
+
+If the overflow is a single tool result — a 2 MB log — do not put the log in the model. Put a path, a hash, and the lines that matched an error pattern. The model can ask for another slice. That is retrieval of a file the tool already returned, and it is cheaper than a 100k-token apology.
+

@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 25.6 Cache Thrashing.
 
+Prefix caches and KV caches help only when the next request shares a prefix with one you already paid for. Thrashing is the opposite: every request is just different enough that nothing hits, and you pay the prefill (3.3) in full, every time. A timestamp at the top of the system prompt will do it. So will a user id in the first line, or a retrieved chunk that changes order on every call.
+
+Put the stable text first: identity, instructions, tool schemas. Put the per-request text last. Canonicalize JSON key order in tool definitions so two identical schemas are byte-identical. Measure hit rate. A cache with a 5% hit rate on a workload you thought was repetitive is a prompt-layout bug, not a reason to buy a larger cache.
+
+Tenant isolation (22.2) still applies. Do not “fix” a low hit rate by sharing prefixes across tenants. A hit that leaks another tenant’s document is worse than a miss.
+

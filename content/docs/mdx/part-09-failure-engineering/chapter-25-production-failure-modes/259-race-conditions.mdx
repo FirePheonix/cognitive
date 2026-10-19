@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 25.9 Race Conditions.
 
+Two requests for the same user, or two agents on the same ticket, read a state, decide, and write back. The second write drops the first action. With tools that charge money or send mail, the lost write is not a confused transcript. It is a double send, because each agent believed it was the one who had not sent yet.
+
+Serialize per resource. A lock or a queue keyed by ticket id is enough for most products. Idempotency keys (9.5) make a retry of the same action safe; they do not make two different actions safe. “Send the summary” and “send the summary” from two workers are two actions unless they share a key you assigned from the ticket, not from the model.
+
+Do not let the model be the lock. A sentence in the prompt that says “only one of you should reply” is a wish. The check belongs in the tool, against a database, before the side effect. If the check fails, return that as a tool error so the losing agent stops instead of trying a more creative send.
+

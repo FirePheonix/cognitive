@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 25.8 Prompt Drift.
 
+The prompt in production is not the prompt in the pull request. Someone edited a sentence in a dashboard. A flag prepends a paragraph for one tenant. A retrieved “instruction” document from a wiki now contradicts the system prompt. Three months later nobody can reproduce a trace, because the text the model saw was never stored.
+
+Store the rendered prompt, or a hash of it plus the template version, on the trace (17.2). Chapter 2.10 is the discipline: prompts are artifacts with diffs. A change to a prompt is a deploy. It goes through the same golden set as a code change (16.5).
+
+Drift from the model side looks identical in the product and is not the same bug. If the template hash is unchanged and the score moved, the model or a tool schema moved. If the hash changed and nobody meant it to, you have an unreviewed edit. The trace is how you tell those apart. Without it you will retrain a model to compensate for a sentence someone added on a Thursday.
+

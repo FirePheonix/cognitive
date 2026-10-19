@@ -7,3 +7,10 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 25.1 Hallucinated Tool Calls.
 
+The model emits `get_user_balance`. The registry has `get_balance`. If you fuzzy-match, you may run the wrong function. If you drop the call and let the model continue, it will often invent the return value and the user will see a number nobody computed.
+
+![An unknown tool name must come back as an error in the transcript, not as a made-up result](/part-09/chapter-25/unknown-tool.png)
+*Fig: The safe failure is a tool message that says the function does not exist. The model can recover in the open. A silent success is a hallucination with a UI.*
+
+Reject names that are not in the registry, exactly. Return the error as a tool result so the next step is conditioned on it. Do not pass near-miss arguments through: a hallucinated `user_id` that happens to be some other user’s id is an authorization bug, not a parsing bug (21.1). Log the proposed name. A spike in unknown tools is how you notice a prompt change renamed a function the model still remembers.
+

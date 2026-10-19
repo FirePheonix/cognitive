@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 25.3 Infinite Agent Loops.
 
+An agent loop without a stop condition is a billing bug that looks like thinking. The model calls a tool, the tool returns, the model calls the same tool with the same arguments, and nothing in the process is counting. Chapter 2.11 and chapter 20 list the stops that belong in the loop: a finish action, a max iteration, an error-rate breaker, and a detector for “same call three times.”
+
+The fingerprint that matters is the pair (tool name, canonical arguments), not the prose around it. Two calls that differ by a timestamp in an unused field are the same call. Store the last N fingerprints. When the set collapses, stop and escalate with the trajectory, not with another retry.
+
+A loop can also fail open while making progress you do not want: it “finishes” by declaring success without the test having passed. Machine-checkable termination (20.4) is the counter. The model does not get to be the only judge of done. A test, a schema, or a human gate does.
+

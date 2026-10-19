@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 25.2 Malformed JSON.
 
+The model is sampling tokens. A trailing comma, a bare `True`, or a paragraph of apology before the brace are all legal tokens. Your parser then throws, the user sees an error, and a retry sometimes works because the sample changed. That is not a fix. It is a second draw from the same distribution.
+
+Chapter 8 splits the responses that actually help. A grammar or JSON-schema mask (8.3, Willard & Louf 2023) makes the illegal token impossible. A repair pass can close a truncated object if you are already in production without a mask. A retry with the parser error pasted back in works only when the model is allowed to see the error; swallowing it and asking again with the same prompt repeats the same mistake.
+
+Watch the parse-failure rate as a metric of its own. If it moves after a model upgrade and the golden answers did not, the provider changed tokenization or temperature behavior. Do not “fix” it by widening the parser until `{"a": 1} trailing junk` counts as success. You will then store the junk.
+

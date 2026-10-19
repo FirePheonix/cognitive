@@ -7,3 +7,10 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 25.10 Cascading Failures.
 
+The model gets slow. Clients time out and retry. The retries are more load. The model gets slower. A queue with no cap accepts all of it, and the recovery time becomes the time required to drain a queue that grew while you were down. This is the same loop the SRE book describes for any shared service. The model does not get an exemption because the work is “just inference.”
+
+![A slow model, client retries, a growing queue, more timeouts, more retries](/part-09/chapter-25/retry-storm.png)
+*Fig: Cut the loop with a bounded queue, a circuit breaker (19.3), and a 429 that tells the client when to come back. A retry without jitter synchronizes every client onto the same millisecond and makes the next wave worse.*
+
+Load-shed the cheapest work first if you can tell it apart: background summaries, not the request a person is watching. If you cannot tell, shed at the edge with a limit you chose in daylight. An unbounded retry policy will choose for you, at the worst moment. Google’s SRE book states the general pattern; the LLM-shaped version is that each retry is also a token bill, so the storm costs money even after it stops moving the product.
+

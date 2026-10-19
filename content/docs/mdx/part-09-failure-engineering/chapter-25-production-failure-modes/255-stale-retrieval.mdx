@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 25.5 Stale Retrieval.
 
+The index says the refund policy is 30 days. The policy changed to 14 days last week. The model cites the chunk, the citation is real, and the answer is wrong. This is not a hallucination in the usual sense. The retriever did its job on a corpus nobody updated.
+
+Stamp every chunk with a source, a version, and a time. Filter on them (12.5) when the question is about “current.” Rebuild or patch the index on the same deploy that changes the document, not in a nightly job that lags by a day you cannot explain. When a document is deleted, delete its vectors in the same transaction you can manage; an orphan vector is a policy you already retracted.
+
+A freshness eval is a small set of questions whose correct answer changed on a known date. If the system still returns yesterday’s answer, the pipeline is stale even though recall of the old corpus looks perfect. Chapter 12.8 is the design. This page is the outage it prevents.
+
