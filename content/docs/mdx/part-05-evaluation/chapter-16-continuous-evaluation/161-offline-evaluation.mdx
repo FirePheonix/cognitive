@@ -104,3 +104,6 @@ Status: PASS
 ```
 
 A report that only shows "78% pass rate" hides the fact that safety dropped from 90% to 75%. Break it down.
+
+![A change moves from a golden set, to a shadow deployment, to an A/B slice, and only then to everyone](/part-05/chapter-16/offline-to-online.png)
+*Fig: The golden set is the bugs you already know. Shadow scoring runs the new prompt on live inputs and discards the output. An A/B test is the first time a user sees it.*
