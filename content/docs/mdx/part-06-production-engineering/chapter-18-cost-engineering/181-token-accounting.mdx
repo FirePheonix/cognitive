@@ -103,3 +103,6 @@ def check_token_budget(agent_type: str, current_tokens: int) -> bool:
 ```
 
 If an agent regularly exceeds its budget, that's a signal to optimize — not to raise the budget.
+
+![A single turn is cheap; ten turns without compaction re-bill the growing input](/part-06/chapter-18/token-cost.png)
+*Fig: Input at $0.50 / million and output at $2 / million, for one turn, is noise. The same agent on turn 10 is re-sending every previous tool result as input. Attribute the bill to the feature and the tenant or you will “fix” it by changing models.*
