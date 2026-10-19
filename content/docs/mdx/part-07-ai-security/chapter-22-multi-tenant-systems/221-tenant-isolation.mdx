@@ -228,3 +228,6 @@ def isolation_audit(tenant_a: str, tenant_b: str, shared_retriever) -> dict:
 ```
 
 Zero tolerance for leaks. If `isolation_pass` is False, the system should be taken offline until the root cause is identified and resolved.
+
+![An unsafe prefix cache can serve tenant A’s document to tenant B; a cache keyed by tenant cannot](/part-07/chapter-22/tenant-cache.png)
+*Fig: Prompt cache and KV cache are shared machines. Reuse a prefix only when that prefix contains no tenant data. A public system prompt can be shared. A retrieved customer document cannot.*
