@@ -136,3 +136,16 @@ User message / fetched content
 - [20.6 Indirect Prompt Injection](./206-indirect-prompt-injection) — deep dive on the most dangerous vector
 - [20.2 Jailbreaks](./202-jailbreaks) — bypassing safety training rather than instructions
 - [21.5 Secure Tool Execution](../chapter-21-data-permission-security/215-secure-tool-execution) — harness-level enforcement that injections cannot bypass
+
+![Direct injection arrives in the user message; indirect injection arrives inside a page the agent fetched](/part-07/chapter-20/direct-vs-indirect.png)
+*Fig: Perez & Ribeiro (2022) put the instruction in the user turn. Greshake et al. (2023) put it in a page the model was asked to read. OWASP lists prompt injection as LLM01 for agentic apps.*
+
+<figure class="paper-shot">
+<img src="/part-07/chapter-20/papers/prompt-injection-2022-abstract.png" alt="Title and abstract of Ignore Previous Prompt: Attack Techniques For Language Models, Perez and Ribeiro 2022" />
+<figcaption>Perez &amp; Ribeiro (2022), <em>Ignore Previous Prompt: Attack Techniques For Language Models</em>. <a href="https://arxiv.org/abs/2211.09527">arXiv:2211.09527</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-07/chapter-20/papers/prompt-injection-2022-figure.png" alt="First figure of the prompt injection paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2211.09527">HTML version</a>.</figcaption>
+</figure>

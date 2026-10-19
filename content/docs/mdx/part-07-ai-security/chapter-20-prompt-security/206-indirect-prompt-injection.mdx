@@ -178,3 +178,15 @@ def fetch_and_scan(url: str, agent_id: str) -> ScanResult:
 - [20.1 Prompt Injection](./201-prompt-injection) — the broader injection taxonomy
 - [21.1 Permission Boundaries](../chapter-21-data-permission-security/211-permission-boundaries) — preventing fetched content from escalating privileges
 - [17.6 Error Analysis](../../part-06-production-engineering/chapter-17-observability/176-error-analysis) — detecting anomalous agent behavior in traces
+
+The indirect case is the one that survives a filter on the chat box. Greshake et al. planted instructions in content an integrated LLM would fetch — a page, an email, a retrieved document — and the model treated them as orders, including exfiltration through whatever tool it already had.
+
+<figure class="paper-shot">
+<img src="/part-07/chapter-20/papers/indirect-injection-2023-abstract.png" alt="Title and abstract of Not what you've signed up for: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection, Greshake et al. 2023" />
+<figcaption>Greshake, Abdelnabi, Mishra, Endres, Holz &amp; Fritz (2023), <em>Not what you've signed up for: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection</em>. <a href="https://arxiv.org/abs/2302.12173">arXiv:2302.12173</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-07/chapter-20/papers/indirect-injection-2023-figure.png" alt="First figure of the indirect prompt injection paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2302.12173">HTML version</a>.</figcaption>
+</figure>
