@@ -93,3 +93,16 @@ def safe_judge(question: str, answer: str, facts: list[str]) -> dict:
 ```
 
 Track the error rate. If more than 2% of judge calls fail to parse, your judge prompt needs tightening.
+
+![A bare score of 4 versus a written reason that ends in 2 out of 5](/part-05/chapter-15/reason-then-score.png)
+*Fig: Ask for the reason before the number. Zheng et al. (2023) documented the biases that show up when a model is asked only for a score: position, verbosity, and self-preference.*
+
+<figure class="paper-shot">
+<img src="/part-05/chapter-15/papers/llm-as-judge-2023-abstract.png" alt="Title and abstract of Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena, Zheng et al. 2023" />
+<figcaption>Zheng, Chiang, Sheng, Zhuang, Wu, Zhuang, Lin, Li, Li, Xing, Zhang, Gonzalez &amp; Stoica (2023), <em>Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena</em>. <a href="https://arxiv.org/abs/2306.05685">arXiv:2306.05685</a>.</figcaption>
+</figure>
+
+<figure class="paper-shot">
+<img src="/part-05/chapter-15/papers/llm-as-judge-2023-figure.png" alt="First figure of the LLM-as-a-judge paper" />
+<figcaption>First figure of the same paper. <a href="https://ar5iv.labs.arxiv.org/html/2306.05685">HTML version</a>.</figcaption>
+</figure>
