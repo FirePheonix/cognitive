@@ -7,3 +7,12 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 26.1 ChatGPT Architecture.
 
+OpenAI does not publish the serving diagram. What they do publish is enough to see the shape: a product around a model, not a model with a text box.
+
+The GPT-4 technical report ([arXiv:2303.08774](https://arxiv.org/abs/2303.08774)) describes a model trained to predict the next token, then post-trained, and evaluated on exams and the OpenAI Evals suite. It is explicit that the report omits details “about the architecture (including model size), hardware, training compute, dataset construction, [and] training method.” Treat any blog that fills those blanks with round numbers as fiction.
+
+The product surface is in the system cards and the product posts. ChatGPT is not one completion. It is a shell that can call tools — browsing, code execution, image generation — and run safety classifiers around the model. That is the same split as chapter 1: the orchestrator decides what the model sees and which tools may run. When a conversation fails, the interesting question is which layer failed. A wrong citation from browse is a retrieval failure. A refusal on a benign request is a classifier. A malformed action is the model. The trace, which you do not get from the consumer app, is how a team that runs this kind of stack tells them apart.
+
+![Public systems publish a shell around a model: tools and review where the product needs them, not the weight layout](/part-09/chapter-26/public-shapes.png)
+*Fig: The essays and system cards describe the shell. They do not describe the kernel launch config. Read them for the shape, and do not invent the rest.*
+

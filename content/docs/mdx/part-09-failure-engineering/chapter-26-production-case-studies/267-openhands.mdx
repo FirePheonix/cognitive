@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 26.7 OpenHands.
 
+OpenHands is the rare coding agent with a paper and a repo you can read. Wang et al., *OpenHands: An Open Platform for AI Software Developers as Generalist Agents* ([arXiv:2407.16741](https://arxiv.org/abs/2407.16741)), describe a platform — not a single prompt — where agents use a shell, a browser, and an editor inside a sandbox, and where the same harness can host different models. The sandbox is the point. The agent is assumed to be able to run code, so the code runs where it cannot touch production.
+
+Read it as a checklist against chapter 21 and chapter 10. Tools are real (a shell is not a simulated shell). Observations come back as text the next step can use. The event stream is a trace. Evaluation is on benchmarks such as SWE-bench, where a test, not the agent, decides success. That last item is machine-checkable termination (20.4) in the form of a unit test.
+
+The paper will not tell you your timeout or your cost cap. Those are yours. What it will show you is that a generalist coding agent is a platform with a sandbox and an eval, and that swapping the model is supposed to be the easy part. If swapping the model in your system requires a rewrite, you have coupled the harness to one provider’s tool dialect.
+

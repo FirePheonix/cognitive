@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 26.5 Perplexity.
 
+Perplexity is a retrieval product that happens to generate. The answer is supposed to come with sources. That is the RAG contract in chapter 12 and the citation metric in 14.5, turned into the whole interface. Their public engineering posts (the Perplexity blog and the write-ups they have given on how search and the model split the work) describe the same pipeline this book draws: retrieve, then read, then write, with the sources visible so a wrong claim can be checked against a page.
+
+The failure that defines this product is not a crash. It is a confident paragraph whose citations do not support the sentence. Recall can be high — the right page was retrieved — and grounding can still fail. Measure them separately. A second failure is freshness (25.5): the index returns last month’s article for a question about today. A “search” product that cannot tell you the time on the source is a stale corpus with good prose.
+
+When you copy the shape, copy the citation UI too. A source list the model never had to actually use is decoration. The check is whether a sentence’s citation entails the sentence. That is an eval, not a footer.
+

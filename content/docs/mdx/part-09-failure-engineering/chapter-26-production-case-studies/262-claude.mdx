@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 26.2 Claude.
 
+Anthropic’s public engineering writing is about the harness, which is the part a reader can copy. *Building effective agents* ([anthropic.com/engineering/building-effective-agents](https://www.anthropic.com/engineering/building-effective-agents)) separates workflows, where code picks the path, from agents, where the model picks the path, and tells you to start with the simplest one that works. *Effective context engineering* describes the same loop this book calls context: what you put in a finite window, and how an agent that runs for many steps has to compact that window.
+
+Claude Code is the productized version of the loop chapter. Their own note, [Getting started with loops](https://claude.com/resources/articles/getting-started-with-loops), defines a loop as an agent repeating work until a stop condition, and splits them by trigger: a user turn, a goal, a schedule, an event. The model is one participant. The stop condition, the verifier, and the tools are the system.
+
+Nothing in those posts is a license to guess GPU counts or dataset mix. The useful steal is the structure: a verifiable “done,” a tool the model can see the result of, and a human gate where the side effect is expensive. That is chapter 2.11 and chapter 20, with a public citation.
+

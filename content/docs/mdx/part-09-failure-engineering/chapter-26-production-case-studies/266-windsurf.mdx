@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 26.6 Windsurf.
 
+Windsurf (Codeium) publishes Cascade as an agent that edits a repo, runs commands, and keeps going until a goal. The public docs describe the product, not the scheduler: a flow of steps with tool calls, in an IDE, with the user able to stop it. That is a loop (2.11), with the editor as the harness.
+
+What is worth stealing is the boundary they have to draw, the same one every coding agent draws. The model proposes a command. Something else decides whether that command may run. A prompt that says “do not delete the repo” is not that something. Chapter 21 is. A cascade that can run tests is useful. A cascade that can run tests and also curl an unknown host is a security incident that looks like progress.
+
+If you adopt multi-step editing, adopt the stop conditions in the same change: max steps, a test that defines done, and a human gate before anything leaves the branch. An agent that commits to main because the loop was “being helpful” is the infinite-loop failure (25.3) with a git remote attached.
+

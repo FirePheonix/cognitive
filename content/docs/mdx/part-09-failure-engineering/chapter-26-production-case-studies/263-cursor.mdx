@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 26.3 Cursor.
 
+Cursor is an editor with a model behind it, which means most of the product is the context you assemble from a repo. Public writing from the team (the Cursor blog, at [cursor.com/blog](https://cursor.com/blog)) describes indexing a codebase, retrieving the pieces relevant to a question, and applying an edit the user can accept. The model does not read your entire repository into one window on every keystroke. Something selects files and ranges first. That is RAG for source code, with a human as the last gate on the diff.
+
+The failure modes in chapter 25 show up here in a specific costume. Stale retrieval is an index that missed a rename. Context overflow is an agent that opened too many files and lost the original instruction. A hallucinated tool is an edit applied to a path that does not exist. The trace you want, if you build anything like this, is: which files were retrieved, which edit was proposed, whether the user accepted it, and whether the tests passed after.
+
+Do not copy a competitor’s prompt from a screenshot and call it an architecture. The architecture you can see from outside is retrieve, propose, review. The prompt is the part they change every week.
+

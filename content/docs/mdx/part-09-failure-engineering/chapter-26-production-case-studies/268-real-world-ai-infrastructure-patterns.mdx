@@ -7,3 +7,11 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 26.8 Real-World AI Infrastructure Patterns.
 
+The case studies in this chapter rhyme, even when the vendors do not share a stack.
+
+The model is one service. Around it: retrieval when the product needs private or fresh text, tools when it needs to act, a policy when the action has a side effect, and an eval that does not trust the model’s own “done.” Chat products add safety classifiers. Coding products add a sandbox and a diff a human can reject. Search products add citations. All of them need a trace, or the next incident is a story instead of a span.
+
+The inference patterns from Part II show up underneath and are easy to miss from the product blog. A coding completion that feels instant is a latency budget (speculative decoding, a small model, a cached prefix). A chat product that stays cheap at long histories is compaction plus prefix caching. A multi-tenant API that does not leak is a cache key, not a promise. None of the public posts replace those mechanisms. They assume them.
+
+When you copy a product, copy the measurement it cannot ship without. Copilot needs acceptance rate and latency. Perplexity needs citation support. A coding agent needs tests passed after the edit. A chat product needs a safety slice that is allowed to disagree with the average score. The infrastructure is whatever keeps that number honest when the model, the prompt, or the index moves.
+

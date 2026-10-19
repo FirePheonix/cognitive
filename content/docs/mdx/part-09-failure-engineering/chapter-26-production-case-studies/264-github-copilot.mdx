@@ -7,3 +7,9 @@ lastUpdatedDate: '2026-08-05'
 
 This section covers the details of 26.4 GitHub Copilot.
 
+GitHub’s own research write-up, *Quantifying GitHub Copilot’s impact on developer productivity and happiness* (2022, [github.blog](https://github.blog/news-insights/research/research-quantifying-github-copilots-impact-on-developer-productivity-and-happiness/)), is a productivity study, not a systems paper. What it establishes is the product shape people actually use: suggestions inside the editor, accepted or rejected at the speed of typing, on top of a code model (descended from the Codex line, Chen et al., *Evaluating Large Language Models Trained on Code*, [arXiv:2107.03374](https://arxiv.org/abs/2107.03374)).
+
+That interaction is a latency budget. A completion that arrives after the user has already typed the line is waste. Speculative decoding and a small model for the cheap path (chapters 6 and 11) are the inference tools that fit a budget measured in tens of milliseconds. A 30-second agent loop does not fit inline completion. It fits a separate “agent” mode, which is a different product with a different failure mode: it can edit many files before a human looks.
+
+If you build both, do not share one timeout. The inline path should fail open to “no suggestion.” The agent path should fail closed to “no edit applied” until a check or a person says otherwise.
+
