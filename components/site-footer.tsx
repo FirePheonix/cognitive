@@ -7,6 +7,7 @@ const footerGroups = [
     title: 'Explore',
     links: [
       { href: '/docs', label: 'Library' },
+      { href: '/books', label: 'Books' },
       { href: '/docs/overview', label: 'Overview' },
       { href: '/newsletter', label: 'Newsletter' },
     ],

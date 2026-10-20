@@ -47,10 +47,10 @@ You can also skip the agent and type the same steps yourself. Both doors run the
 
 ```mermaid
 flowchart LR
-  You["You<br/>one question"] --> Agent["Your coding agent"]
-  Agent --> REA["REA<br/>the switchboard"]
-  REA --> Tool["A tool that already existed<br/>reader, browser, or disassembler"]
-  Tool --> Notes["Notes come back<br/>seen, guessed, or unknown"]
+  You["You ask one question"] --> Agent["Your coding agent"]
+  Agent --> REA["REA the switchboard"]
+  REA --> Tool["A tool that already existed"]
+  Tool --> Notes["Notes come back labelled"]
   Notes --> Agent
 ```
 
@@ -85,10 +85,10 @@ Each fact wears one of three labels.
 
 ```mermaid
 flowchart TD
-  Fact["A fact comes back"] --> Kind{"Where did it come from?"}
-  Kind -->|Read it in the file| Seen["Seen<br/>you can point at the line"]
-  Kind -->|The tool inferred it| Guessed["Guessed<br/>useful, still a guess"]
-  Kind -->|The tool could not follow| Unknown["Unknown<br/>a question mark, not a blank"]
+  Fact["A fact comes back"] --> Kind{"Where did it come from"}
+  Kind -->|Read it in the file| Seen["Seen: you can point at the line"]
+  Kind -->|The tool inferred it| Guessed["Guessed: useful but still a guess"]
+  Kind -->|The tool could not follow| Unknown["Unknown: a gap not a blank"]
 ```
 
 Why the labels exist: a language model hates a hole. Hand it a pile of raw disassembly and it will finish your sentences. Hand it notes that already say seen, guessed, or unknown, and it has somewhere to put "I don't know yet."
@@ -105,10 +105,10 @@ You do not point REA at an app and receive its source code. You ask about one fe
 
 ```mermaid
 flowchart TD
-  Ask["1. Ask about one feature"] --> Look["2. Look, with the tool that fits"]
-  Look --> Label["3. Label each fact<br/>seen, guessed, or unknown"]
-  Label --> Rule["4. Write the rule in a sentence a person can test"]
-  Rule --> Check{"5. Does the real program do that?"}
+  Ask["1. Ask about one feature"] --> Look["2. Look with the right tool"]
+  Look --> Label["3. Mark each fact seen guessed or unknown"]
+  Label --> Rule["4. Write a rule a person can test"]
+  Rule --> Check{"5. Does the real program do that"}
   Check -->|Yes| Stop["Stop"]
   Check -->|No| Ask
 ```
@@ -155,12 +155,12 @@ What changed was permission. You set the goal, and you set the rule for acceptin
 
 ```mermaid
 flowchart TD
-  You["You set the goal<br/>and what done means"] --> Agent["Agent tries a hypothesis"]
-  Agent --> Oracle{"Does it match<br/>a real reference?"}
-  Oracle -->|No| Revise["Revise, and look again"]
+  You["You set the goal and what done means"] --> Agent["Agent tries a hypothesis"]
+  Agent --> Oracle{"Does it match a real reference"}
+  Oracle -->|No| Revise["Revise and look again"]
   Revise --> Agent
-  Oracle -->|Yes| Repo["Save it in the repo<br/>code, check, and the lesson"]
-  Repo --> Next["The next session, and the next game,<br/>start further along"]
+  Oracle -->|Yes| Repo["Save the code the check and the lesson"]
+  Repo --> Next["The next game starts further along"]
 ```
 
 Four jobs, and they are not the same person.
@@ -212,11 +212,9 @@ The order that fell out of doing this more than once:
 
 ```mermaid
 flowchart TD
-  Exact["1. Match the original<br/>compile the old way, compare, write down what still differs"]
-  Play["2. Play it on the old machine<br/>shared state shows up here"]
-  Name["3. Name it<br/>only where the evidence supports the word"]
-  Port["4. Then port<br/>the old build stays as the reference"]
-  Exact --> Play --> Name --> Port
+  Exact["1. Match the original and write down what still differs"] --> Play["2. Play it on the old machine"]
+  Play --> Name["3. Name a field only when the evidence supports the word"]
+  Name --> Port["4. Then port and keep the old build as the reference"]
 ```
 
 The playable old build is a second check. The first asks "do the instructions still match?" The second asks "does the game still behave?" They catch different mistakes. Changing a type can change the instructions. Changing who owns a value can split one piece of state into two. Either failure should be visible before you keep going.
@@ -255,15 +253,11 @@ What is still hard to copy is everything that is not in the file you shipped the
 
 ```mermaid
 flowchart LR
-  subgraph easy ["Easier to read now"]
-    Button["A button's behavior"]
-    Rule["A rule in the app on their machine"]
-    Format["A format, a flow, a thin wrapper"]
+  subgraph easy [Easier to read now]
+    Button["A button"] --> ClientRule["A rule on their machine"] --> Format["A format or a thin wrapper"]
   end
-  subgraph hard ["Still not in the file"]
-    Trust["People who trust you"]
-    Data["Your servers and your data"]
-    Speed["How fast you ship the next thing"]
+  subgraph hard [Still not in the file]
+    Trust["People who trust you"] --> Data["Your servers and your data"] --> Speed["How fast you ship the next thing"]
   end
 ```
 

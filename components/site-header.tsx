@@ -18,6 +18,7 @@ import { cn } from '@/lib/cn';
 import { CognitiveSearchTrigger } from '@/components/cognitive-search';
 
 const navItems = [
+  { href: '/books', label: 'Books', icon: BookOpen },
   { href: '/cognitive-notes', label: 'Cognitive Notes', icon: FileCode2 },
   { href: '/newsletter', label: 'Newsletter', icon: AlbumIcon },
 ];
