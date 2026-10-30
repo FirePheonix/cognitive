@@ -6,16 +6,14 @@ import { FileIcon, FileTextIcon, SearchIcon } from 'lucide-react';
 import { Marquee } from '@/app/(home)/marquee';
 import { ServerCodeBlock } from '@/components/codeblock';
 import { CognitiveSearchPanel } from '@/components/cognitive-search';
+import { LearningPathsSection } from '@/components/learning-paths-section';
 import { getAllDocs, getSearchItems } from '@/content/docs/docs-server';
 import {
   Hero,
   AgnosticBackground,
   PreviewImages,
-  SecondSectionBackdrop,
   ConceptFlowDiagram,
   OrangeDitheredBackground,
-  BooksSceneClient,
-  StorySection,
 } from '@/app/(home)/page.client';
 
 const headingVariants = cva('font-medium tracking-tight', {
@@ -96,8 +94,10 @@ export default async function Page() {
           understand ideas <span className="text-brand font-medium">deeply</span>, not just memorize
           buzzwords.
         </p>
-        <div className="relative p-4 rounded-2xl col-span-full z-2 overflow-hidden border bg-black md:p-8">
-          <SecondSectionBackdrop />
+
+        <LearningPathsSection />
+
+        <div className="relative p-4 rounded-2xl col-span-full z-2 overflow-hidden border bg-fd-card md:p-8">
           <CognitiveSearchPanel
             embedded
             autoType
@@ -110,21 +110,9 @@ export default async function Page() {
         <Aesthetics />
         */}
 
-        <ForEngineers searchItems={searchItems} docs={docs} />
+        <ForEngineers searchItems={searchItems} />
       </div>
-      <BooksSection />
     </main>
-  );
-}
-
-function BooksSection() {
-  return (
-    <section className="relative mx-auto mt-10 w-full max-w-[1400px] overflow-hidden rounded-2xl border bg-[#020604] p-2 shadow-2xl shadow-green-950/30">
-      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_0%,rgba(34,197,94,0.24),transparent_42%),linear-gradient(135deg,rgba(2,6,4,0.75),rgba(5,25,13,0.45))]" />
-      <div className="relative h-[760px] w-full rounded-xl border border-white/10 bg-black max-md:h-[720px]">
-        <BooksSceneClient />
-      </div>
-    </section>
   );
 }
 
@@ -243,11 +231,9 @@ function Feedback() {
   );
 }
 
-function ForEngineers({ searchItems, docs }: { searchItems: any[]; docs: any[] }) {
+function ForEngineers({ searchItems }: { searchItems: any[] }) {
   return (
     <>
-      <StorySection searchItems={searchItems} docs={docs} />
-
       <div className={cn(cardVariants(), 'relative flex flex-col overflow-hidden z-2')}>
         <h3
           className={cn(
