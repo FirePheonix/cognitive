@@ -18,16 +18,11 @@ import OpenAPIImg from './openapi.png';
 import NotebookImg from './notebook.png';
 import { cva } from 'class-variance-authority';
 import AgentHeroImage from './agent-hero.png';
-import SecondSectionBg from './2nd-section-bg.png';
 import Greek2Image from './assets/greek-2.webp';
 import HeroLightImg from '@/public/hero.png';
 import HeroDarkImg from '@/public/hero-dark.png';
 import { useTheme } from 'next-themes';
-import Link from 'next/link';
-import { StoryControl } from '@/components/story-control';
-import { DocsSidebarPreview } from '@/components/docs-sidebar-preview';
 import dynamic from 'next/dynamic';
-import { ArrowRight } from 'lucide-react';
 
 const buttonVariants = cva(
   'inline-flex justify-center px-5 py-3 rounded-full font-medium tracking-tight transition-colors',
@@ -153,54 +148,6 @@ function HeroArticlePreview() {
         priority
         className="hidden dark:block w-full h-auto object-cover"
       />
-    </div>
-  );
-}
-
-export function SecondSectionBackdrop() {
-  const { resolvedTheme } = useTheme();
-  const ref = useRef<HTMLDivElement | null>(null);
-  const visible = useIsVisible(ref);
-  const [showShader, setShowShader] = useState(false);
-
-  useEffect(() => {
-    if (visible && !showShader) {
-      setShowShader(true);
-    }
-  }, [visible, showShader]);
-
-  return (
-    <div ref={ref} className="absolute inset-0 -z-3 overflow-hidden">
-      <div className="absolute inset-x-0 top-1/2 aspect-[1782/1024] w-full -translate-y-1/2">
-        <Image
-          src={SecondSectionBg}
-          alt=""
-          role="presentation"
-          fill
-          className="object-contain opacity-70 saturate-60 dark:opacity-65"
-        />
-        {showShader && (
-          <ImageDithering
-            image={SecondSectionBg.src}
-            width="100%"
-            height="100%"
-            fit="contain"
-            scale={1}
-            colorBack="#00000000"
-            colorFront={resolvedTheme === 'dark' ? '#123b12' : '#173f13'}
-            colorHighlight={resolvedTheme === 'dark' ? '#8fd56f' : '#7fcf58'}
-            type="4x4"
-            size={6}
-            colorSteps={2}
-            originalColors={false}
-            className="absolute inset-0 opacity-95 mix-blend-screen dark:opacity-90"
-            minPixelRatio={1}
-            maxPixelCount={1280 * 720}
-          />
-        )}
-      </div>
-      <div className="absolute inset-0 -z-2 bg-[#020702]/55 mix-blend-multiply dark:bg-[#020502]/60" />
-      <div className="absolute inset-0 -z-1 bg-radial-[circle_at_50%_0%] from-brand/24 via-transparent to-black/35" />
     </div>
   );
 }
@@ -471,133 +418,3 @@ export function OrangeDitheredBackground() {
   );
 }
 
-const DynamicBooksScene = dynamic(
-  () => import('@/components/books-scene').then((mod) => mod.BooksScene),
-  {
-    ssr: false,
-    loading: () => (
-      <div className="flex h-full w-full items-center justify-center bg-fd-card/50">
-        <div className="h-8 w-8 animate-spin rounded-full border-4 border-brand border-t-transparent" />
-      </div>
-    ),
-  },
-);
-
-export function BooksSceneClient() {
-  return <DynamicBooksScene />;
-}
-
-export function StorySection({ searchItems, docs = [] }: { searchItems: any[]; docs?: any[] }) {
-  const [isOverviewHovered, setIsOverviewHovered] = useState(false);
-  const [isDiagramHovered, setIsDiagramHovered] = useState(false);
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const diagramTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-
-  const handleOverviewHover = (hovered: boolean) => {
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-    }
-    if (hovered) {
-      setIsOverviewHovered(true);
-    } else {
-      timeoutRef.current = setTimeout(() => {
-        setIsOverviewHovered(false);
-      }, 250);
-    }
-  };
-
-  const handleDiagramHover = (hovered: boolean) => {
-    if (diagramTimeoutRef.current) {
-      clearTimeout(diagramTimeoutRef.current);
-    }
-    if (hovered) {
-      setIsDiagramHovered(true);
-    } else {
-      diagramTimeoutRef.current = setTimeout(() => {
-        setIsDiagramHovered(false);
-      }, 250);
-    }
-  };
-
-  const isAnyHovered = isOverviewHovered || isDiagramHovered;
-
-  return (
-    <div className="relative col-span-full min-h-[570px] px-2 py-8 rounded-2xl z-2 border shadow-md flex items-center justify-center overflow-hidden lg:overflow-visible">
-      <Image
-        src="/learn-visually-bg.png"
-        alt=""
-        role="presentation"
-        fill
-        className="absolute inset-0 size-full -z-1 pointer-events-none object-cover object-top rounded-2xl"
-      />
-
-      <div
-        className={cn(
-          'w-full max-w-[520px] rounded-2xl border bg-fd-card/80 p-3 shadow-xl shadow-black/40 backdrop-blur-md flex flex-col items-center text-center transition-all duration-500 ease-out relative',
-          isAnyHovered ? 'lg:-translate-x-44 -translate-x-8 shadow-2xl' : 'translate-x-0',
-        )}
-      >
-        <div className="space-y-4 px-4 py-3 flex flex-col items-center">
-          <h2 className="text-3xl lg:text-4xl font-medium tracking-tight">Learn AI Visually.</h2>
-
-          <p className="max-w-md text-sm leading-6 text-fd-muted-foreground text-center">
-            Explore modern AI concepts with diagrams with real, human explanations.
-          </p>
-        </div>
-
-        <div className="w-full text-left">
-          <StoryControl
-            searchItems={searchItems}
-            onOverviewHoverChange={handleOverviewHover}
-            onDiagramHoverChange={handleDiagramHover}
-          />
-        </div>
-
-        {/* Floating Docs Sidebar Preview with Hover Hitbox Bridge & Grace Timeout */}
-        <div
-          onMouseEnter={() => handleOverviewHover(true)}
-          onMouseLeave={() => handleOverviewHover(false)}
-          className={cn(
-            'absolute left-[calc(100%+1.25rem)] top-1/2 -translate-y-1/2 transition-all duration-500 ease-out max-md:hidden z-30',
-            'before:absolute before:-left-8 before:top-0 before:bottom-0 before:w-8 before:content-[""]',
-            isOverviewHovered
-              ? 'opacity-100 translate-x-0 scale-100 pointer-events-auto'
-              : 'opacity-0 translate-x-8 scale-95 pointer-events-none',
-          )}
-        >
-          <DocsSidebarPreview docs={docs} />
-        </div>
-
-        {/* Floating Architecture Diagram Preview */}
-        <div
-          onMouseEnter={() => handleDiagramHover(true)}
-          onMouseLeave={() => handleDiagramHover(false)}
-          className={cn(
-            'absolute left-[calc(100%+1.25rem)] top-1/2 -translate-y-1/2 transition-all duration-500 ease-out max-md:hidden z-30 w-[600px]',
-            'before:absolute before:-left-8 before:top-0 before:bottom-0 before:w-8 before:content-[""]',
-            isDiagramHovered
-              ? 'opacity-100 translate-x-0 scale-100 pointer-events-auto'
-              : 'opacity-0 translate-x-8 scale-95 pointer-events-none',
-          )}
-        >
-          <div className="overflow-hidden rounded-2xl border border-fd-border/80 bg-fd-card/95 p-2 shadow-2xl backdrop-blur-xl">
-            <Image
-              src="/learn-context.png"
-              alt="Architecture Diagram"
-              width={600}
-              height={450}
-              className="rounded-xl block dark:hidden w-full h-auto"
-            />
-            <Image
-              src="/learn-context-dark.png"
-              alt="Architecture Diagram"
-              width={600}
-              height={450}
-              className="rounded-xl hidden dark:block w-full h-auto"
-            />
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
