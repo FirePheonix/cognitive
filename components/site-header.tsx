@@ -11,11 +11,15 @@ import {
   FileCode2,
   LayoutTemplate,
   Moon,
+  Star,
   Sun,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { cn } from '@/lib/cn';
 import { CognitiveSearchTrigger } from '@/components/cognitive-search';
+
+const GITHUB_REPO = 'FirePheonix/cognitive';
+const GITHUB_URL = `https://github.com/${GITHUB_REPO}`;
 
 const navItems = [
   { href: '/books', label: 'Books', icon: BookOpen },
@@ -87,15 +91,7 @@ export function SiteHeader() {
               className="h-9 max-w-[240px] rounded-full bg-fd-secondary"
             />
             <ThemeToggle />
-            <a
-              href="https://github.com/FirePheonix/cognitive"
-              target="_blank"
-              rel="noreferrer noopener"
-              aria-label="Github"
-              className="inline-flex size-9 items-center justify-center rounded-md p-2 text-fd-muted-foreground transition-colors hover:bg-fd-accent hover:text-fd-accent-foreground"
-            >
-              <GithubMark className="size-4" />
-            </a>
+            <GithubStarsLink />
           </div>
 
           <div className="ms-auto flex flex-row items-center -me-1.5 lg:hidden">
@@ -188,6 +184,54 @@ export function ThemeToggle({ className }: { className?: string }) {
         <Moon className="size-4" />
       </button>
     </div>
+  );
+}
+
+function formatStarCount(count: number) {
+  if (count >= 1000) {
+    const compact = count / 1000;
+    return `${compact >= 10 ? Math.round(compact) : compact.toFixed(1).replace(/\.0$/, '')}k`;
+  }
+  return String(count);
+}
+
+function GithubStarsLink() {
+  const [stars, setStars] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    fetch(`https://api.github.com/repos/${GITHUB_REPO}`, {
+      headers: { Accept: 'application/vnd.github+json' },
+    })
+      .then((response) => (response.ok ? response.json() : Promise.reject(response.status)))
+      .then((data: { stargazers_count?: number }) => {
+        if (cancelled) return;
+        if (typeof data.stargazers_count === 'number') setStars(data.stargazers_count);
+      })
+      .catch(() => {
+        // Non-critical social proof — keep the GitHub link without a count.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <a
+      href={GITHUB_URL}
+      target="_blank"
+      rel="noreferrer noopener"
+      aria-label={stars === null ? 'GitHub' : `GitHub repository, ${stars} stars`}
+      className="inline-flex h-9 items-center gap-1.5 rounded-md px-2 text-fd-muted-foreground transition-colors hover:bg-fd-accent hover:text-fd-accent-foreground"
+    >
+      <GithubMark className="size-4" />
+      <Star className="size-3.5 fill-current" aria-hidden />
+      <span className="min-w-[1.25rem] text-xs font-medium tabular-nums">
+        {stars === null ? '—' : formatStarCount(stars)}
+      </span>
+    </a>
   );
 }
 
