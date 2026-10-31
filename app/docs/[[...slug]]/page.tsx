@@ -170,7 +170,12 @@ export default async function DocsPage({ params }: { params: Promise<{ slug?: st
 
       <DocsDesktopToc items={toc} />
 
-      <button className="fixed bottom-5 right-5 z-30 inline-flex items-center gap-2 rounded-2xl border bg-fd-card px-4 py-3 text-sm font-medium shadow-xl transition-colors hover:bg-fd-accent">
+      <button
+        className={cn(
+          'fixed right-5 z-30 inline-flex items-center gap-2 rounded-2xl border bg-fd-card px-4 py-3 text-sm font-medium shadow-xl transition-colors hover:bg-fd-accent',
+          page.audio ? 'bottom-24' : 'bottom-5',
+        )}
+      >
         <MessageCircle className="size-4" />
         Ask AI
       </button>
