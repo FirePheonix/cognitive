@@ -17,6 +17,12 @@ on:
         required: false
         default: 'false'
         type: boolean
+      paths:
+        description: >-
+          Newline-separated media/ paths to upload (overrides diff when set).
+          Example: media/appendix-g-modern-llm-systems/chapter-29-interpretability/chapter-29.wav
+        required: false
+        type: string
 
 jobs:
   deploy-media:
@@ -44,8 +50,12 @@ jobs:
         id: changed
         env:
           FULL_SYNC: ${{ github.event.inputs.full_sync }}
+          PATHS: ${{ github.event.inputs.paths }}
         run: |
-          if [ "$FULL_SYNC" = "true" ]; then
+          if [ -n "$PATHS" ]; then
+            echo "Explicit path list requested"
+            FILES=$(printf '%s\n' "$PATHS" | sed '/^[[:space:]]*$/d' | sort -u)
+          elif [ "$FULL_SYNC" = "true" ]; then
             echo "Full sync requested — gathering all files in media/"
             FILES=$(find media -type f | sort)
           else
@@ -72,6 +82,12 @@ jobs:
         run: |
           FAILED=0
           while IFS= read -r file; do
+            if [ ! -f "$file" ]; then
+              echo "   ✗ MISSING $file"
+              FAILED=$((FAILED + 1))
+              continue
+            fi
+
             # Strip the leading "media/" prefix so the remote key mirrors the
             # folder structure under the server's STORAGE_DIR.
             # local:  media/part-i-foundations/chapter-1/1-1.wav
@@ -81,13 +97,34 @@ jobs:
 
             echo "→ uploading: $file  →  $url"
 
-            echo "" > /tmp/curl_response.txt
-            http_code=$(curl -s -o /tmp/curl_response.txt -w "%{http_code}" \
-              -X PUT \
-              -H "X-API-Key: $API_KEY" \
-              -H "Content-Type: application/octet-stream" \
-              --data-binary "@$file" \
-              "$url")
+            # Retry transient tunnel/origin failures (common 502s on large WAVs).
+            attempt=1
+            max_attempts=4
+            http_code="000"
+            while [ "$attempt" -le "$max_attempts" ]; do
+              echo "" > /tmp/curl_response.txt
+              http_code=$(curl -s -o /tmp/curl_response.txt -w "%{http_code}" \
+                --connect-timeout 30 \
+                --max-time 600 \
+                -X PUT \
+                -H "X-API-Key: $API_KEY" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary "@$file" \
+                "$url" || true)
+
+              if [ "$http_code" = "201" ] || [ "$http_code" = "200" ]; then
+                break
+              fi
+
+              if [ "$attempt" -lt "$max_attempts" ] && { [ "$http_code" = "502" ] || [ "$http_code" = "503" ] || [ "$http_code" = "504" ] || [ "$http_code" = "000" ]; }; then
+                sleep_for=$((attempt * 15))
+                echo "   ↻ attempt $attempt/$max_attempts got HTTP $http_code — retrying in ${sleep_for}s"
+                sleep "$sleep_for"
+                attempt=$((attempt + 1))
+                continue
+              fi
+              break
+            done
 
             if [ "$http_code" = "201" ] || [ "$http_code" = "200" ]; then
               echo "   ✓ $file ($http_code)"
