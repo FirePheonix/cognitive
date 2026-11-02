@@ -37,6 +37,11 @@ describe('SiteHeader mobile menu', () => {
     expect(dialog).toHaveTextContent(/AI Concepts/i);
     expect(dialog).toHaveTextContent(/Books/i);
     expect(screen.getByRole('button', { name: /close menu/i })).toBeInTheDocument();
+
+    // Backdrop must not sit above the panel (that blocked taps).
+    const dismiss = screen.getByRole('button', { name: /dismiss menu/i });
+    expect(dismiss.className).toMatch(/z-40/);
+    expect(dialog.parentElement?.className).toMatch(/z-50/);
   });
 });
 

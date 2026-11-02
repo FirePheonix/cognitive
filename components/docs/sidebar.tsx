@@ -391,16 +391,21 @@ export function DocsSidebar({
       </div>
 
       {mobileOpen ? (
-        <div className="fixed inset-0 z-40 lg:hidden" role="dialog" aria-modal="true" aria-label="Documentation navigation">
+        <div
+          className="fixed inset-0 z-50 lg:hidden"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Documentation navigation"
+        >
           <button
             type="button"
             aria-label="Dismiss navigation"
-            className="absolute inset-0 bg-black/40"
+            className="absolute inset-0 z-0 bg-black/40"
             onClick={() => setMobileOpen(false)}
           />
           <aside
             id={mobileMenuId}
-            className="absolute inset-y-0 left-0 flex w-[min(100%,20rem)] max-w-full flex-col border-e bg-fd-card text-sm shadow-xl"
+            className="absolute inset-y-0 left-0 z-10 flex w-[min(100%,20rem)] max-w-full flex-col border-e bg-fd-card text-sm shadow-xl"
           >
             {renderSidebarPanel({ mobile: true })}
           </aside>

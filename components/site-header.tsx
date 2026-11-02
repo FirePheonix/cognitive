@@ -69,8 +69,18 @@ export function SiteHeader() {
   if (pathname.startsWith('/docs')) return null;
 
   return (
-    <header id="nd-nav" className="sticky top-0 z-40">
-      <div className="border-b bg-fd-background/80 backdrop-blur-lg">
+    <header id="nd-nav" className="sticky top-0 z-50">
+      {/* Backdrop sits under the menu panel so links stay clickable */}
+      {menuOpen ? (
+        <button
+          type="button"
+          aria-label="Dismiss menu"
+          className="fixed inset-0 z-40 bg-black/40 lg:hidden"
+          onClick={() => setMenuOpen(false)}
+        />
+      ) : null}
+
+      <div className="relative z-50 border-b bg-fd-background/95 backdrop-blur-lg">
         <div className="mx-auto flex h-14 w-full max-w-[1400px] items-center px-4">
           <Link href="/" className="inline-flex items-center gap-2.5 font-semibold">
             <span
@@ -193,15 +203,6 @@ export function SiteHeader() {
           </div>
         ) : null}
       </div>
-
-      {menuOpen ? (
-        <button
-          type="button"
-          aria-label="Dismiss menu"
-          className="fixed inset-x-0 bottom-0 top-14 z-30 bg-black/40 lg:hidden"
-          onClick={() => setMenuOpen(false)}
-        />
-      ) : null}
     </header>
   );
 }
