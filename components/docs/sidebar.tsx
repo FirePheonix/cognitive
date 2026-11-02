@@ -22,20 +22,12 @@ import { CognitiveSearchTrigger } from '@/components/cognitive-search';
 
 const sections = [
   {
-    title: 'Handbook',
-    description: 'AI systems course',
-    href: '/docs',
-    color: 'var(--brand)',
-    icon: BookOpen,
-    filter: 'handbook',
-  },
-  {
-    title: 'Long Form',
-    description: 'Deep-dive chapters',
-    href: '/docs/part-01-foundations/chapter-01-from-prompt-to-production',
-    color: 'var(--accent)',
-    icon: Book,
-    filter: 'long-form',
+    title: 'LLM Fundamentals',
+    description: 'How language models work',
+    href: '/docs/llm-fundamentals',
+    color: 'var(--fd-primary)',
+    icon: Cpu,
+    filter: 'llm-fundamentals',
   },
   {
     title: 'ML Fundamentals',
@@ -46,12 +38,20 @@ const sections = [
     filter: 'ml-fundamentals',
   },
   {
-    title: 'LLM Fundamentals',
-    description: 'How language models work',
-    href: '/docs/llm-fundamentals',
-    color: 'var(--fd-primary)',
-    icon: Cpu,
-    filter: 'llm-fundamentals',
+    title: 'Long Form',
+    description: 'Deep-dive chapters',
+    href: '/docs/part-01-foundations/chapter-01-from-prompt-to-production',
+    color: 'var(--accent)',
+    icon: Book,
+    filter: 'long-form',
+  },
+  {
+    title: 'Handbook',
+    description: 'AI systems course',
+    href: '/docs/overview',
+    color: 'var(--brand)',
+    icon: BookOpen,
+    filter: 'handbook',
   },
 ] as const;
 
@@ -81,7 +81,7 @@ export function DocsSidebar({
       if (pathname.match(/^\/docs\/part-\d+-/) || pathname.startsWith('/docs/long-form')) {
         return sections.find((s) => s.filter === 'long-form')!;
       }
-      return sections[0];
+      return sections.find((s) => s.filter === 'handbook')!;
     },
     [pathname],
   );

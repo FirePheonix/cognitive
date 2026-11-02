@@ -7,8 +7,9 @@ import {
   AlbumIcon,
   BookOpen,
   ChevronDown,
+  Cpu,
   FileCode2,
-  LayoutTemplate,
+  FlaskConical,
   Menu,
   Moon,
   Star,
@@ -30,16 +31,16 @@ const navItems = [
 
 const documentationItems = [
   {
-    href: '/docs',
-    title: 'AI Concepts',
-    description: 'Explore modern AI engineering concepts and patterns.',
-    icon: BookOpen,
+    href: '/docs/llm-fundamentals',
+    title: 'LLM Fundamentals',
+    description: 'How language models work — from tokens to modern systems.',
+    icon: Cpu,
   },
   {
-    href: '/docs/appendices/appendix-b-engineering-patterns',
-    title: 'Appendices',
-    description: 'Core concepts, patterns, checklists, and glossary.',
-    icon: LayoutTemplate,
+    href: '/docs/ml-fundamentals',
+    title: 'ML Fundamentals',
+    description: 'Classical machine learning from scratch.',
+    icon: FlaskConical,
   },
 ];
 
@@ -213,7 +214,7 @@ function DocumentationMenu({ pathname }: { pathname: string }) {
   return (
     <div className="group relative">
       <Link
-        href="/docs"
+        href="/docs/llm-fundamentals"
         className={cn(
           'inline-flex items-center gap-1 p-2 text-fd-muted-foreground transition-colors hover:text-fd-accent-foreground',
           active && 'text-fd-primary',
