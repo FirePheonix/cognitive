@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { ThemeToggle, GithubMark } from '@/components/site-header';
+import { SiteHeader, ThemeToggle, GithubMark } from '@/components/site-header';
 
 // Mock next-themes
 vi.mock('next-themes', () => ({
@@ -22,6 +22,23 @@ vi.mock('next/link', () => ({
 vi.mock('next/navigation', () => ({
   usePathname: vi.fn(() => '/'),
 }));
+
+describe('SiteHeader mobile menu', () => {
+  it('opens navigation links from the hamburger button', async () => {
+    const user = userEvent.setup();
+    render(<SiteHeader />);
+
+    expect(screen.queryByRole('dialog', { name: /site navigation/i })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /open menu/i }));
+
+    const dialog = screen.getByRole('dialog', { name: /site navigation/i });
+    expect(dialog).toBeInTheDocument();
+    expect(dialog).toHaveTextContent(/AI Concepts/i);
+    expect(dialog).toHaveTextContent(/Books/i);
+    expect(screen.getByRole('button', { name: /close menu/i })).toBeInTheDocument();
+  });
+});
 
 describe('ThemeToggle', () => {
   it('renders Light and Dark buttons', () => {

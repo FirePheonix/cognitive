@@ -6,15 +6,16 @@ import { useTheme } from 'next-themes';
 import {
   AlbumIcon,
   BookOpen,
-  Boxes,
   ChevronDown,
   FileCode2,
   LayoutTemplate,
+  Menu,
   Moon,
   Star,
   Sun,
+  X,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { cn } from '@/lib/cn';
 import { CognitiveSearchTrigger } from '@/components/cognitive-search';
 
@@ -44,11 +45,31 @@ const documentationItems = [
 
 export function SiteHeader() {
   const pathname = usePathname();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuId = useId();
+
+  useEffect(() => {
+    setMenuOpen(false);
+  }, [pathname]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMenuOpen(false);
+    };
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [menuOpen]);
 
   if (pathname.startsWith('/docs')) return null;
 
   return (
-    <header id="nd-nav" className="sticky top-0 z-40 h-14">
+    <header id="nd-nav" className="sticky top-0 z-40">
       <div className="border-b bg-fd-background/80 backdrop-blur-lg">
         <div className="mx-auto flex h-14 w-full max-w-[1400px] items-center px-4">
           <Link href="/" className="inline-flex items-center gap-2.5 font-semibold">
@@ -69,7 +90,7 @@ export function SiteHeader() {
             <span>Cognitive</span>
           </Link>
 
-          <nav className="hidden flex-row items-center gap-2 px-6 text-sm sm:flex">
+          <nav className="hidden flex-row items-center gap-2 px-6 text-sm md:flex">
             <DocumentationMenu pathname={pathname} />
             {navItems.map((item) => (
               <Link
@@ -97,14 +118,90 @@ export function SiteHeader() {
           <div className="ms-auto flex flex-row items-center -me-1.5 lg:hidden">
             <CognitiveSearchTrigger className="size-10 justify-center rounded-md border-0 bg-transparent p-2 [&_kbd]:hidden [&_span]:hidden" />
             <button
-              aria-label="Open menu"
+              type="button"
+              aria-label={menuOpen ? 'Close menu' : 'Open menu'}
+              aria-expanded={menuOpen}
+              aria-controls={menuId}
+              onClick={() => setMenuOpen((value) => !value)}
               className="inline-flex size-10 items-center justify-center rounded-md p-2 text-fd-muted-foreground transition-colors hover:bg-fd-accent hover:text-fd-accent-foreground"
             >
-              <ChevronDown className="size-4" />
+              {menuOpen ? <X className="size-5" /> : <Menu className="size-5" />}
             </button>
           </div>
         </div>
+
+        {menuOpen ? (
+          <div
+            id={menuId}
+            className="border-t bg-fd-background lg:hidden"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Site navigation"
+          >
+            <div className="mx-auto flex max-h-[calc(100dvh-3.5rem)] w-full max-w-[1400px] flex-col gap-4 overflow-y-auto px-4 py-4">
+              <nav className="flex flex-col gap-1">
+                <p className="px-2 text-xs font-semibold uppercase tracking-wide text-fd-muted-foreground">
+                  Learn
+                </p>
+                {documentationItems.map((item) => (
+                  <Link
+                    key={item.href}
+                    href={item.href}
+                    onClick={() => setMenuOpen(false)}
+                    className={cn(
+                      'flex items-start gap-3 rounded-lg px-2 py-2.5 text-fd-muted-foreground transition-colors hover:bg-fd-accent hover:text-fd-accent-foreground',
+                      pathname.startsWith(item.href) && 'bg-fd-accent/60 text-fd-primary',
+                    )}
+                  >
+                    <span className="mt-0.5 rounded-md border bg-fd-muted p-1">
+                      <item.icon className="size-4" />
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block text-sm font-medium text-fd-foreground">
+                        {item.title}
+                      </span>
+                      <span className="mt-0.5 block text-xs text-fd-muted-foreground">
+                        {item.description}
+                      </span>
+                    </span>
+                  </Link>
+                ))}
+              </nav>
+
+              <nav className="flex flex-col gap-1 border-t pt-3">
+                {navItems.map((item) => (
+                  <Link
+                    key={item.href}
+                    href={item.href}
+                    onClick={() => setMenuOpen(false)}
+                    className={cn(
+                      'inline-flex items-center gap-2 rounded-lg px-2 py-2.5 text-sm text-fd-muted-foreground transition-colors hover:bg-fd-accent hover:text-fd-accent-foreground',
+                      pathname.startsWith(item.href) && 'bg-fd-accent/60 text-fd-primary',
+                    )}
+                  >
+                    <item.icon className="size-4" />
+                    {item.label}
+                  </Link>
+                ))}
+              </nav>
+
+              <div className="flex items-center justify-between gap-3 border-t pt-3">
+                <ThemeToggle />
+                <GithubStarsLink />
+              </div>
+            </div>
+          </div>
+        ) : null}
       </div>
+
+      {menuOpen ? (
+        <button
+          type="button"
+          aria-label="Dismiss menu"
+          className="fixed inset-x-0 bottom-0 top-14 z-30 bg-black/40 lg:hidden"
+          onClick={() => setMenuOpen(false)}
+        />
+      ) : null}
     </header>
   );
 }

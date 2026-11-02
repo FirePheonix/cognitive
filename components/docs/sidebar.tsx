@@ -11,9 +11,10 @@ import {
   ChevronRight,
   ChevronsUpDown,
   FileText,
-  SidebarIcon,
+  Menu,
+  X,
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import { cn } from '@/lib/cn';
 import { FumadocsIcon } from '@/components/fumadocs-icon';
 import { GithubMark, ThemeToggle } from '@/components/site-header';
@@ -65,6 +66,8 @@ export function DocsSidebar({
 }) {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const mobileMenuId = useId();
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
   const [openChapters, setOpenChapters] = useState<Record<string, boolean>>({});
   const selected = useMemo(
@@ -136,12 +139,34 @@ export function DocsSidebar({
     }
   }, [sidebarTree, pathname]);
 
-  return (
-    <aside
-      id="nd-sidebar"
-      className="hidden w-[300px] shrink-0 border-e bg-fd-card text-sm lg:block"
-    >
-      <div className="fd-scroll-container sticky top-0 flex h-dvh flex-col overflow-y-auto px-4 py-4">
+  useEffect(() => {
+    setMobileOpen(false);
+    setOpen(false);
+  }, [pathname]);
+
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMobileOpen(false);
+    };
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [mobileOpen]);
+
+  const renderSidebarPanel = (opts?: { mobile?: boolean }) => (
+      <div
+        className="fd-scroll-container flex h-full flex-col overflow-y-auto px-4 py-4"
+        onClick={(event) => {
+          if (!opts?.mobile) return;
+          const target = event.target as HTMLElement | null;
+          if (target?.closest('a')) setMobileOpen(false);
+        }}
+      >
         <div className="flex flex-col gap-3 pb-3">
           <div className="flex items-center gap-2">
             <Link
@@ -151,12 +176,16 @@ export function DocsSidebar({
               <FumadocsIcon className="size-5" />
               <span>AI Systems</span>
             </Link>
-            <button
-              aria-label="Toggle sidebar"
-              className="inline-flex size-8 items-center justify-center rounded-md text-fd-muted-foreground transition-colors hover:bg-fd-accent hover:text-fd-accent-foreground"
-            >
-              <SidebarIcon className="size-4" />
-            </button>
+            {opts?.mobile ? (
+              <button
+                type="button"
+                aria-label="Close navigation"
+                onClick={() => setMobileOpen(false)}
+                className="inline-flex size-8 items-center justify-center rounded-md text-fd-muted-foreground transition-colors hover:bg-fd-accent hover:text-fd-accent-foreground"
+              >
+                <X className="size-4" />
+              </button>
+            ) : null}
           </div>
           <CognitiveSearchTrigger searchItems={searchItems} />
           {/* Note: Kept the Switcher UI untouched for future extensions. It currently acts as a global quick link menu. */}
@@ -334,7 +363,57 @@ export function DocsSidebar({
           </div>
         </div>
       </div>
-    </aside>
+  );
+
+  return (
+    <>
+      <div className="sticky top-0 z-30 flex h-14 items-center gap-2 border-b bg-fd-background/90 px-3 backdrop-blur-lg lg:hidden">
+        <button
+          type="button"
+          aria-label={mobileOpen ? 'Close navigation' : 'Open navigation'}
+          aria-expanded={mobileOpen}
+          aria-controls={mobileMenuId}
+          onClick={() => setMobileOpen((value) => !value)}
+          className="inline-flex size-10 items-center justify-center rounded-md text-fd-muted-foreground transition-colors hover:bg-fd-accent hover:text-fd-accent-foreground"
+        >
+          {mobileOpen ? <X className="size-5" /> : <Menu className="size-5" />}
+        </button>
+        <Link href="/" className="inline-flex min-w-0 items-center gap-2 font-medium">
+          <FumadocsIcon className="size-5 shrink-0" />
+          <span className="truncate">{selected.title}</span>
+        </Link>
+        <div className="ms-auto">
+          <CognitiveSearchTrigger
+            searchItems={searchItems}
+            className="size-10 justify-center rounded-md border-0 bg-transparent p-2 [&_kbd]:hidden [&_span]:hidden"
+          />
+        </div>
+      </div>
+
+      {mobileOpen ? (
+        <div className="fixed inset-0 z-40 lg:hidden" role="dialog" aria-modal="true" aria-label="Documentation navigation">
+          <button
+            type="button"
+            aria-label="Dismiss navigation"
+            className="absolute inset-0 bg-black/40"
+            onClick={() => setMobileOpen(false)}
+          />
+          <aside
+            id={mobileMenuId}
+            className="absolute inset-y-0 left-0 flex w-[min(100%,20rem)] max-w-full flex-col border-e bg-fd-card text-sm shadow-xl"
+          >
+            {renderSidebarPanel({ mobile: true })}
+          </aside>
+        </div>
+      ) : null}
+
+      <aside
+        id="nd-sidebar"
+        className="hidden w-[300px] shrink-0 border-e bg-fd-card text-sm lg:block"
+      >
+        <div className="sticky top-0 h-dvh">{renderSidebarPanel()}</div>
+      </aside>
+    </>
   );
 }
 
