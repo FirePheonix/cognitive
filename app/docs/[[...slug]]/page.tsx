@@ -29,9 +29,7 @@ import { redirect } from 'next/navigation';
 export default async function DocsPage({ params }: { params: Promise<{ slug?: string[] }> }) {
   const { slug = [] } = await params;
   if (slug.length === 0) {
-    redirect(
-      '/docs/part-01-foundations/chapter-01-from-prompt-to-production/11-the-lifecycle-of-an-ai-request',
-    );
+    redirect('/docs/llm-fundamentals');
   }
   const page = getDocBySlug(slug);
 
