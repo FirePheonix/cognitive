@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Play, Pause, ArrowLeft, ArrowRight } from 'lucide-react';
+import { Play, Pause, RotateCcw, RotateCw } from 'lucide-react';
 import { cn } from '@/lib/cn';
 
 interface DocAudioPlayerProps {
@@ -70,7 +70,6 @@ export function DocAudioPlayer({ src }: DocAudioPlayerProps) {
         setIsDocked(!entry.isIntersecting);
       },
       {
-        // Dock once the inline player has scrolled fully out of the top of the viewport
         root: null,
         threshold: 0,
         rootMargin: '-8px 0px 0px 0px',
@@ -80,6 +79,16 @@ export function DocAudioPlayer({ src }: DocAudioPlayerProps) {
     observer.observe(sentinel);
     return () => observer.disconnect();
   }, []);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty(
+      '--doc-audio-dock-pad',
+      isDocked ? '4.5rem' : '0px',
+    );
+    return () => {
+      document.documentElement.style.removeProperty('--doc-audio-dock-pad');
+    };
+  }, [isDocked]);
 
   const togglePlay = () => {
     if (!audioRef.current) return;
@@ -122,18 +131,32 @@ export function DocAudioPlayer({ src }: DocAudioPlayerProps) {
   };
 
   const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
+  const speed = SPEED_OPTIONS[speedIndex];
 
-  const controls = (docked: boolean) => (
-    <div
-      className={cn(
-        'inline-flex items-center gap-2 sm:gap-3 rounded-full border border-neutral-800 bg-neutral-950/95 px-3 sm:px-4 py-2 text-xs text-neutral-200 shadow-sm backdrop-blur-md',
-        docked && 'w-full max-w-xl justify-between shadow-2xl',
-      )}
-    >
+  const progress = (
+    <div className="relative min-w-0 flex-1">
+      <input
+        type="range"
+        aria-label="Audio progress"
+        min={0}
+        max={duration || 100}
+        step={0.1}
+        value={currentTime}
+        onChange={handleSeek}
+        className="h-1 w-full cursor-pointer appearance-none rounded-full bg-neutral-800 focus:outline-none"
+        style={{
+          background: `linear-gradient(to right, #ffffff 0%, #ffffff ${progressPercent}%, #333333 ${progressPercent}%, #333333 100%)`,
+        }}
+      />
+    </div>
+  );
+
+  const inlineControls = (
+    <div className="inline-flex max-w-full flex-wrap items-center gap-2 rounded-full border border-neutral-800 bg-neutral-950/95 px-3 py-2 text-xs text-neutral-200 shadow-sm backdrop-blur-md sm:gap-3 sm:px-4">
       <button
         type="button"
         onClick={togglePlay}
-        className="flex items-center gap-2 font-medium hover:text-white transition-colors shrink-0"
+        className="flex shrink-0 items-center gap-2 font-medium transition-colors hover:text-white"
         aria-label={isPlaying ? 'Pause audiobook' : 'Play audiobook'}
       >
         {isPlaying ? (
@@ -141,62 +164,96 @@ export function DocAudioPlayer({ src }: DocAudioPlayerProps) {
         ) : (
           <Play className="size-3.5 fill-current text-white" />
         )}
-        <span className={cn(docked ? 'hidden sm:inline' : 'inline')}>
-          Listen to audiobook
-        </span>
+        <span>Listen to audiobook</span>
       </button>
 
-      <span className="text-neutral-700 hidden sm:inline">·</span>
+      <span className="hidden text-neutral-700 sm:inline">·</span>
 
-      <button
-        type="button"
-        onClick={() => skipBy(-SKIP_SECONDS)}
-        className="inline-flex items-center gap-1 rounded-full border border-neutral-800 bg-neutral-900/80 px-2 py-1 font-mono text-[11px] text-neutral-300 transition-colors hover:border-neutral-600 hover:text-white"
-        aria-label={`Skip back ${SKIP_SECONDS} seconds`}
-        title={`−${SKIP_SECONDS} seconds`}
-      >
-        <ArrowLeft className="size-3.5" />
-        <span>−{SKIP_SECONDS}</span>
-      </button>
+      <div className="flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={() => skipBy(-SKIP_SECONDS)}
+          className="inline-flex size-7 items-center justify-center rounded-full border border-neutral-800 bg-neutral-900/80 text-neutral-300 transition-colors hover:border-neutral-600 hover:text-white"
+          aria-label={`Skip back ${SKIP_SECONDS} seconds`}
+        >
+          <RotateCcw className="size-3.5" />
+        </button>
+        <button
+          type="button"
+          onClick={() => skipBy(SKIP_SECONDS)}
+          className="inline-flex size-7 items-center justify-center rounded-full border border-neutral-800 bg-neutral-900/80 text-neutral-300 transition-colors hover:border-neutral-600 hover:text-white"
+          aria-label={`Skip forward ${SKIP_SECONDS} seconds`}
+        >
+          <RotateCw className="size-3.5" />
+        </button>
+      </div>
 
-      <button
-        type="button"
-        onClick={() => skipBy(SKIP_SECONDS)}
-        className="inline-flex items-center gap-1 rounded-full border border-neutral-800 bg-neutral-900/80 px-2 py-1 font-mono text-[11px] text-neutral-300 transition-colors hover:border-neutral-600 hover:text-white"
-        aria-label={`Skip forward ${SKIP_SECONDS} seconds`}
-        title={`+${SKIP_SECONDS} seconds`}
-      >
-        <span>+{SKIP_SECONDS}</span>
-        <ArrowRight className="size-3.5" />
-      </button>
-
-      <span className="font-mono text-[11px] text-neutral-400 shrink-0 tabular-nums">
+      <span className="shrink-0 font-mono text-[11px] tabular-nums text-neutral-400">
         {formatTime(currentTime)} / {formatTime(duration)}
       </span>
 
-      <div className={cn('relative flex items-center', docked ? 'flex-1 min-w-16' : 'w-24 sm:w-32')}>
-        <input
-          type="range"
-          aria-label="Audio progress"
-          min={0}
-          max={duration || 100}
-          step={0.1}
-          value={currentTime}
-          onChange={handleSeek}
-          className="h-1 w-full cursor-pointer appearance-none rounded-full bg-neutral-800 focus:outline-none"
-          style={{
-            background: `linear-gradient(to right, #ffffff 0%, #ffffff ${progressPercent}%, #333333 ${progressPercent}%, #333333 100%)`,
-          }}
-        />
-      </div>
+      <div className="hidden w-28 sm:block sm:w-32">{progress}</div>
 
       <button
         type="button"
         onClick={toggleSpeed}
-        className="font-mono text-[11px] font-medium text-neutral-400 hover:text-white transition-colors shrink-0"
-        aria-label={`Playback speed ${SPEED_OPTIONS[speedIndex]}x`}
+        className="shrink-0 font-mono text-[11px] font-medium text-neutral-400 transition-colors hover:text-white"
+        aria-label={`Playback speed ${speed}x`}
       >
-        {SPEED_OPTIONS[speedIndex]}x
+        {speed}x
+      </button>
+    </div>
+  );
+
+  // Compact docked bar: play · scrub · time · speed. No overflow on phones.
+  const dockedControls = (
+    <div className="flex w-full max-w-[min(28rem,calc(100vw-1.5rem))] items-center gap-2 rounded-full border border-neutral-800 bg-neutral-950/95 px-2.5 py-1.5 text-xs text-neutral-200 shadow-2xl backdrop-blur-md sm:gap-3 sm:px-3 sm:py-2">
+      <button
+        type="button"
+        onClick={togglePlay}
+        className="inline-flex size-8 shrink-0 items-center justify-center rounded-full bg-white text-neutral-950 transition-opacity hover:opacity-90"
+        aria-label={isPlaying ? 'Pause audiobook' : 'Play audiobook'}
+      >
+        {isPlaying ? (
+          <Pause className="size-3.5 fill-current" />
+        ) : (
+          <Play className="size-3.5 fill-current" />
+        )}
+      </button>
+
+      <button
+        type="button"
+        onClick={() => skipBy(-SKIP_SECONDS)}
+        className="hidden size-7 shrink-0 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-white sm:inline-flex"
+        aria-label={`Skip back ${SKIP_SECONDS} seconds`}
+      >
+        <RotateCcw className="size-3.5" />
+      </button>
+      <button
+        type="button"
+        onClick={() => skipBy(SKIP_SECONDS)}
+        className="hidden size-7 shrink-0 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-white sm:inline-flex"
+        aria-label={`Skip forward ${SKIP_SECONDS} seconds`}
+      >
+        <RotateCw className="size-3.5" />
+      </button>
+
+      {progress}
+
+      <span className="shrink-0 font-mono text-[10px] tabular-nums text-neutral-400 sm:text-[11px]">
+        <span className="sm:hidden">{formatTime(currentTime)}</span>
+        <span className="hidden sm:inline">
+          {formatTime(currentTime)} / {formatTime(duration)}
+        </span>
+      </span>
+
+      <button
+        type="button"
+        onClick={toggleSpeed}
+        className="shrink-0 rounded-full px-1.5 py-0.5 font-mono text-[10px] font-medium text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-white sm:text-[11px]"
+        aria-label={`Playback speed ${speed}x`}
+      >
+        {speed}x
       </button>
     </div>
   );
@@ -216,14 +273,13 @@ export function DocAudioPlayer({ src }: DocAudioPlayerProps) {
         onEnded={() => setIsPlaying(false)}
       />
 
-      {/* Sentinel keeps layout; docks when this scrolls off-screen */}
       <div ref={sentinelRef} className={cn(isDocked && 'invisible pointer-events-none')}>
-        {controls(false)}
+        {inlineControls}
       </div>
 
       {isDocked ? (
         <div className="pointer-events-none fixed inset-x-0 bottom-0 z-40 flex justify-center px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2">
-          <div className="pointer-events-auto w-full max-w-xl">{controls(true)}</div>
+          <div className="pointer-events-auto">{dockedControls}</div>
         </div>
       ) : null}
     </>

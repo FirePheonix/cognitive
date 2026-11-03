@@ -60,7 +60,12 @@ export default async function DocsPage({ params }: { params: Promise<{ slug?: st
     <>
       <DocsMobileToc items={toc} />
 
-      <main className="min-w-0 px-6 py-10 md:px-10 xl:px-14">
+      <main
+        className={cn(
+          'min-w-0 px-6 py-10 md:px-10 xl:px-14',
+          page.audio && 'pb-[calc(var(--doc-audio-dock-pad,0px)+1.5rem)]',
+        )}
+      >
         <article className="mx-auto flex min-h-[calc(100vh-8rem)] max-w-[760px] flex-col">
           <nav className="mb-6 flex items-center gap-1.5 text-sm text-fd-muted-foreground">
             <Link href="/docs" className="transition-colors hover:text-fd-foreground">
@@ -171,13 +176,19 @@ export default async function DocsPage({ params }: { params: Promise<{ slug?: st
       <DocsDesktopToc items={toc} />
 
       <button
+        type="button"
+        aria-label="Ask AI"
         className={cn(
-          'fixed right-5 z-30 inline-flex items-center gap-2 rounded-2xl border bg-fd-card px-4 py-3 text-sm font-medium shadow-xl transition-colors hover:bg-fd-accent',
-          page.audio ? 'bottom-24' : 'bottom-5',
+          'fixed z-30 inline-flex items-center gap-2 rounded-full border bg-fd-card text-sm font-medium shadow-xl transition-colors hover:bg-fd-accent',
+          // Stay clear of the docked audiobook bar and page gutters on phones
+          page.audio
+            ? 'bottom-[calc(var(--doc-audio-dock-pad,4.5rem)+0.75rem)] right-3 sm:bottom-24 sm:right-5'
+            : 'bottom-[max(1rem,env(safe-area-inset-bottom))] right-3 sm:bottom-5 sm:right-5',
+          'size-11 justify-center p-0 sm:h-auto sm:w-auto sm:rounded-2xl sm:px-4 sm:py-3',
         )}
       >
         <MessageCircle className="size-4" />
-        Ask AI
+        <span className="hidden sm:inline">Ask AI</span>
       </button>
     </>
   );
